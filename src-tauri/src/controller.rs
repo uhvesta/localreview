@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -29,8 +29,8 @@ use localreview_domain::{
 };
 use localreview_git::DiscoveryConfig;
 use localreview_highlight::{
-    HighlightCacheConfig, HighlightCancellation, HighlightPolicy, HighlightRequest,
-    HighlightService, HighlightStatus, HighlightTheme,
+    resolve_language, HighlightCacheConfig, HighlightCancellation, HighlightPolicy,
+    HighlightRequest, HighlightService, HighlightStatus, HighlightTheme,
 };
 use localreview_persistence::{
     BackupPolicy, PersistenceDiagnostics, RemoteReviewReplacementPromotion, StateStore,
@@ -257,11 +257,13 @@ struct RemoteWatcher {
 }
 
 #[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum DesktopOperation {
     Workspace { workspace_id: String },
-    PullRequest { url: String },
-    SshWorkspace { target: String },
 }
 
 #[derive(Debug)]
@@ -270,6 +272,10 @@ pub struct DesktopController {
     replay_guard: Mutex<ReplayGuard>,
     presentation_cache: Mutex<PresentationCache>,
     highlight: HighlightService,
+    /// Git attribute lookup is stable for an immutable comparison. Caching
+    /// both hits and misses prevents virtual scrolling from spawning a
+    /// `git check-attr` process for every viewport window.
+    language_attribute_cache: Mutex<HashMap<(String, String), Option<String>>>,
     /// Presentation jobs share a small worker budget, but are not globally
     /// serialized.  A one-file scroll can therefore never make another file
     /// wait behind a single held mutex, while CPU/process pressure remains
@@ -1364,6 +1370,7 @@ impl DesktopController {
                 HighlightPolicy::default(),
                 HighlightCacheConfig::default(),
             ),
+            language_attribute_cache: Mutex::new(HashMap::new()),
             presentation_work: PresentationWorkPool::new(MAX_PRESENTATION_WORKERS),
             presentation_jobs: Mutex::new(PresentationJobRegistry::default()),
             refresh_available: Arc::new(Mutex::new(BTreeSet::new())),
@@ -1419,7 +1426,9 @@ impl DesktopController {
             }
             let _ = app_handle.emit(
                 crate::DESKTOP_OPERATION_EVENT,
-                DesktopOperation::SshWorkspace { target },
+                DesktopOperation::Workspace {
+                    workspace_id: workspace.id,
+                },
             );
             Ok(())
         }))
@@ -2463,6 +2472,7 @@ impl DesktopController {
                 Some(&job),
             );
         }
+        let language_attribute = self.highlight_language_attribute(&document, session.id);
 
         let (all_rows, hunks) =
             self.cached_canonical_rows(&document, mode, full_file_side, &ui_state)?;
@@ -2474,8 +2484,13 @@ impl DesktopController {
         );
         let mut rows = all_rows[start..end].to_vec();
         self.mark_annotation_rows(&document, &mut rows)?;
-        let (old_tokens, new_tokens, highlight_status, highlight_reason) =
-            self.highlight_window(&document, &rows, &settings, Some(&job))?;
+        let (old_tokens, new_tokens, highlight_status, highlight_reason) = self.highlight_window(
+            &document,
+            &rows,
+            &settings,
+            language_attribute.as_deref(),
+            Some(&job),
+        )?;
         self.ensure_presentation_job_current(&job)?;
         Ok(PresentationWindow {
             generation: request.generation,
@@ -2784,22 +2799,30 @@ impl DesktopController {
             DiffSide::Old => &document.old.content,
             DiffSide::New => &document.new.content,
         };
+        let session = self
+            .session_for_comparison(document.comparison_id)?
+            .ok_or_else(|| {
+                DispatchError::Invalid("file is not part of a retained review".into())
+            })?;
+        let language_attribute = self.highlight_language_attribute(&document, session.id);
         let side_name = side_name(side).to_owned();
-        Ok(
-            localreview_highlight::outline(Path::new(document.file.path.as_str()), source, None)
-                .into_iter()
-                .enumerate()
-                .map(|(index, symbol)| OutlineSymbolView {
-                    id: format!("{}:{}:{}", side_name, symbol.start_line, index),
-                    name: symbol.name,
-                    kind: outline_kind_name(symbol.kind).into(),
-                    start_line: symbol.start_line,
-                    end_line: symbol.end_line,
-                    depth: symbol.depth,
-                    side: side_name.clone(),
-                })
-                .collect(),
+        Ok(localreview_highlight::outline(
+            Path::new(document.file.path.as_str()),
+            source,
+            language_attribute.as_deref(),
         )
+        .into_iter()
+        .enumerate()
+        .map(|(index, symbol)| OutlineSymbolView {
+            id: format!("{}:{}:{}", side_name, symbol.start_line, index),
+            name: symbol.name,
+            kind: outline_kind_name(symbol.kind).into(),
+            start_line: symbol.start_line,
+            end_line: symbol.end_line,
+            depth: symbol.depth,
+            side: side_name.clone(),
+        })
+        .collect())
     }
 
     pub fn workspace_ui_state(
@@ -4401,7 +4424,10 @@ impl DesktopController {
             for export in self.state().prompt_exports(session.id)? {
                 items.push(ReviewHistoryItem {
                     id: format!("export:{}", export.id),
-                    label: "Exported prompt".into(),
+                    label: export
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| prompt_title_for_scope(&export.scope).to_owned()),
                     created_at: export.created_at.to_rfc3339(),
                     annotation_count: export.annotation_ids.len(),
                     item_type: "export".into(),
@@ -5846,11 +5872,45 @@ impl DesktopController {
         Ok(())
     }
 
+    fn highlight_language_attribute(
+        &self,
+        document: &ReviewDiffDocument,
+        session_id: ReviewSessionId,
+    ) -> Option<String> {
+        let key = (
+            document.comparison_id.to_string(),
+            document.file.path.to_string(),
+        );
+        if let Ok(cache) = self.language_attribute_cache.lock() {
+            if let Some(cached) = cache.get(&key) {
+                return cached.clone();
+            }
+        }
+        let resolved = (|| {
+            let comparisons = self.current_comparisons(session_id).ok()?;
+            let repository_id = document_repository_id(document, &comparisons).ok()?;
+            let repository = self.state().repositories_for_id(repository_id).ok()??;
+            localreview_git::GitRepository::open(repository.worktree_path.as_str())
+                .linguist_language(&document.file.path)
+                .ok()?
+        })();
+        if let Ok(mut cache) = self.language_attribute_cache.lock() {
+            cache.insert(key, resolved.clone());
+            // Comparison IDs make entries immutable, but old review history
+            // can be unbounded. A deterministic cap avoids permanent growth.
+            if cache.len() > 8_192 {
+                cache.clear();
+            }
+        }
+        resolved
+    }
+
     fn highlight_window(
         &self,
         document: &ReviewDiffDocument,
         rows: &[DiffRowView],
         settings: &ReviewSettings,
+        language_attribute: Option<&str>,
         job: Option<&PresentationJobLease>,
     ) -> Result<HighlightWindow, DispatchError> {
         let _permit = self.presentation_work.acquire(job)?;
@@ -5864,7 +5924,7 @@ impl DesktopController {
                 path: Path::new(document.file.path.as_str()),
                 source: &document.old.content,
                 side: DiffSide::Old,
-                language_attribute: None,
+                language_attribute,
                 theme: theme.clone(),
                 force: false,
             },
@@ -5878,7 +5938,7 @@ impl DesktopController {
                 path: Path::new(document.file.path.as_str()),
                 source: &document.new.content,
                 side: DiffSide::New,
-                language_attribute: None,
+                language_attribute,
                 theme,
                 force: false,
             },
@@ -5995,8 +6055,19 @@ impl DesktopController {
                 collapsed_context_lines: None,
             })
             .collect();
-        let (old_tokens, new_tokens, highlight_status, highlight_reason) =
-            self.highlight_window(document, &rows, settings, job)?;
+        let session = self
+            .session_for_comparison(document.comparison_id)?
+            .ok_or_else(|| {
+                DispatchError::Invalid("file is not part of a retained review".into())
+            })?;
+        let language_attribute = self.highlight_language_attribute(document, session.id);
+        let (old_tokens, new_tokens, highlight_status, highlight_reason) = self.highlight_window(
+            document,
+            &rows,
+            settings,
+            language_attribute.as_deref(),
+            job,
+        )?;
         if let Some(job) = job {
             self.ensure_presentation_job_current(job)?;
         }
@@ -7589,21 +7660,10 @@ fn row_kind(kind: DiffLineKind) -> &'static str {
 }
 
 fn language_name(path: &str) -> &'static str {
-    match path.rsplit('.').next().unwrap_or_default() {
-        "rs" => "Rust",
-        "swift" => "Swift",
-        "ts" | "tsx" => "TypeScript",
-        "js" | "jsx" => "JavaScript",
-        "svelte" => "Svelte",
-        "py" => "Python",
-        "go" => "Go",
-        "json" => "JSON",
-        "toml" => "TOML",
-        "yaml" | "yml" => "YAML",
-        "md" => "Markdown",
-        "sh" => "Shell",
-        _ => "Text",
-    }
+    resolve_language(Path::new(path), "", None).map_or(
+        "Text",
+        localreview_highlight::HighlightLanguage::display_name,
+    )
 }
 
 fn parse_remote_target(value: &str) -> Result<RemoteTarget, DispatchError> {
@@ -8600,6 +8660,50 @@ mod tests {
         let review = reopened.load_review(workspace_id).unwrap();
         assert_eq!(review.workspace.progress.total, 1);
         assert_eq!(review.repositories[0].base, "main");
+    }
+
+    #[test]
+    fn presentation_language_honors_linguist_language_attributes() {
+        let fixture = review_fixture("fn old() {}\n", "fn new() {}\n");
+        let output = std::process::Command::new("git")
+            .current_dir(fixture._workspace_directory.path())
+            .args(["init", "-q"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        std::fs::write(
+            fixture._workspace_directory.path().join(".gitattributes"),
+            "*.rs linguist-language=Java\n",
+        )
+        .unwrap();
+        let document = fixture
+            .controller
+            .persisted_review_document(fixture.file_id, None)
+            .unwrap()
+            .document;
+        let session = fixture
+            .controller
+            .service
+            .active_review_session(fixture.workspace_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fixture
+                .controller
+                .highlight_language_attribute(&document, session.id)
+                .as_deref(),
+            Some("Java")
+        );
+    }
+
+    #[test]
+    fn file_list_language_labels_share_the_highlight_resolver() {
+        assert_eq!(language_name("src/Main.java"), "Java");
+        assert_eq!(language_name("rules/BUILD.bazel"), "Starlark");
+        assert_eq!(language_name("src/worker.kt"), "Kotlin");
+        assert_eq!(language_name("queries/review.sql"), "SQL");
+        assert_eq!(language_name("flake.nix"), "Nix");
+        assert_eq!(language_name("unknown.data"), "Text");
     }
 
     fn replace_fixture_review(
@@ -10137,6 +10241,36 @@ mod tests {
     }
 
     #[test]
+    fn structural_presentation_choices_survive_controller_restart() {
+        let fixture = review_fixture("fn old() {}\n", "fn new() {}\n");
+        fixture
+            .controller
+            .save_workspace_ui_state(
+                fixture.workspace_id,
+                serde_json::from_value(serde_json::json!({
+                    "activeFileId": fixture.file_id.to_string(),
+                    "mode": "difftastic",
+                    "fullFileSide": "old",
+                    "scrollTop": 321.0,
+                    "splitRatio": 0.63,
+                    "rightTab": "outline"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        let reopened =
+            DesktopController::new(StateStore::open(fixture._state_directory.path()).unwrap());
+        let restored = reopened.workspace_ui_state(fixture.workspace_id).unwrap();
+        assert_eq!(restored.active_file_id, Some(fixture.file_id.to_string()));
+        assert_eq!(restored.mode, "difftastic");
+        assert_eq!(restored.full_file_side, "old");
+        assert_eq!(restored.scroll_top, 321.0);
+        assert_eq!(restored.split_ratio, 0.63);
+        assert_eq!(restored.right_tab, "outline");
+    }
+
+    #[test]
     fn explicit_annotation_inclusion_survives_restart_including_an_empty_selection() {
         let fixture = review_fixture("fn old() {}\n", "fn new() {}\n");
         let saved = fixture
@@ -10381,6 +10515,99 @@ mod tests {
     }
 
     #[test]
+    fn prompt_modes_are_strict_and_history_keeps_scope_labels() {
+        let fixture = review_fixture("before\n", "after\n");
+        let save = |kind: &str, body: &str| {
+            fixture
+                .controller
+                .save_annotation(AnnotationView {
+                    id: Uuid::new_v4().to_string(),
+                    file_id: fixture.file_id.to_string(),
+                    repository_id: fixture.repository_id.to_string(),
+                    kind: kind.into(),
+                    state: "open".into(),
+                    side: "new".into(),
+                    start_line: if matches!(kind, "file_note" | "review_note") {
+                        0
+                    } else {
+                        1
+                    },
+                    end_line: if matches!(kind, "file_note" | "review_note") {
+                        0
+                    } else {
+                        1
+                    },
+                    body: body.into(),
+                    selected_source: String::new(),
+                    labels: Vec::new(),
+                    local_only: true,
+                    created_at: Utc::now().to_rfc3339(),
+                    published_id: None,
+                })
+                .unwrap()
+        };
+        save("comment", "comment body");
+        save("question", "question body");
+        save("file_note", "file note body");
+        save("suggestion", "suggestion body");
+        save("review_note", "review note body");
+        let generate = |scope: &str| {
+            fixture
+                .controller
+                .generate_prompt(
+                    fixture.workspace_id,
+                    PromptInput {
+                        scope: scope.into(),
+                        annotation_ids: Vec::new(),
+                        portable: Some(true),
+                        history_id: None,
+                    },
+                )
+                .unwrap()
+        };
+
+        let feedback = generate("feedback");
+        assert_eq!(feedback.title, "Review feedback");
+        assert_eq!(feedback.annotation_count, 2);
+        assert!(feedback.content.contains("comment body"));
+        assert!(feedback.content.contains("suggestion body"));
+        assert!(!feedback.content.contains("question body"));
+        assert!(!feedback.content.contains("file note body"));
+        assert!(!feedback.content.contains("review note body"));
+
+        let questions = generate("questions");
+        assert_eq!(questions.title, "Questions for investigation");
+        assert_eq!(questions.annotation_count, 1);
+        assert!(questions.content.contains("# Review questions"));
+        assert!(questions.content.contains("Question:\n\nquestion body"));
+        assert!(!questions.content.contains("comment body"));
+
+        let full = generate("all");
+        assert_eq!(full.title, "Full review prompt");
+        assert_eq!(full.annotation_count, 5);
+        for body in [
+            "comment body",
+            "question body",
+            "file note body",
+            "suggestion body",
+            "review note body",
+        ] {
+            assert!(full.content.contains(body));
+        }
+
+        let history = fixture.controller.history(fixture.workspace_id).unwrap();
+        for expected in [
+            "Review feedback",
+            "Questions for investigation",
+            "Full review prompt",
+        ] {
+            assert!(history
+                .iter()
+                .any(|item| { item.item_type == "export" && item.label == expected }));
+        }
+    }
+
+    #[test]
     fn prompt_history_references_are_explicit_and_workspace_bound() {
         let fixture = review_fixture("before\n", "after\n");
         save_fixture_annotation(&fixture, "Only the original set belongs here.");
@@ -10583,6 +10810,15 @@ mod tests {
         assert_eq!(exact.content, first.content);
         assert_eq!(exact.title, first.title);
         assert_eq!(exact.annotation_count, first.annotation_count);
+        assert!(reopened
+            .history(fixture.workspace_id)
+            .unwrap()
+            .iter()
+            .any(|item| {
+                item.id == format!("export:{}", first.export_id)
+                    && item.label == first.title
+                    && item.annotation_count == first.annotation_count
+            }));
 
         let session = reopened
             .service

@@ -64,7 +64,7 @@
 
   $: structuralRows = (difftastic?.chunks ?? []).flatMap((chunk, chunkIndex) => chunk.rows.map((entry, rowIndex) => ({
     id: `difftastic:${chunkIndex}:${rowIndex}`,
-    kind: entry.old && !entry.new ? 'deletion' as const : entry.new && !entry.old ? 'addition' as const : 'context' as const,
+    kind: entry.old && !entry.new ? 'deletion' as const : entry.new && !entry.old ? 'addition' as const : 'modification' as const,
     oldLine: entry.old?.lineNumber, newLine: entry.new?.lineNumber, oldText: entry.old?.text, newText: entry.new?.text
   })));
   $: displayRows = (mode === 'difftastic' && structuralRows.length ? structuralRows : rows) as DiffRow[];
@@ -151,6 +151,7 @@
   function changeLabel(row: DiffRow) {
     if (row.kind === 'addition') return 'added change';
     if (row.kind === 'deletion') return 'removed change';
+    if (row.kind === 'modification') return 'modified change';
     return 'unchanged context';
   }
   function sideLabel(row: DiffRow, side: DiffSide) {
@@ -300,7 +301,7 @@
 {#if mode === 'difftastic'}
   <div class="structural-notice" role="status">
     <span class="spark">✦</span>
-    <span><strong>Structural diff</strong> · Backend Difftastic adapter · {difftastic?.display === 'inline' ? 'inline' : 'side-by-side'} · Read-only</span>
+    <span><strong>Structural diff</strong> · Backend Difftastic adapter · {difftastic?.display === 'inline' ? 'inline' : 'side-by-side'} · {difftastic?.status ?? 'loading'} · Read-only</span>
     {#if difftastic?.fallback}
       <span class="difftastic-fallback">Fallback: {difftastic.fallback.reason}</span>
     {:else}
@@ -334,6 +335,9 @@
       {#if !windowCoversVisible && effectiveTotal > 0}
         <div class="diff-loading" style:height={`${rowHeight}px`}>Loading captured rows…</div>
       {/if}
+      {#if mode === 'difftastic' && !difftastic?.fallback && effectiveTotal === 0}
+        <div class="structural-empty" role="status">No structural changes detected by Difftastic.</div>
+      {/if}
       {#each visibleRows as row (row.id)}
         {#if row.kind === 'header'}
           {@const hunk = hunks.find((entry) => entry.id === row.hunkId || entry.id === row.id)}
@@ -352,13 +356,13 @@
         {:else if mode === 'difftastic' && difftastic?.display === 'inline'}
           {@const oldCell = structuralCell(row, 'old')}
           {@const newCell = structuralCell(row, 'new')}
-          <div class:active={lineFor(row) === activeLine} class:added={row.kind === 'addition'} class:removed={row.kind === 'deletion'} class="diff-row structural-inline-row" data-structural-display="inline" role="group" aria-label={`${rowLabel(row, [row.newLine ? 'new' : 'old'])} Read-only inline structural presentation.`} style:height={`${rowHeight}px`}>
+          <div class:active={lineFor(row) === activeLine} class:added={row.kind === 'addition'} class:removed={row.kind === 'deletion'} class:modified={row.kind === 'modification'} class="diff-row structural-inline-row" data-structural-display="inline" role="group" aria-label={`${rowLabel(row, [row.newLine ? 'new' : 'old'])} Read-only inline structural presentation.`} style:height={`${rowHeight}px`}>
             <span class="annotation-gutter structural-gutter" aria-hidden="true">•</span><span class="line-number old">{row.oldLine ?? ''}</span><span class="line-number new">{row.newLine ?? ''}</span><span class="marker">{row.oldLine && row.newLine ? '↦' : row.newLine ? '+' : '−'}</span><code>{#if oldCell && newCell && oldCell.text !== newCell.text}<span class="structural-before">{#each structuralSegments(oldCell.text, oldCell.changedSpans) as segment}<span class={segment.class}>{segment.text}</span>{/each}</span><span class="structural-arrow"> → </span>{/if}{#each structuralSegments((newCell ?? oldCell)?.text ?? '', (newCell ?? oldCell)?.changedSpans) as segment}<span class={segment.class}>{segment.text}</span>{/each}</code>
           </div>
         {:else if mode === 'difftastic'}
           {@const oldCell = structuralCell(row, 'old')}
           {@const newCell = structuralCell(row, 'new')}
-          <div class:active={lineFor(row) === activeLine} class:added={row.kind === 'addition'} class:removed={row.kind === 'deletion'} class="diff-row split-row structural-row" role="group" aria-label={`${rowLabel(row, ['old', 'new'])} Read-only structural presentation.`} style:height={`${rowHeight}px;--split-ratio:${splitRatio}`}>
+          <div class:active={lineFor(row) === activeLine} class:added={row.kind === 'addition'} class:removed={row.kind === 'deletion'} class:modified={row.kind === 'modification'} class="diff-row split-row structural-row" role="group" aria-label={`${rowLabel(row, ['old', 'new'])} Read-only structural presentation.`} style:height={`${rowHeight}px;--split-ratio:${splitRatio}`}>
             <button class="annotation-gutter" aria-label={`Annotation disabled for structural old line ${row.oldLine ?? ''}`} disabled>•</button><span class="line-number">{row.oldLine ?? ''}</span><span class="marker">{row.kind === 'deletion' ? '−' : ''}</span><code>{#each structuralSegments(code(row, 'old'), oldCell?.changedSpans) as segment}<span class={segment.class}>{segment.text}</span>{/each}</code><span class="split-divider"></span><button class="annotation-gutter" aria-label={`Annotation disabled for structural new line ${row.newLine ?? ''}`} disabled>•</button><span class="line-number">{row.newLine ?? ''}</span><span class="marker">{row.kind === 'addition' ? '+' : ''}</span><code>{#each structuralSegments(code(row, 'new'), newCell?.changedSpans) as segment}<span class={segment.class}>{segment.text}</span>{/each}</code>
           </div>
         {:else}

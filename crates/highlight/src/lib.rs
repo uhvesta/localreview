@@ -19,7 +19,7 @@ use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter}
 
 /// Pinned grammar/query bundle. Bump this whenever any grammar/query changes
 /// so old cache entries cannot be reused against different token semantics.
-pub const GRAMMAR_BUNDLE_VERSION: &str = "tree-sitter-2026-07-22-v2";
+pub const GRAMMAR_BUNDLE_VERSION: &str = "tree-sitter-2026-07-22-v3";
 
 const HIGHLIGHT_NAMES: &[&str] = &[
     "attribute",
@@ -74,6 +74,24 @@ pub enum HighlightLanguage {
     Cpp,
     Html,
     Css,
+    Ruby,
+    Php,
+    CSharp,
+    Kotlin,
+    Lua,
+    Scala,
+    R,
+    Elixir,
+    Ocaml,
+    Sql,
+    Nix,
+    Zig,
+    Hcl,
+    Dart,
+    Perl,
+    Dockerfile,
+    Vue,
+    Astro,
     Svelte,
 }
 
@@ -99,7 +117,71 @@ impl HighlightLanguage {
             Self::Cpp => "cpp",
             Self::Html => "html",
             Self::Css => "css",
+            Self::Ruby => "ruby",
+            Self::Php => "php",
+            Self::CSharp => "c_sharp",
+            Self::Kotlin => "kotlin",
+            Self::Lua => "lua",
+            Self::Scala => "scala",
+            Self::R => "r",
+            Self::Elixir => "elixir",
+            Self::Ocaml => "ocaml",
+            Self::Sql => "sql",
+            Self::Nix => "nix",
+            Self::Zig => "zig",
+            Self::Hcl => "hcl",
+            Self::Dart => "dart",
+            Self::Perl => "perl",
+            Self::Dockerfile => "dockerfile",
+            Self::Vue => "vue",
+            Self::Astro => "astro",
             Self::Svelte => "svelte",
+        }
+    }
+
+    /// Human-readable label shared by the file list and the highlighter.
+    /// Keeping this beside resolution prevents the UI's language filter from
+    /// silently disagreeing with the grammar selected for the same path.
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Rust => "Rust",
+            Self::JavaScript => "JavaScript",
+            Self::TypeScript => "TypeScript",
+            Self::Tsx => "TSX",
+            Self::Json => "JSON",
+            Self::Python => "Python",
+            Self::Markdown => "Markdown",
+            Self::Shell => "Shell",
+            Self::Swift => "Swift",
+            Self::Starlark => "Starlark",
+            Self::Toml => "TOML",
+            Self::Yaml => "YAML",
+            Self::Go => "Go",
+            Self::Java => "Java",
+            Self::C => "C",
+            Self::Cpp => "C++",
+            Self::Html => "HTML",
+            Self::Css => "CSS",
+            Self::Ruby => "Ruby",
+            Self::Php => "PHP",
+            Self::CSharp => "C#",
+            Self::Kotlin => "Kotlin",
+            Self::Lua => "Lua",
+            Self::Scala => "Scala",
+            Self::R => "R",
+            Self::Elixir => "Elixir",
+            Self::Ocaml => "OCaml",
+            Self::Sql => "SQL",
+            Self::Nix => "Nix",
+            Self::Zig => "Zig",
+            Self::Hcl => "HCL / Terraform",
+            Self::Dart => "Dart",
+            Self::Perl => "Perl",
+            Self::Dockerfile => "Dockerfile",
+            Self::Vue => "Vue",
+            Self::Astro => "Astro",
+            Self::Svelte => "Svelte",
         }
     }
 }
@@ -211,6 +293,7 @@ pub struct HighlightCacheKey {
 #[serde(rename_all = "snake_case")]
 pub enum PlainTextReason {
     UnknownLanguage,
+    UnsupportedLanguage,
     UnsupportedMixedLanguage,
     Binary,
     Generated,
@@ -373,8 +456,20 @@ impl HighlightService {
         if let Some(reason) = self.eligibility_reason(request, Some(language)) {
             return plain(Some(language), reason);
         }
-        if matches!(language, HighlightLanguage::Svelte) {
+        if matches!(
+            language,
+            HighlightLanguage::Svelte | HighlightLanguage::Vue | HighlightLanguage::Astro
+        ) {
             return plain(Some(language), PlainTextReason::UnsupportedMixedLanguage);
+        }
+        if matches!(
+            language,
+            HighlightLanguage::Hcl
+                | HighlightLanguage::Dart
+                | HighlightLanguage::Perl
+                | HighlightLanguage::Dockerfile
+        ) {
+            return plain(Some(language), PlainTextReason::UnsupportedLanguage);
         }
         let key = cache_key(request, language);
         if let Ok(mut cache) = self.cache.lock() {
@@ -477,7 +572,10 @@ impl HighlightService {
         if !request.force && line_count(request.source) > self.policy.max_lines {
             return Some(PlainTextReason::TooManyLines);
         }
-        if matches!(language, Some(HighlightLanguage::Svelte)) {
+        if matches!(
+            language,
+            Some(HighlightLanguage::Svelte | HighlightLanguage::Vue | HighlightLanguage::Astro)
+        ) {
             return None;
         }
         None
@@ -581,9 +679,28 @@ fn parser_language(language: HighlightLanguage) -> Option<tree_sitter::Language>
         HighlightLanguage::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         HighlightLanguage::Html => tree_sitter_html::LANGUAGE.into(),
         HighlightLanguage::Css => tree_sitter_css::LANGUAGE.into(),
-        // Svelte needs a mixed-language parser/query bundle, which we do not
-        // pretend to have. Returning no entries is safe and predictable.
-        HighlightLanguage::Svelte => return None,
+        HighlightLanguage::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+        HighlightLanguage::Php => tree_sitter_php::LANGUAGE_PHP.into(),
+        HighlightLanguage::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+        HighlightLanguage::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
+        HighlightLanguage::Lua => tree_sitter_lua::LANGUAGE.into(),
+        HighlightLanguage::Scala => tree_sitter_scala::LANGUAGE.into(),
+        HighlightLanguage::R => tree_sitter_r::LANGUAGE.into(),
+        HighlightLanguage::Elixir => tree_sitter_elixir::LANGUAGE.into(),
+        HighlightLanguage::Ocaml => tree_sitter_ocaml::LANGUAGE_OCAML.into(),
+        HighlightLanguage::Sql => tree_sitter_sequel::LANGUAGE.into(),
+        HighlightLanguage::Nix => tree_sitter_nix::LANGUAGE.into(),
+        HighlightLanguage::Zig => tree_sitter_zig::LANGUAGE.into(),
+        // These languages either need an ABI-15 grammar (this app deliberately
+        // pins the ABI-14 runtime) or a mixed-language injection pipeline.
+        // Returning no outline is safer than navigating to heuristic symbols.
+        HighlightLanguage::Hcl
+        | HighlightLanguage::Dart
+        | HighlightLanguage::Perl
+        | HighlightLanguage::Dockerfile
+        | HighlightLanguage::Vue
+        | HighlightLanguage::Astro
+        | HighlightLanguage::Svelte => return None,
     })
 }
 
@@ -704,16 +821,25 @@ pub fn resolve_language(
         .and_then(|value| value.to_str())
         .unwrap_or_default();
     let exact = match name {
-        "Cargo.toml" | "pyproject.toml" => Some(HighlightLanguage::Toml),
+        "Cargo.toml" | "Cargo.lock" | "pyproject.toml" => Some(HighlightLanguage::Toml),
         "BUILD" | "BUILD.bazel" | "WORKSPACE" | "WORKSPACE.bazel" => {
             Some(HighlightLanguage::Starlark)
         }
         "MODULE.bazel" => Some(HighlightLanguage::Starlark),
         "Makefile" | "makefile" | "GNUmakefile" => Some(HighlightLanguage::Shell),
+        "Gemfile" | "Rakefile" | "Guardfile" | "Podfile" | "Fastfile" | "Vagrantfile" => {
+            Some(HighlightLanguage::Ruby)
+        }
+        ".bashrc" | ".bash_profile" | ".zshrc" | ".zprofile" => Some(HighlightLanguage::Shell),
+        "flake.lock" => Some(HighlightLanguage::Json),
+        "Dockerfile" | "Containerfile" => Some(HighlightLanguage::Dockerfile),
         _ => None,
     };
     if exact.is_some() {
         return exact;
+    }
+    if name.starts_with("Dockerfile.") || name.starts_with("Containerfile.") {
+        return Some(HighlightLanguage::Dockerfile);
     }
     let by_extension =
         path.extension()
@@ -723,7 +849,7 @@ pub fn resolve_language(
                 "js" | "mjs" | "cjs" | "jsx" => Some(HighlightLanguage::JavaScript),
                 "ts" | "mts" | "cts" => Some(HighlightLanguage::TypeScript),
                 "tsx" => Some(HighlightLanguage::Tsx),
-                "json" | "jsonc" | "json5" => Some(HighlightLanguage::Json),
+                "json" | "jsonc" | "json5" | "ipynb" => Some(HighlightLanguage::Json),
                 "py" | "pyi" | "pyw" => Some(HighlightLanguage::Python),
                 "md" | "mdx" | "markdown" => Some(HighlightLanguage::Markdown),
                 "sh" | "bash" | "zsh" | "fish" => Some(HighlightLanguage::Shell),
@@ -736,8 +862,26 @@ pub fn resolve_language(
                 "c" | "h" => Some(HighlightLanguage::C),
                 "cc" | "cp" | "cpp" | "cxx" | "c++" | "hh" | "hpp" | "hxx" | "h++" | "ipp"
                 | "inl" => Some(HighlightLanguage::Cpp),
-                "html" | "htm" | "xhtml" | "svg" => Some(HighlightLanguage::Html),
+                "html" | "htm" | "xhtml" | "svg" | "xml" => Some(HighlightLanguage::Html),
                 "css" => Some(HighlightLanguage::Css),
+                "rb" | "rake" | "gemspec" => Some(HighlightLanguage::Ruby),
+                "php" | "php3" | "php4" | "php5" | "phtml" => Some(HighlightLanguage::Php),
+                "cs" | "csx" => Some(HighlightLanguage::CSharp),
+                "kt" | "kts" => Some(HighlightLanguage::Kotlin),
+                "lua" => Some(HighlightLanguage::Lua),
+                "scala" | "sc" => Some(HighlightLanguage::Scala),
+                "r" => Some(HighlightLanguage::R),
+                "ex" | "exs" => Some(HighlightLanguage::Elixir),
+                "ml" | "mli" => Some(HighlightLanguage::Ocaml),
+                "sql" | "ddl" | "dml" => Some(HighlightLanguage::Sql),
+                "nix" => Some(HighlightLanguage::Nix),
+                "zig" => Some(HighlightLanguage::Zig),
+                "hcl" | "tf" | "tfvars" => Some(HighlightLanguage::Hcl),
+                "dart" => Some(HighlightLanguage::Dart),
+                "pl" | "pm" | "pod" | "t" => Some(HighlightLanguage::Perl),
+                "dockerfile" => Some(HighlightLanguage::Dockerfile),
+                "vue" => Some(HighlightLanguage::Vue),
+                "astro" => Some(HighlightLanguage::Astro),
                 "svelte" => Some(HighlightLanguage::Svelte),
                 _ => None,
             });
@@ -764,6 +908,24 @@ fn parse_language_name(value: &str) -> Option<HighlightLanguage> {
         "cpp" | "c++" | "cxx" => Some(HighlightLanguage::Cpp),
         "html" | "xhtml" => Some(HighlightLanguage::Html),
         "css" => Some(HighlightLanguage::Css),
+        "ruby" | "rb" => Some(HighlightLanguage::Ruby),
+        "php" => Some(HighlightLanguage::Php),
+        "c#" | "csharp" | "c sharp" | "cs" => Some(HighlightLanguage::CSharp),
+        "kotlin" | "kt" => Some(HighlightLanguage::Kotlin),
+        "lua" => Some(HighlightLanguage::Lua),
+        "scala" => Some(HighlightLanguage::Scala),
+        "r" => Some(HighlightLanguage::R),
+        "elixir" | "ex" => Some(HighlightLanguage::Elixir),
+        "ocaml" | "ml" => Some(HighlightLanguage::Ocaml),
+        "sql" => Some(HighlightLanguage::Sql),
+        "nix" => Some(HighlightLanguage::Nix),
+        "zig" => Some(HighlightLanguage::Zig),
+        "hcl" | "terraform" => Some(HighlightLanguage::Hcl),
+        "dart" => Some(HighlightLanguage::Dart),
+        "perl" => Some(HighlightLanguage::Perl),
+        "dockerfile" | "containerfile" => Some(HighlightLanguage::Dockerfile),
+        "vue" => Some(HighlightLanguage::Vue),
+        "astro" => Some(HighlightLanguage::Astro),
         "svelte" => Some(HighlightLanguage::Svelte),
         _ => None,
     }
@@ -793,6 +955,18 @@ fn language_from_shebang(source: &str) -> Option<HighlightLanguage> {
         .to_ascii_lowercase();
     if interpreter.starts_with("python") {
         Some(HighlightLanguage::Python)
+    } else if matches!(interpreter.as_str(), "ruby" | "jruby") {
+        Some(HighlightLanguage::Ruby)
+    } else if interpreter == "php" {
+        Some(HighlightLanguage::Php)
+    } else if interpreter == "lua" {
+        Some(HighlightLanguage::Lua)
+    } else if interpreter == "rscript" {
+        Some(HighlightLanguage::R)
+    } else if interpreter == "elixir" {
+        Some(HighlightLanguage::Elixir)
+    } else if interpreter.starts_with("perl") {
+        Some(HighlightLanguage::Perl)
     } else if matches!(interpreter.as_str(), "node" | "nodejs" | "deno" | "bun") {
         Some(HighlightLanguage::JavaScript)
     } else if matches!(
@@ -861,7 +1035,25 @@ fn configuration(
         HighlightLanguage::Cpp => cpp_config().map(Some),
         HighlightLanguage::Html => html_config().map(Some),
         HighlightLanguage::Css => css_config().map(Some),
-        HighlightLanguage::Svelte => Ok(None),
+        HighlightLanguage::Ruby => ruby_config().map(Some),
+        HighlightLanguage::Php => php_config().map(Some),
+        HighlightLanguage::CSharp => c_sharp_config().map(Some),
+        HighlightLanguage::Kotlin => kotlin_config().map(Some),
+        HighlightLanguage::Lua => lua_config().map(Some),
+        HighlightLanguage::Scala => scala_config().map(Some),
+        HighlightLanguage::R => r_config().map(Some),
+        HighlightLanguage::Elixir => elixir_config().map(Some),
+        HighlightLanguage::Ocaml => ocaml_config().map(Some),
+        HighlightLanguage::Sql => sql_config().map(Some),
+        HighlightLanguage::Nix => nix_config().map(Some),
+        HighlightLanguage::Zig => zig_config().map(Some),
+        HighlightLanguage::Hcl
+        | HighlightLanguage::Dart
+        | HighlightLanguage::Perl
+        | HighlightLanguage::Dockerfile
+        | HighlightLanguage::Vue
+        | HighlightLanguage::Astro
+        | HighlightLanguage::Svelte => Ok(None),
     }
 }
 
@@ -1145,6 +1337,206 @@ fn css_config() -> Result<&'static HighlightConfiguration, &'static str> {
         .map_err(String::as_str)
 }
 
+fn ruby_config() -> Result<&'static HighlightConfiguration, &'static str> {
+    static CONFIG: OnceLock<Result<HighlightConfiguration, String>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            configured(
+                tree_sitter_ruby::LANGUAGE.into(),
+                "ruby",
+                tree_sitter_ruby::HIGHLIGHTS_QUERY,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(String::as_str)
+}
+
+fn php_config() -> Result<&'static HighlightConfiguration, &'static str> {
+    static CONFIG: OnceLock<Result<HighlightConfiguration, String>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            configured(
+                tree_sitter_php::LANGUAGE_PHP.into(),
+                "php",
+                tree_sitter_php::HIGHLIGHTS_QUERY,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(String::as_str)
+}
+
+// The ABI-14 C# and Kotlin crates do not export their bundled queries. These
+// deliberately small semantic queries cover stable lexical nodes and avoid
+// vendoring grammar-sized query files into the app.
+const C_SHARP_HIGHLIGHTS_QUERY: &str = r#"
+(comment) @comment
+[(string_literal) (verbatim_string_literal) (raw_string_literal) (character_literal)] @string
+[(integer_literal) (real_literal)] @number
+(boolean_literal) @boolean
+(predefined_type) @type
+(identifier) @variable
+"#;
+
+fn c_sharp_config() -> Result<&'static HighlightConfiguration, &'static str> {
+    static CONFIG: OnceLock<Result<HighlightConfiguration, String>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            configured(
+                tree_sitter_c_sharp::LANGUAGE.into(),
+                "c_sharp",
+                C_SHARP_HIGHLIGHTS_QUERY,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(String::as_str)
+}
+
+const KOTLIN_HIGHLIGHTS_QUERY: &str = r#"
+[(line_comment) (block_comment)] @comment
+[(string_literal) (multiline_string_literal) (character_literal)] @string
+[(number_literal) (float_literal)] @number
+(user_type) @type
+(identifier) @variable
+"#;
+
+fn kotlin_config() -> Result<&'static HighlightConfiguration, &'static str> {
+    static CONFIG: OnceLock<Result<HighlightConfiguration, String>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            configured(
+                tree_sitter_kotlin_ng::LANGUAGE.into(),
+                "kotlin",
+                KOTLIN_HIGHLIGHTS_QUERY,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(String::as_str)
+}
+
+fn lua_config() -> Result<&'static HighlightConfiguration, &'static str> {
+    static CONFIG: OnceLock<Result<HighlightConfiguration, String>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            configured(
+                tree_sitter_lua::LANGUAGE.into(),
+                "lua",
+                tree_sitter_lua::HIGHLIGHTS_QUERY,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(String::as_str)
+}
+
+fn scala_config() -> Result<&'static HighlightConfiguration, &'static str> {
+    static CONFIG: OnceLock<Result<HighlightConfiguration, String>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            configured(
+                tree_sitter_scala::LANGUAGE.into(),
+                "scala",
+                tree_sitter_scala::HIGHLIGHTS_QUERY,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(String::as_str)
+}
+
+fn r_config() -> Result<&'static HighlightConfiguration, &'static str> {
+    static CONFIG: OnceLock<Result<HighlightConfiguration, String>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            configured(
+                tree_sitter_r::LANGUAGE.into(),
+                "r",
+                tree_sitter_r::HIGHLIGHTS_QUERY,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(String::as_str)
+}
+
+fn elixir_config() -> Result<&'static HighlightConfiguration, &'static str> {
+    static CONFIG: OnceLock<Result<HighlightConfiguration, String>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            configured(
+                tree_sitter_elixir::LANGUAGE.into(),
+                "elixir",
+                tree_sitter_elixir::HIGHLIGHTS_QUERY,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(String::as_str)
+}
+
+fn ocaml_config() -> Result<&'static HighlightConfiguration, &'static str> {
+    static CONFIG: OnceLock<Result<HighlightConfiguration, String>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            configured(
+                tree_sitter_ocaml::LANGUAGE_OCAML.into(),
+                "ocaml",
+                tree_sitter_ocaml::HIGHLIGHTS_QUERY,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(String::as_str)
+}
+
+fn sql_config() -> Result<&'static HighlightConfiguration, &'static str> {
+    static CONFIG: OnceLock<Result<HighlightConfiguration, String>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            configured(
+                tree_sitter_sequel::LANGUAGE.into(),
+                "sql",
+                tree_sitter_sequel::HIGHLIGHTS_QUERY,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(String::as_str)
+}
+
+fn nix_config() -> Result<&'static HighlightConfiguration, &'static str> {
+    static CONFIG: OnceLock<Result<HighlightConfiguration, String>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            configured(
+                tree_sitter_nix::LANGUAGE.into(),
+                "nix",
+                tree_sitter_nix::HIGHLIGHTS_QUERY,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(String::as_str)
+}
+
+fn zig_config() -> Result<&'static HighlightConfiguration, &'static str> {
+    static CONFIG: OnceLock<Result<HighlightConfiguration, String>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            configured(
+                tree_sitter_zig::LANGUAGE.into(),
+                "zig",
+                tree_sitter_zig::HIGHLIGHTS_QUERY,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(String::as_str)
+}
+
 #[derive(Debug)]
 struct CacheEntry {
     tokens: Vec<TokenSpan>,
@@ -1253,6 +1645,7 @@ mod tests {
             ("MODULE.bazel", HighlightLanguage::Starlark),
             ("rules/example.bzl", HighlightLanguage::Starlark),
             ("Cargo.toml", HighlightLanguage::Toml),
+            ("Cargo.lock", HighlightLanguage::Toml),
             ("config/settings.YML", HighlightLanguage::Yaml),
             ("cmd/main.go", HighlightLanguage::Go),
             ("src/Main.java", HighlightLanguage::Java),
@@ -1418,6 +1811,86 @@ mod tests {
     }
 
     #[test]
+    fn resolves_and_highlights_extended_mainstream_language_set() {
+        let fixtures = [
+            (
+                "lib/demo.rb",
+                "class Demo\n  def value = 42\nend\n",
+                HighlightLanguage::Ruby,
+            ),
+            (
+                "web/index.php",
+                "<?php function value(): int { return 42; }\n",
+                HighlightLanguage::Php,
+            ),
+            (
+                "src/Demo.cs",
+                "class Demo { static int Value() => 42; }\n",
+                HighlightLanguage::CSharp,
+            ),
+            (
+                "src/Demo.kt",
+                "class Demo { fun value(): Int = 42 }\n",
+                HighlightLanguage::Kotlin,
+            ),
+            (
+                "scripts/demo.lua",
+                "local function value() return 42 end\n",
+                HighlightLanguage::Lua,
+            ),
+            (
+                "src/Demo.scala",
+                "object Demo { def value: Int = 42 }\n",
+                HighlightLanguage::Scala,
+            ),
+            (
+                "analysis/demo.R",
+                "value <- function() { 42 }\n",
+                HighlightLanguage::R,
+            ),
+            (
+                "lib/demo.ex",
+                "defmodule Demo do\n  def value, do: 42\nend\n",
+                HighlightLanguage::Elixir,
+            ),
+            (
+                "lib/demo.ml",
+                "let value () = 42\n",
+                HighlightLanguage::Ocaml,
+            ),
+            (
+                "schema/demo.sql",
+                "SELECT count(*) FROM reviews WHERE open = true;\n",
+                HighlightLanguage::Sql,
+            ),
+            (
+                "flake.nix",
+                "{ pkgs, ... }: { value = 42; }\n",
+                HighlightLanguage::Nix,
+            ),
+            (
+                "src/demo.zig",
+                "pub fn value() u32 { return 42; }\n",
+                HighlightLanguage::Zig,
+            ),
+        ];
+        let service = HighlightService::default();
+        for (path, source, expected) in fixtures {
+            assert_eq!(
+                resolve_language(Path::new(path), source, None),
+                Some(expected),
+                "{path}"
+            );
+            let result = service.highlight(&request(path, source, DiffSide::New), None);
+            assert_eq!(result.status, HighlightStatus::Highlighted, "{path}");
+            assert!(
+                !result.tokens.is_empty(),
+                "{path} must produce semantic token spans"
+            );
+        }
+    }
+
+    #[test]
     fn every_pinned_grammar_builds_a_highlight_configuration() {
         let configurations = [
             ("swift", swift_config()),
@@ -1430,6 +1903,18 @@ mod tests {
             ("cpp", cpp_config()),
             ("html", html_config()),
             ("css", css_config()),
+            ("ruby", ruby_config()),
+            ("php", php_config()),
+            ("c_sharp", c_sharp_config()),
+            ("kotlin", kotlin_config()),
+            ("lua", lua_config()),
+            ("scala", scala_config()),
+            ("r", r_config()),
+            ("elixir", elixir_config()),
+            ("ocaml", ocaml_config()),
+            ("sql", sql_config()),
+            ("nix", nix_config()),
+            ("zig", zig_config()),
         ];
         for (name, configuration) in configurations {
             if let Err(error) = configuration {
@@ -1477,7 +1962,7 @@ mod tests {
     }
 
     #[test]
-    fn svelte_and_unknown_files_are_safe_fallbacks() {
+    fn unsupported_mixed_known_and_unknown_files_are_safe_fallbacks() {
         let service = HighlightService::default();
         assert_eq!(
             service
@@ -1491,6 +1976,12 @@ mod tests {
                 )
                 .status,
             HighlightStatus::PlainText(PlainTextReason::UnsupportedMixedLanguage)
+        );
+        assert_eq!(
+            service
+                .highlight(&request("main.tf", "value = 42", DiffSide::New), None)
+                .status,
+            HighlightStatus::PlainText(PlainTextReason::UnsupportedLanguage)
         );
         assert_eq!(
             service

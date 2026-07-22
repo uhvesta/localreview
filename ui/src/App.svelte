@@ -323,9 +323,9 @@
       else setSettings({ rightWidth: Math.min(520, Math.max(240, window.innerWidth - event.clientX)) });
     };
     const onUp = () => resizeSide = undefined;
-    const onPageHide = () => { void flushPendingReviewPersistence(); };
+    const onPageHide = () => { void flushReviewPersistence(); };
     const onVisibilityChange = () => {
-      if (document.visibilityState === 'hidden') void flushPendingReviewPersistence();
+      if (document.visibilityState === 'hidden') void flushReviewPersistence();
     };
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('pointermove', onMove);
@@ -336,7 +336,7 @@
       // Forwarded CLI requests are applied by the desktop backend. The event
       // carries only the already-validated workspace id and never paths or a
       // generic command; this keeps focus activation as narrow as Tauri IPC.
-      void listen<{ kind: string; workspaceId?: string }>('localreview://desktop-operation', (event) => {
+      void listen<{ kind: 'workspace'; workspaceId: string }>('localreview://desktop-operation', (event) => {
         if (event.payload.kind !== 'workspace' || !event.payload.workspaceId) return;
         void (async () => {
           const loaded = await api.listWorkspaces();
@@ -362,10 +362,10 @@
       disposed = true;
       unlistenDesktopOperation?.();
       unlistenRefreshAvailable?.();
-      // Dispatch the last stable snapshots while the webview still permits
-      // lifecycle work. Native persistence may complete after unmount; the
-      // queued payloads no longer read component globals.
-      void flushPendingReviewPersistence();
+      // Capture and dispatch the last stable snapshots while the webview still
+      // permits lifecycle work. Native persistence may complete after
+      // unmount; the queued payloads no longer read component globals.
+      void flushReviewPersistence();
       if (finishPreviewTimer) window.clearTimeout(finishPreviewTimer);
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('pointermove', onMove);
@@ -551,6 +551,10 @@
     activeSelection = undefined;
     composer = undefined;
     restoredScrollTop = 0;
+    // The file choice is durable presentation state. Save it before any
+    // potentially slow native presentation/highlighting work so closing the
+    // window cannot restore the previously selected file.
+    await persistWorkspaceUiStateNow({ activeFileId: fileId, scrollTop: 0 });
     await loadPresentation(0, 220);
     await loadOutline();
     if (review && !review.files.find((file) => file.id === fileId)?.viewed) {
@@ -567,9 +571,13 @@
   async function setMode(next: DiffMode, location?: { side: DiffSide; line: number }) {
     const source = location ?? (nearestSourceLine ? { side: nearestSourceSide ?? 'new' as DiffSide, line: nearestSourceLine } : undefined);
     mode = next;
+    // Difftastic can take materially longer than canonical presentation. The
+    // selection must reach native storage before that work begins; otherwise
+    // a quit or presentation failure leaves the visibly selected tab durable
+    // only in the soon-to-be-destroyed webview.
+    await persistWorkspaceUiStateNow({ mode: next });
     if (source && activeFileId) await jumpToSource(activeFileId, source.side, source.line, next);
     else await loadPresentation(presentation?.startRow ?? 0, (presentation?.startRow ?? 0) + 220);
-    persistWorkspaceUiState();
   }
 
   async function setSettings(partial: Partial<ReviewSettings>) {
@@ -1280,9 +1288,11 @@
   }
   async function setFullFileSide(side: FullFileSide) {
     fullFileSide = side;
+    // Persist this discrete presentation choice before loading the selected
+    // side and its outline for the same shutdown-safety guarantee as mode.
+    await persistWorkspaceUiStateNow({ fullFileSide: side });
     await loadPresentation(presentation?.startRow ?? 0, (presentation?.startRow ?? 0) + 220);
     await loadOutline();
-    persistWorkspaceUiState({ fullFileSide });
   }
   async function jumpToSource(fileId: string, side: DiffSide, line: number, targetMode: DiffMode = mode) {
     activeFileId = fileId;
@@ -1930,7 +1940,7 @@
 {#if zoomToast}<div class="zoom-toast" role="status">{zoomToast}</div>{/if}
 
 {#if prompt}
-  <div class="modal-backdrop" role="presentation"><dialog open class="modal prompt-modal" aria-modal="true" aria-labelledby="prompt-title" use:focusTrap={{ onClose: () => prompt = undefined }}><header><div><span class="eyebrow">STRUCTURED EXPORT</span><h2 id="prompt-title">{prompt.title}</h2><p>{prompt.annotationCount} annotations · about {prompt.estimatedTokens.toLocaleString()} tokens</p></div><button class="icon-button" on:click={() => prompt = undefined} aria-label="Close prompt preview">×</button></header>{#if promptHistoryId?.startsWith('export:')}<div class="prompt-exact-note" role="status">Exact durable export · original Markdown and path mode are read-only.</div>{:else}<div class="prompt-scopes" role="group" aria-label="Prompt scope"><button aria-pressed={promptScope === 'feedback'} class:active={promptScope === 'feedback'} on:click={() => previewPrompt('feedback')}>Feedback</button><button aria-pressed={promptScope === 'questions'} class:active={promptScope === 'questions'} on:click={() => previewPrompt('questions')}>Questions</button><button aria-pressed={promptScope === 'all'} class:active={promptScope === 'all'} on:click={() => previewPrompt('all')}>All</button><span class="prompt-path-mode" aria-label="Prompt path mode"><button aria-pressed={promptPortable} class:active={promptPortable} on:click={() => { promptPortable = true; void previewPrompt(promptScope); }}>Portable paths</button><button aria-pressed={!promptPortable} class:active={!promptPortable} on:click={() => { promptPortable = false; void previewPrompt(promptScope); }}>Workspace paths</button></span></div>{/if}{#if promptNeedsLargeCopyWarning()}<div class="prompt-size-warning" role="alert">This prompt is unusually large. Copying can exceed clipboard or model limits; it remains unchanged unless you choose to copy it.</div>{/if}<pre>{prompt.content}</pre><footer><span>{promptHistoryId?.startsWith('export:') ? 'Exact durable export; copy and saves never alter annotations.' : promptPortable ? 'Portable prompt: no local filesystem paths.' : 'Workspace-aware prompt: includes local repository paths.'}</span><div><button class="secondary-button" on:click={() => savePrompt('markdown')}>Save Markdown…</button><button class="secondary-button" on:click={() => savePrompt('json')}>Save JSON…</button><button class="secondary-button" on:click={() => prompt = undefined}>Close</button><button class="primary-button" on:click={() => copyPrompt(largePromptCopyWarning)}>{largePromptCopyWarning ? 'Copy large prompt anyway' : 'Copy prompt'}</button></div></footer></dialog></div>
+  <div class="modal-backdrop" role="presentation"><dialog open class="modal prompt-modal" aria-modal="true" aria-labelledby="prompt-title" use:focusTrap={{ onClose: () => prompt = undefined }}><header><div><span class="eyebrow">STRUCTURED EXPORT</span><h2 id="prompt-title">{prompt.title}</h2><p>{prompt.annotationCount} annotations · about {prompt.estimatedTokens.toLocaleString()} tokens</p></div><button class="icon-button" on:click={() => prompt = undefined} aria-label="Close prompt preview">×</button></header>{#if promptHistoryId?.startsWith('export:')}<div class="prompt-exact-note" role="status">Exact durable export · original Markdown and path mode are read-only.</div>{:else}<div class="prompt-scopes" role="group" aria-label="Prompt scope"><button aria-pressed={promptScope === 'feedback'} class:active={promptScope === 'feedback'} on:click={() => previewPrompt('feedback')}>Feedback</button><button aria-pressed={promptScope === 'questions'} class:active={promptScope === 'questions'} on:click={() => previewPrompt('questions')}>Questions</button><button aria-pressed={promptScope === 'all'} class:active={promptScope === 'all'} on:click={() => previewPrompt('all')}>Full</button><span class="prompt-path-mode" aria-label="Prompt path mode"><button aria-pressed={promptPortable} class:active={promptPortable} on:click={() => { promptPortable = true; void previewPrompt(promptScope); }}>Portable paths</button><button aria-pressed={!promptPortable} class:active={!promptPortable} on:click={() => { promptPortable = false; void previewPrompt(promptScope); }}>Qualified paths</button></span></div>{/if}{#if promptNeedsLargeCopyWarning()}<div class="prompt-size-warning" role="alert">This prompt is unusually large. Copying can exceed clipboard or model limits; it remains unchanged unless you choose to copy it.</div>{/if}<pre>{prompt.content}</pre><footer><span>{promptHistoryId?.startsWith('export:') ? 'Exact durable export; copy and saves never alter annotations.' : promptPortable ? 'Portable prompt: no local filesystem paths.' : 'Qualified prompt: repository-qualified logical paths; no local filesystem roots.'}</span><div><button class="secondary-button" on:click={() => savePrompt('markdown')}>Save Markdown…</button><button class="secondary-button" on:click={() => savePrompt('json')}>Save JSON…</button><button class="secondary-button" on:click={() => prompt = undefined}>Close</button><button class="primary-button" on:click={() => copyPrompt(largePromptCopyWarning)}>{largePromptCopyWarning ? 'Copy large prompt anyway' : 'Copy prompt'}</button></div></footer></dialog></div>
 {/if}
 
 {#if showHistory}

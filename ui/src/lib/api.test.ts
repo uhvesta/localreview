@@ -13,6 +13,57 @@ describe('browser fallback API', () => {
     expect(after.annotations).toHaveLength(review.annotations.length);
   });
 
+  it('keeps feedback, question, and full prompt scopes strict', async () => {
+    const api = makeMockApi();
+    const review = await api.loadReview('workspace-localreview');
+    const comment = review.annotations.find((annotation) => annotation.kind === 'comment')!;
+    const question = review.annotations.find((annotation) => annotation.kind === 'question')!;
+    const suggestion = review.annotations.find((annotation) => annotation.kind === 'suggestion')!;
+    const fileNote = { ...comment, id: 'scope-file-note', kind: 'file_note' as const, startLine: 0, endLine: 0, body: 'included file note body' };
+    const reviewNote = { ...comment, id: 'scope-review-note', kind: 'review_note' as const, startLine: 0, endLine: 0, body: 'included review note body', selectedSource: '' };
+    await api.saveAnnotation(review.workspace.id, fileNote);
+    await api.saveAnnotation(review.workspace.id, reviewNote);
+
+    const feedback = await api.generatePrompt(review.workspace.id, { scope: 'feedback', portable: true });
+    expect(feedback.title).toBe('Review feedback');
+    expect(feedback.annotationCount).toBe(2);
+    expect(feedback.content).toContain('# LocalReview feedback');
+    expect(feedback.content).toContain(comment.body);
+    expect(feedback.content).toContain(suggestion.body);
+    expect(feedback.content).not.toContain(question.body);
+    expect(feedback.content).not.toContain('included file note body');
+
+    const questions = await api.generatePrompt(review.workspace.id, { scope: 'questions', portable: true });
+    expect(questions.title).toBe('Questions for investigation');
+    expect(questions.annotationCount).toBe(1);
+    expect(questions.content).toContain('# Review questions');
+    expect(questions.content).toContain('Answer every included question');
+    expect(questions.content).toContain('Question:');
+    expect(questions.content).toContain(question.body);
+    expect(questions.content).not.toContain(comment.body);
+
+    const full = await api.generatePrompt(review.workspace.id, { scope: 'all', portable: true });
+    expect(full.title).toBe('Full review prompt');
+    expect(full.annotationCount).toBe(5);
+    expect(full.content).toContain('# Full LocalReview prompt');
+    expect(full.content).toContain('handle the included file and review notes');
+    expect(full.content).toContain(comment.body);
+    expect(full.content).toContain(question.body);
+    expect(full.content).toContain(suggestion.body);
+    expect(full.content).toContain('included file note body');
+    expect(full.content).toContain('included review note body');
+
+    const selected = await api.generatePrompt(review.workspace.id, { scope: 'selected', annotationIds: [comment.id, question.id], portable: true });
+    expect(selected.annotationCount).toBe(2);
+    expect(selected.content).toContain('# Selected review annotations');
+    expect(selected.content).toContain("Handle only the selected annotations below according to each annotation's stated kind and intent.");
+    expect(selected.content).not.toContain('included file note body');
+    expect(selected.content).not.toContain('included review note body');
+    expect((await api.getReviewHistory(review.workspace.id)).filter((item) => item.type === 'export').map((item) => item.label)).toEqual(expect.arrayContaining([
+      'Review feedback', 'Questions for investigation', 'Full review prompt'
+    ]));
+  });
+
   it('reopens a durable prompt export byte-for-byte without touching annotations', async () => {
     const api = makeMockApi();
     const review = await api.loadReview('workspace-localreview');
@@ -47,8 +98,39 @@ describe('browser fallback API', () => {
     const api = makeMockApi();
     const review = await api.loadReview('workspace-localreview');
     const content = formatPrompt(review, [...review.annotations].reverse(), true);
-    expect(content).toContain('# LocalReview review prompt');
+    expect(content).toContain('# Full LocalReview prompt');
     expect(content.indexOf('ui/src/App.svelte')).toBeLessThan(content.indexOf('ui/src/lib/api.ts'));
+    expect(content).not.toContain('Filesystem path:');
+  });
+
+  it('keeps prompt paths logical and handles anchorless review notes', async () => {
+    const api = makeMockApi();
+    const review = await api.loadReview('workspace-localreview');
+    review.workspace.name = 'file:///private/var/tmp/logical-review';
+    review.workspace.location = '/private/var/folders/cache/localreview/reviews/worktree';
+    const anchored = review.annotations[0]!;
+    const repository = review.repositories.find((item) => item.id === anchored.repositoryId)!;
+    repository.path = 'file:///private/var/tmp/cache/repository';
+    const reviewNote = {
+      ...anchored,
+      id: 'review-note-path-test',
+      repositoryId: '',
+      fileId: '',
+      kind: 'review_note' as const,
+      startLine: 0,
+      endLine: 0,
+      body: 'Keep this overall observation portable.',
+      selectedSource: ''
+    };
+
+    const content = formatPrompt(review, [anchored, reviewNote], false, 'all');
+    expect(content).toContain('Workspace: logical-review');
+    expect(content).toContain(`Repository \`repository:${repository.id}\``);
+    expect(content).toContain(`Logical path: \`repository:${repository.id}/ui/src/App.svelte\``);
+    expect(content).toContain('## Overall review');
+    expect(content).toContain('Keep this overall observation portable.');
+    expect(content).not.toContain('/private/var');
+    expect(content).not.toContain('file:///');
     expect(content).not.toContain('Filesystem path:');
   });
 

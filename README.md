@@ -45,6 +45,8 @@ Tauri's Apple notarization credentials. Always verify the finished app after
 all resources have been bundled:
 
 ```sh
+codesign --verify --strict \
+  target/release/bundle/macos/LocalReview.app/Contents/Resources/localreview-sidecars/difft
 codesign --verify --deep --strict target/release/bundle/macos/LocalReview.app
 spctl --assess --type execute --verbose target/release/bundle/macos/LocalReview.app
 ```
@@ -52,19 +54,30 @@ spctl --assess --type execute --verbose target/release/bundle/macos/LocalReview.
 The Tauri macOS build automatically provisions the ignored, generated
 Difftastic 0.69.0 sidecar before bundling. It downloads the pinned Apple
 Silicon and Intel release archives, verifies their SHA-256 digests, creates a
-universal executable, and verifies its architectures, version, and final
-digest. To provision or verify it independently:
+universal executable, and verifies its architectures, version, and final raw
+digest. The verified unsigned binary is cached under the ignored `target/`
+tree. A copy is placed in Tauri resources and, when
+`APPLE_SIGNING_IDENTITY` is set, signed before Tauri signs the enclosing app.
+Use `-` for an ad-hoc local signature; a production identity enables hardened
+runtime and a trusted timestamp. To provision or verify it independently:
 
 ```sh
 scripts/package-difftastic-macos.sh --ensure
 scripts/package-difftastic-macos.sh --check
+
+APPLE_SIGNING_IDENTITY=- scripts/package-difftastic-macos.sh --ensure
+APPLE_SIGNING_IDENTITY=- scripts/package-difftastic-macos.sh --check
 ```
 
 Run the script without an option to force a clean rebuild. The generated file
 at `src-tauri/resources/localreview-sidecars/difft` is intentionally ignored;
-do not commit it or use a user-global `difft` installation. Linux companion
-assets remain pinned in the Rust adapter and are packaged by their target's
-release pipeline.
+do not commit it or the ignored `target/localreview-sidecars/difft-unsigned`
+cache, and do not use a user-global `difft` installation. The pinned universal
+SHA-256 authenticates only the unsigned cache because code signing necessarily
+changes Mach-O bytes. `--check` verifies the cache and the resource mode
+selected by `APPLE_SIGNING_IDENTITY`; run it with the same identity setting as
+the build. Linux companion assets remain pinned in the Rust adapter and are
+packaged by their target's release pipeline.
 
 Run all source gates:
 
@@ -136,6 +149,24 @@ enabled = false
 ```
 
 Explicit CLI/GUI inputs take precedence. LocalReview never rewrites this file.
+
+## Syntax highlighting
+
+Unified, Split, and Full File views use pinned Tree-sitter grammars and render
+semantic byte spans as escaped text. The native grammar bundle currently
+covers Rust, JavaScript, TypeScript/TSX, JSON, Python, Markdown, shell, Swift,
+Starlark/Bazel, TOML, YAML, Go, Java, C, C++, HTML/XML/SVG, CSS, Ruby, PHP, C#,
+Kotlin, Lua, Scala, R, Elixir, OCaml, SQL, Nix, and Zig. For local Git
+worktrees, resolution prefers a recognized `linguist-language` override from
+Git's `.gitattributes` rules, then special filenames, extensions, and
+shebangs. Remote captures currently use the latter deterministic rules.
+
+An unknown language always renders as safe monospaced plain text. Svelte, Vue,
+and Astro also use that fallback until mixed-language injection grammars are
+pinned. HCL/Terraform, Dart, Perl, and Dockerfile are recognized but currently
+fall back to plain text because their available Rust grammar packages require
+an incompatible Tree-sitter ABI or API. This fallback never hides source or
+changes diff/annotation geometry.
 
 ## Data and privacy
 

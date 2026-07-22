@@ -5,6 +5,7 @@
 //! review UI. It never uses a user-global `difft` binary or a shell command.
 
 use std::{
+    collections::HashMap,
     ffi::{OsStr, OsString},
     fs,
     io::{self, Read},
@@ -162,7 +163,11 @@ impl Default for DifftasticPolicy {
             max_input_bytes: 512 * 1024,
             max_output_bytes: 4 * 1024 * 1024,
             max_stderr_bytes: 64 * 1024,
-            graph_limit: 250_000,
+            // Match the pinned sidecar's upstream default. The previous
+            // 250k cap made ordinary medium-sized Rust/Java/TypeScript files
+            // silently degrade to a line-oriented diff long before the
+            // bounded process timeout or output limit was reached.
+            graph_limit: 3_000_000,
             parse_error_limit: 0,
         }
     }
@@ -391,7 +396,13 @@ impl DifftasticAdapter {
         match normalize_json_output(&output.stdout.bytes, &old, &new, request.display) {
             Ok(document) => {
                 if document.line_oriented {
-                    DifftasticOutcome::fallback(DifftasticFallbackReason::LineOrParseFallback)
+                    DifftasticOutcome::fallback_with_detail(
+                        DifftasticFallbackReason::LineOrParseFallback,
+                        format!(
+                            "Difftastic used its line-oriented {:?} backend",
+                            document.language
+                        ),
+                    )
                 } else {
                     DifftasticOutcome::Structural(document)
                 }
@@ -478,8 +489,8 @@ pub enum DifftasticFileStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DifftasticAlignment {
-    /// 1-based canonical line numbers. `None` represents an explicit empty
-    /// side in a structural side-by-side row.
+    /// 1-based canonical line numbers for the corresponding normalized
+    /// structural row. `None` represents an explicit empty side.
     pub old_line_number: Option<u32>,
     pub new_line_number: Option<u32>,
 }
@@ -554,8 +565,16 @@ struct TempSnapshots {
 impl TempSnapshots {
     fn create(request: &DifftasticRequest) -> Result<Self, String> {
         let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let old_path = snapshot_path(directory.path(), "old", &request.old.path);
-        let new_path = snapshot_path(directory.path(), "new", &request.new.path);
+        // Keep the logical basename byte-for-byte. Difftastic recognizes not
+        // only extensions but special names such as Cargo.lock, Dockerfile,
+        // BUILD, and Gemfile. Prefixing snapshots with `old-`/`new-` changed
+        // those names and incorrectly selected the plain-text backend.
+        let old_directory = directory.path().join("old");
+        let new_directory = directory.path().join("new");
+        fs::create_dir_all(&old_directory).map_err(|error| error.to_string())?;
+        fs::create_dir_all(&new_directory).map_err(|error| error.to_string())?;
+        let old_path = snapshot_path(&old_directory, &request.old.path);
+        let new_path = snapshot_path(&new_directory, &request.new.path);
         fs::write(&old_path, &request.old.content).map_err(|error| error.to_string())?;
         fs::write(&new_path, &request.new.content).map_err(|error| error.to_string())?;
         Ok(Self {
@@ -566,12 +585,12 @@ impl TempSnapshots {
     }
 }
 
-fn snapshot_path(directory: &Path, side: &str, logical_path: &Path) -> PathBuf {
+fn snapshot_path(directory: &Path, logical_path: &Path) -> PathBuf {
     let filename = logical_path
         .file_name()
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| OsStr::new("review.txt"));
-    directory.join(format!("{side}-{}", filename.to_string_lossy()))
+    directory.join(filename)
 }
 
 struct BoundedOutput {
@@ -761,25 +780,68 @@ fn normalize_json_output(
         }
     };
     let status = parse_status(&raw.status)?;
-    let line_oriented = raw.language.eq_ignore_ascii_case("text")
-        || raw.language.eq_ignore_ascii_case("binary")
-        || raw.language.eq_ignore_ascii_case("plaintext");
+    // Limit-triggered fallbacks are reported as strings such as
+    // `Text (exceeded DFT_GRAPH_LIMIT)`. Treat every decorated text backend
+    // as an explicit fallback before validating its line-oriented change
+    // spans, which may legitimately contain zero-width alignment markers.
+    let language = raw.language.trim();
+    let line_oriented = language.eq_ignore_ascii_case("text")
+        || language.eq_ignore_ascii_case("binary")
+        || language.eq_ignore_ascii_case("plaintext")
+        || language
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("text "));
+    if line_oriented {
+        return Ok(DifftasticPresentation {
+            schema_version: NORMALIZED_SCHEMA_VERSION,
+            display,
+            language: raw.language,
+            status,
+            line_oriented: true,
+            alignment: Vec::new(),
+            chunks: Vec::new(),
+        });
+    }
     let old_lines = source_lines(old_source);
     let new_lines = source_lines(new_source);
-    let alignment = raw
-        .aligned_lines
-        .into_iter()
-        .map(|(old, new)| {
-            Ok(DifftasticAlignment {
-                old_line_number: validate_line_number(old, &old_lines, "old alignment")?,
-                new_line_number: validate_line_number(new, &new_lines, "new alignment")?,
-            })
-        })
-        .collect::<Result<Vec<_>, DifftasticError>>()?;
+    // `aligned_lines` is the complete-file display order. `chunks` contains
+    // only structurally novel rows and upstream serializes each chunk from a
+    // map whose tuple ordering does not necessarily match source order. Keep
+    // only the sparse structural rows, but order and align them through the
+    // authoritative complete-file map.
+    let mut alignment_positions = HashMap::with_capacity(raw.aligned_lines.len());
+    for (index, &(old, new)) in raw.aligned_lines.iter().enumerate() {
+        validate_line_number(old, &old_lines, "old alignment")?;
+        validate_line_number(new, &new_lines, "new alignment")?;
+        if old.is_none() && new.is_none() {
+            return Err(DifftasticError::InvalidSchema(
+                "alignment row unexpectedly lacks both sides".into(),
+            ));
+        }
+        if alignment_positions.insert((old, new), index).is_some() {
+            return Err(DifftasticError::InvalidSchema(
+                "alignment contains a duplicate row".into(),
+            ));
+        }
+    }
     let chunks = raw
         .chunks
         .into_iter()
-        .map(|rows| {
+        .map(|mut rows| {
+            let mut invalid_row = None;
+            rows.sort_by_key(|row| {
+                let key = raw_row_key(row);
+                let position = alignment_positions.get(&key).copied();
+                if position.is_none() {
+                    invalid_row = Some(key);
+                }
+                position.unwrap_or(usize::MAX)
+            });
+            if let Some((old, new)) = invalid_row {
+                return Err(DifftasticError::InvalidSchema(format!(
+                    "structural row ({old:?}, {new:?}) is absent from alignment"
+                )));
+            }
             rows.into_iter()
                 .map(|row| {
                     Ok(DifftasticRow {
@@ -791,6 +853,23 @@ fn normalize_json_output(
                 .map(|rows| DifftasticChunk { rows })
         })
         .collect::<Result<Vec<_>, DifftasticError>>()?;
+    let chunks = match &status {
+        DifftasticFileStatus::Created if chunks.is_empty() => {
+            single_sided_chunk(new_source, DifftasticSide::New)
+        }
+        DifftasticFileStatus::Deleted if chunks.is_empty() => {
+            single_sided_chunk(old_source, DifftasticSide::Old)
+        }
+        _ => chunks,
+    };
+    let alignment = chunks
+        .iter()
+        .flat_map(|chunk| chunk.rows.iter())
+        .map(|row| DifftasticAlignment {
+            old_line_number: row.old.as_ref().map(|cell| cell.line_number),
+            new_line_number: row.new.as_ref().map(|cell| cell.line_number),
+        })
+        .collect();
     Ok(DifftasticPresentation {
         schema_version: NORMALIZED_SCHEMA_VERSION,
         display,
@@ -800,6 +879,46 @@ fn normalize_json_output(
         alignment,
         chunks,
     })
+}
+
+fn raw_row_key(row: &RawRow) -> (Option<u32>, Option<u32>) {
+    (
+        row.lhs.as_ref().map(|cell| cell.line_number),
+        row.rhs.as_ref().map(|cell| cell.line_number),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum DifftasticSide {
+    Old,
+    New,
+}
+
+fn single_sided_chunk(source: &str, side: DifftasticSide) -> Vec<DifftasticChunk> {
+    let rows = source
+        .lines()
+        .enumerate()
+        .map(|(index, text)| {
+            let cell = DifftasticCell {
+                line_number: u32::try_from(index).unwrap_or(u32::MAX).saturating_add(1),
+                text: text.to_owned(),
+                changed_spans: Vec::new(),
+            };
+            match side {
+                DifftasticSide::Old => DifftasticRow {
+                    old: Some(cell),
+                    new: None,
+                },
+                DifftasticSide::New => DifftasticRow {
+                    old: None,
+                    new: Some(cell),
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    rows.is_empty()
+        .then(Vec::new)
+        .unwrap_or_else(|| vec![DifftasticChunk { rows }])
 }
 
 fn parse_status(value: &str) -> Result<DifftasticFileStatus, DifftasticError> {
@@ -921,6 +1040,43 @@ mod tests {
         }
     }
 
+    fn language_request(path: &str, old: &str, new: &str) -> DifftasticRequest {
+        DifftasticRequest {
+            old: DifftasticInput {
+                path: PathBuf::from(path),
+                content: old.as_bytes().to_vec(),
+            },
+            new: DifftasticInput {
+                path: PathBuf::from(path),
+                content: new.as_bytes().to_vec(),
+            },
+            display: DifftasticDisplay::SideBySide,
+            background: DifftasticBackground::Dark,
+            width: 120,
+        }
+    }
+
+    #[test]
+    fn snapshot_paths_preserve_extensionless_language_filenames() {
+        let request = language_request("nested/Cargo.lock", "version = 3\n", "version = 4\n");
+        let snapshots = TempSnapshots::create(&request).expect("snapshots");
+
+        assert_eq!(
+            snapshots.old_path.file_name(),
+            Some(OsStr::new("Cargo.lock"))
+        );
+        assert_eq!(
+            snapshots.new_path.file_name(),
+            Some(OsStr::new("Cargo.lock"))
+        );
+        assert_ne!(snapshots.old_path.parent(), snapshots.new_path.parent());
+    }
+
+    #[test]
+    fn default_graph_limit_matches_the_pinned_sidecar_default() {
+        assert_eq!(DifftasticPolicy::default().graph_limit, 3_000_000);
+    }
+
     #[test]
     fn normalizes_pinned_json_fixture_to_private_schema() {
         let request = fixture_request();
@@ -932,7 +1088,9 @@ mod tests {
         assert_eq!(document.schema_version, NORMALIZED_SCHEMA_VERSION);
         assert_eq!(document.status, DifftasticFileStatus::Changed);
         assert_eq!(document.language, "Rust");
-        assert_eq!(document.alignment[1].old_line_number, Some(2));
+        assert_eq!(document.alignment.len(), 1);
+        assert_eq!(document.alignment[0].old_line_number, Some(2));
+        assert_eq!(document.alignment[0].new_line_number, Some(2));
         let row = &document.chunks[0].rows[0];
         assert_eq!(row.old.as_ref().map(|cell| cell.line_number), Some(2));
         assert_eq!(
@@ -943,6 +1101,114 @@ mod tests {
             row.new.as_ref().map(|cell| cell.changed_spans.len()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn orders_sparse_structural_rows_by_complete_file_alignment() {
+        let output = br#"{
+            "aligned_lines":[[0,0],[null,1],[1,2],[2,3]],
+            "chunks":[[
+                {"rhs":{"line_number":1,"changes":[{"start":0,"end":6,"content":"insert","highlight":"normal"}]}},
+                {"lhs":{"line_number":0,"changes":[{"start":0,"end":5,"content":"alpha","highlight":"normal"}]},
+                 "rhs":{"line_number":0,"changes":[{"start":0,"end":6,"content":"alpha!","highlight":"normal"}]}}
+            ]],
+            "language":"Rust","status":"changed"
+        }"#;
+        let document = normalize_json_output(
+            output,
+            "alpha\nkeep\n",
+            "alpha!\ninsert\nkeep\n",
+            DifftasticDisplay::SideBySide,
+        )
+        .expect("real 0.69-shaped sparse output");
+
+        let rows = &document.chunks[0].rows;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].old.as_ref().map(|cell| cell.line_number), Some(1));
+        assert_eq!(rows[0].new.as_ref().map(|cell| cell.line_number), Some(1));
+        assert_eq!(rows[1].old, None);
+        assert_eq!(rows[1].new.as_ref().map(|cell| cell.line_number), Some(2));
+        assert_eq!(
+            document.alignment,
+            vec![
+                DifftasticAlignment {
+                    old_line_number: Some(1),
+                    new_line_number: Some(1),
+                },
+                DifftasticAlignment {
+                    old_line_number: None,
+                    new_line_number: Some(2),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn materializes_created_and_deleted_sources_when_upstream_omits_chunks() {
+        let created = normalize_json_output(
+            br#"{"language":"Rust","status":"created"}"#,
+            "",
+            "fn main() {\n}\n",
+            DifftasticDisplay::SideBySide,
+        )
+        .expect("created output");
+        assert_eq!(created.status, DifftasticFileStatus::Created);
+        assert_eq!(created.chunks[0].rows.len(), 2);
+        assert!(created.chunks[0]
+            .rows
+            .iter()
+            .all(|row| row.old.is_none() && row.new.is_some()));
+        assert_eq!(created.alignment[1].new_line_number, Some(2));
+
+        let deleted = normalize_json_output(
+            br#"{"language":"Rust","status":"deleted"}"#,
+            "fn main() {\n}\n",
+            "",
+            DifftasticDisplay::SideBySide,
+        )
+        .expect("deleted output");
+        assert_eq!(deleted.status, DifftasticFileStatus::Deleted);
+        assert_eq!(deleted.chunks[0].rows.len(), 2);
+        assert!(deleted.chunks[0]
+            .rows
+            .iter()
+            .all(|row| row.old.is_some() && row.new.is_none()));
+        assert_eq!(deleted.alignment[1].old_line_number, Some(2));
+    }
+
+    #[test]
+    fn unchanged_content_from_a_pure_rename_has_an_explicit_empty_presentation() {
+        let document = normalize_json_output(
+            br#"{"language":"Rust","status":"unchanged"}"#,
+            "fn main() {}\n",
+            "fn main() {}\n",
+            DifftasticDisplay::SideBySide,
+        )
+        .expect("unchanged renamed content");
+
+        assert_eq!(document.status, DifftasticFileStatus::Unchanged);
+        assert!(document.chunks.is_empty());
+        assert!(document.alignment.is_empty());
+    }
+
+    #[test]
+    fn decorated_text_backend_is_an_explicit_line_oriented_result() {
+        let document = normalize_json_output(
+            br#"{
+                "aligned_lines":[[0,0]],
+                "chunks":[[{"lhs":{"line_number":0,"changes":[{"start":0,"end":0,"content":"","highlight":"normal"}]}}]],
+                "language":"Text (exceeded DFT_GRAPH_LIMIT)",
+                "status":"changed"
+            }"#,
+            "old\n",
+            "new\n",
+            DifftasticDisplay::SideBySide,
+        )
+        .expect("line-oriented output should not be parsed as structural spans");
+
+        assert!(document.line_oriented);
+        assert_eq!(document.language, "Text (exceeded DFT_GRAPH_LIMIT)");
+        assert!(document.chunks.is_empty());
     }
 
     #[test]
@@ -1025,6 +1291,154 @@ mod tests {
                 panic!("real pinned sidecar unexpectedly fell back: {reason:?}");
             }
         }
+    }
+
+    /// Exercises language selection through the same private snapshot path
+    /// used by the native app. There is intentionally no LocalReview language
+    /// allowlist: preserving the logical basename lets the pinned Difftastic
+    /// executable accept every grammar it ships.
+    #[test]
+    fn packaged_pinned_sidecar_accepts_representative_languages_when_supplied() {
+        let Some(executable) = std::env::var_os("LOCALREVIEW_TEST_DIFFTASTIC_SIDECAR") else {
+            return;
+        };
+        let adapter = DifftasticAdapter::new_for_testing(
+            PathBuf::from(executable),
+            DifftasticPolicy::default(),
+        );
+        let cases = [
+            (
+                "Example.java",
+                "class Example { int value() { return 1; } }\n",
+                "class Example { int value() { return 2; } }\n",
+            ),
+            (
+                "main.go",
+                "package main\nfunc value() int { return 1 }\n",
+                "package main\nfunc value() int { return 2 }\n",
+            ),
+            ("rules.bzl", "VALUE = 1\n", "VALUE = 2\n"),
+            ("example.py", "value = 1\n", "value = 2\n"),
+            ("example.js", "const value = 1;\n", "const value = 2;\n"),
+            (
+                "example.ts",
+                "const value: number = 1;\n",
+                "const value: number = 2;\n",
+            ),
+            ("example.yaml", "value: 1\n", "value: 2\n"),
+            (
+                "example.rs",
+                "const VALUE: u8 = 1;\n",
+                "const VALUE: u8 = 2;\n",
+            ),
+            (
+                "Cargo.lock",
+                "version = 3\n\n[[package]]\nname = \"old\"\nversion = \"1.0.0\"\n",
+                "version = 3\n\n[[package]]\nname = \"new\"\nversion = \"1.0.0\"\n",
+            ),
+        ];
+
+        for (path, old, new) in cases {
+            match adapter.render(&language_request(path, old, new), None) {
+                DifftasticOutcome::Structural(document) => {
+                    assert!(
+                        !document.line_oriented,
+                        "{path} unexpectedly used a line-oriented backend"
+                    );
+                    assert!(
+                        !document.chunks.is_empty(),
+                        "{path} did not produce structural rows"
+                    );
+                }
+                DifftasticOutcome::CanonicalFallback(reason) => {
+                    panic!("{path} unexpectedly fell back: {reason:?}");
+                }
+            }
+        }
+    }
+
+    /// Release-only semantic coverage for status-specific shapes that the
+    /// upstream JSON format intentionally leaves empty for whole-file changes.
+    #[test]
+    fn packaged_pinned_sidecar_preserves_created_deleted_and_renamed_semantics_when_supplied() {
+        let Some(executable) = std::env::var_os("LOCALREVIEW_TEST_DIFFTASTIC_SIDECAR") else {
+            return;
+        };
+        let adapter = DifftasticAdapter::new_for_testing(
+            PathBuf::from(executable),
+            DifftasticPolicy::default(),
+        );
+        let render = |old_path: &str, old: &[u8], new_path: &str, new: &[u8]| {
+            adapter.render(
+                &DifftasticRequest {
+                    old: DifftasticInput {
+                        path: PathBuf::from(old_path),
+                        content: old.to_vec(),
+                    },
+                    new: DifftasticInput {
+                        path: PathBuf::from(new_path),
+                        content: new.to_vec(),
+                    },
+                    display: DifftasticDisplay::SideBySide,
+                    background: DifftasticBackground::Dark,
+                    width: 120,
+                },
+                None,
+            )
+        };
+
+        let created = render("src/added.rs", b"", "src/added.rs", b"fn added() {}\n");
+        let DifftasticOutcome::Structural(created) = created else {
+            panic!("created Rust file unexpectedly fell back");
+        };
+        assert_eq!(created.status, DifftasticFileStatus::Created);
+        assert_eq!(
+            created.chunks[0].rows[0].new.as_ref().unwrap().line_number,
+            1
+        );
+
+        let deleted = render("src/gone.rs", b"fn gone() {}\n", "src/gone.rs", b"");
+        let DifftasticOutcome::Structural(deleted) = deleted else {
+            panic!("deleted Rust file unexpectedly fell back");
+        };
+        assert_eq!(deleted.status, DifftasticFileStatus::Deleted);
+        assert_eq!(
+            deleted.chunks[0].rows[0].old.as_ref().unwrap().line_number,
+            1
+        );
+
+        let renamed = render(
+            "src/before.rs",
+            b"fn value() -> u8 { 1 }\n",
+            "src/after.rs",
+            b"fn value() -> u8 { 2 }\n",
+        );
+        let DifftasticOutcome::Structural(renamed) = renamed else {
+            panic!("modified rename unexpectedly fell back");
+        };
+        assert_eq!(renamed.status, DifftasticFileStatus::Changed);
+        assert_eq!(
+            renamed.alignment.len(),
+            renamed
+                .chunks
+                .iter()
+                .map(|chunk| chunk.rows.len())
+                .sum::<usize>()
+        );
+        assert_eq!(renamed.alignment[0].old_line_number, Some(1));
+        assert_eq!(renamed.alignment[0].new_line_number, Some(1));
+
+        let pure_rename = render(
+            "src/before.rs",
+            b"fn value() -> u8 { 1 }\n",
+            "src/after.rs",
+            b"fn value() -> u8 { 1 }\n",
+        );
+        let DifftasticOutcome::Structural(pure_rename) = pure_rename else {
+            panic!("pure rename unexpectedly fell back");
+        };
+        assert_eq!(pure_rename.status, DifftasticFileStatus::Unchanged);
+        assert!(pure_rename.chunks.is_empty());
     }
 
     #[cfg(unix)]

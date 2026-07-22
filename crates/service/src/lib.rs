@@ -21,11 +21,11 @@ use localreview_diff::{
     SourceDocument,
 };
 use localreview_domain::{
-    Annotation, AnnotationId, AnnotationSet, BaseReference, BaselineRequest, ComparisonId,
-    ComparisonOptions, ContentFingerprint, DiffSide, GitSha, PromptExportId, PromptExportRecord,
-    PromptScope, Repository, RepositoryComparison, RepositoryId, ReviewFileClassification,
-    ReviewFileId, ReviewSession, ReviewSessionId, ReviewSessionStatus, StoredPath, Workspace,
-    WorkspaceId, WorkspaceSource,
+    is_safe_repository_relative_path, Annotation, AnnotationId, AnnotationSet, BaseReference,
+    BaselineRequest, ComparisonId, ComparisonOptions, ContentFingerprint, DiffSide, GitSha,
+    PromptExportId, PromptExportRecord, PromptScope, Repository, RepositoryComparison,
+    RepositoryId, ReviewFileClassification, ReviewFileId, ReviewSession, ReviewSessionId,
+    ReviewSessionStatus, StoredPath, Workspace, WorkspaceId, WorkspaceSource,
 };
 use localreview_git::{
     classify_review_file, discover_repositories, CapturedLocalComparison, CapturedTrackedFile,
@@ -35,7 +35,7 @@ use localreview_git::{
 use localreview_persistence::{PersistenceError, PreparedReviewGeneration, StateStore};
 use thiserror::Error;
 
-pub const PROMPT_TEMPLATE_VERSION: u32 = 1;
+pub const PROMPT_TEMPLATE_VERSION: u32 = 2;
 pub const MAX_CHANGED_SINCE_PREVIOUS_REVIEW_FILES: usize = 5_000;
 pub const MAX_REVIEW_FILE_CLASSIFICATIONS: usize = 10_000;
 
@@ -1177,11 +1177,11 @@ impl ReviewService {
 #[must_use]
 pub fn prompt_title_for_scope(scope: &PromptScope) -> &'static str {
     match scope {
-        PromptScope::AllQuestions | PromptScope::FocusedQuestion(_) => {
-            "Questions for investigation"
-        }
-        PromptScope::AllActionable | PromptScope::Selected(_) => "Review feedback",
-        PromptScope::CommentsAndQuestions => "Review feedback and questions",
+        PromptScope::AllQuestions => "Questions for investigation",
+        PromptScope::FocusedQuestion(_) => "Focused code question",
+        PromptScope::AllActionable => "Review feedback",
+        PromptScope::Selected(_) => "Selected review annotations",
+        PromptScope::CommentsAndQuestions => "Full review prompt",
     }
 }
 
@@ -1491,9 +1491,63 @@ fn surrounding_context(lines: &[&str], start: u32, end: u32) -> String {
 /// Deterministic Markdown suitable for deliberate clipboard/file handoff. It
 /// only interpolates review objects supplied by the caller, never command
 /// output, environment variables, credentials, ignored paths, or unrelated IO.
+fn prompt_relative_path(path: &StoredPath, fallback: String) -> String {
+    let value = path.as_str();
+    let bytes = value.as_bytes();
+    let windows_absolute = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+    if is_safe_repository_relative_path(path)
+        && !windows_absolute
+        && !value.starts_with('\\')
+        && !value.starts_with('~')
+        && !value.contains("://")
+        && !value
+            .chars()
+            .any(|character| character.is_control() || character == '`')
+    {
+        value.to_owned()
+    } else {
+        fallback
+    }
+}
+
+fn prompt_workspace_name(value: &str) -> String {
+    let trimmed = value.trim();
+    // Display names written by older builds sometimes contained the complete
+    // workspace location (including file:// URLs). A prompt needs only a
+    // human label, so retain at most the final path component regardless of
+    // which platform produced the stored value.
+    let candidate = if trimmed.contains(['/', '\\']) {
+        trimmed
+            .rsplit(['/', '\\'])
+            .find(|segment| !segment.is_empty())
+            .unwrap_or("workspace")
+    } else {
+        trimmed
+    };
+    if candidate.is_empty()
+        || candidate
+            .chars()
+            .any(|character| character.is_control() || character == '`')
+    {
+        "workspace".to_owned()
+    } else {
+        candidate.to_owned()
+    }
+}
+
+fn prompt_logical_path(repository: &str, file: &str) -> String {
+    if repository == "." {
+        file.to_owned()
+    } else {
+        format!("{repository}/{file}")
+    }
+}
+
 #[must_use]
 pub fn format_prompt(request: &PromptRequest) -> FormattedPrompt {
-    let focused_question = matches!(request.scope, PromptScope::FocusedQuestion(_));
     let mut entries = request
         .entries
         .iter()
@@ -1554,14 +1608,27 @@ pub fn format_prompt(request: &PromptRequest) -> FormattedPrompt {
             ))
     });
     let mut output = String::new();
-    if focused_question {
-        output.push_str("# Read-only review question\n\nAnswer the question using the supplied review context. Do not modify source files.\n");
-    } else {
-        output.push_str("# LocalReview feedback\n\nAddress every actionable item below, preserve unrelated behavior, and report how each item was handled. Questions are informational unless explicitly requested.\n");
+    match &request.scope {
+        PromptScope::FocusedQuestion(_) => {
+            output.push_str("# Read-only review question\n\nAnswer the question using the supplied review context. Do not modify source files.\n");
+        }
+        PromptScope::AllQuestions => {
+            output.push_str("# Review questions\n\nAnswer every included question using the supplied review context. Do not modify source files.\n");
+        }
+        PromptScope::CommentsAndQuestions => {
+            output.push_str("# Full LocalReview prompt\n\nAddress the included feedback, answer the included questions, and handle the included file and review notes. Preserve unrelated behavior and report how each item was handled.\n");
+        }
+        PromptScope::Selected(_) => {
+            output.push_str("# Selected review annotations\n\nHandle only the selected annotations below according to each annotation's stated kind and intent. Preserve unrelated behavior and report how each selected item was handled.\n");
+        }
+        PromptScope::AllActionable => {
+            output.push_str("# LocalReview feedback\n\nAddress every actionable item below, preserve unrelated behavior, and report how each item was handled.\n");
+        }
     }
     output.push_str(&format!(
         "\nWorkspace: `{}`\nReview: `{}`\n",
-        request.workspace.display_name, request.review_session_id
+        prompt_workspace_name(&request.workspace.display_name),
+        request.review_session_id
     ));
     let mut last_repository = None::<Option<RepositoryId>>;
     let mut last_file = None::<String>;
@@ -1569,10 +1636,11 @@ pub fn format_prompt(request: &PromptRequest) -> FormattedPrompt {
         let repository_id = entry.repository.as_ref().map(|repository| repository.id);
         if last_repository != Some(repository_id) {
             if let (Some(repository), Some(comparison)) = (&entry.repository, &entry.comparison) {
-                output.push_str(&format!("\n## Repository `{}`\n", repository.relative_path));
-                if request.workspace_aware_paths {
-                    output.push_str(&format!("Local path: `{}`\n", repository.worktree_path));
-                }
+                let repository_path = prompt_relative_path(
+                    &repository.relative_path,
+                    format!("repository:{}", repository.id),
+                );
+                output.push_str(&format!("\n## Repository `{repository_path}`\n"));
                 output.push_str(&format!(
                     "Requested base: `{}`\nMerge base: `{}`\nTarget HEAD: `{}`\nSnapshot: `{}`\n",
                     comparison.requested_base,
@@ -1589,15 +1657,31 @@ pub fn format_prompt(request: &PromptRequest) -> FormattedPrompt {
             last_repository = Some(repository_id);
             last_file = None;
         }
-        let file_key = entry
-            .annotation
-            .anchor
-            .as_ref()
-            .map_or("(overall review)".to_owned(), |anchor| {
-                anchor.file_path.as_str().to_owned()
-            });
+        let file_key =
+            entry
+                .annotation
+                .anchor
+                .as_ref()
+                .map_or("(overall review)".to_owned(), |anchor| {
+                    prompt_relative_path(
+                        &anchor.file_path,
+                        format!("captured-file:{}", entry.annotation.id),
+                    )
+                });
         if last_file.as_deref() != Some(&file_key) {
             output.push_str(&format!("\n### `{file_key}`\n"));
+            if request.workspace_aware_paths {
+                if let Some(repository) = &entry.repository {
+                    let repository_path = prompt_relative_path(
+                        &repository.relative_path,
+                        format!("repository:{}", repository.id),
+                    );
+                    output.push_str(&format!(
+                        "Logical path: `{}`\n",
+                        prompt_logical_path(&repository_path, &file_key)
+                    ));
+                }
+            }
             last_file = Some(file_key);
         }
         output.push_str(&format!("\n#### {:?}\n", entry.annotation.kind));
@@ -1622,7 +1706,13 @@ pub fn format_prompt(request: &PromptRequest) -> FormattedPrompt {
                 &anchor.surrounding_context,
             );
         }
-        output.push_str("Feedback:\n\n");
+        output.push_str(match entry.annotation.kind {
+            localreview_domain::AnnotationKind::Comment => "Feedback:\n\n",
+            localreview_domain::AnnotationKind::Question => "Question:\n\n",
+            localreview_domain::AnnotationKind::Suggestion => "Suggestion:\n\n",
+            localreview_domain::AnnotationKind::FileNote => "File note:\n\n",
+            localreview_domain::AnnotationKind::ReviewNote => "Review note:\n\n",
+        });
         output.push_str(&entry.annotation.body_markdown);
         output.push('\n');
         if let Some(hunk) = &entry.relevant_hunk {
@@ -1649,12 +1739,7 @@ fn scope_includes(scope: &PromptScope, annotation: &Annotation) -> bool {
                 && annotation.state == localreview_domain::AnnotationState::Open
         }
         PromptScope::CommentsAndQuestions => {
-            matches!(
-                annotation.kind,
-                localreview_domain::AnnotationKind::Comment
-                    | localreview_domain::AnnotationKind::Question
-                    | localreview_domain::AnnotationKind::Suggestion
-            ) && annotation.state == localreview_domain::AnnotationState::Open
+            annotation.state == localreview_domain::AnnotationState::Open
         }
         PromptScope::Selected(ids) => ids.contains(&annotation.id),
         PromptScope::FocusedQuestion(id) => {
@@ -1685,7 +1770,7 @@ fn fenced(output: &mut String, heading: &str, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, process::Command};
+    use std::{collections::BTreeSet, fs, path::Path, process::Command};
 
     use chrono::Utc;
     use localreview_domain::{
@@ -1816,7 +1901,7 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        let request = PromptRequest {
+        let mut request = PromptRequest {
             workspace,
             review_session_id: ReviewSessionId::new(),
             annotation_set_id: question.annotation_set_id,
@@ -1843,6 +1928,168 @@ mod tests {
         assert!(formatted.markdown.contains("Read-only review question"));
         assert!(!formatted.markdown.contains("Handle errors."));
         assert!(formatted.markdown.contains("Why is this safe?"));
+        assert!(!formatted.markdown.contains("/tmp/"));
+
+        request.workspace_aware_paths = true;
+        request.workspace.display_name = "/private/var/folders/review-workspace".into();
+        request.entries[1]
+            .repository
+            .as_mut()
+            .unwrap()
+            .worktree_path =
+            StoredPath::from("/private/var/folders/cache/localreview/reviews/123/worktree");
+        let qualified = format_prompt(&request);
+        assert!(qualified.markdown.contains("Workspace: `review-workspace`"));
+        assert!(qualified.markdown.contains("Logical path: `a/src/lib.rs`"));
+        assert!(!qualified.markdown.contains("/private/var"));
+        assert!(!qualified.markdown.contains("Local path:"));
+
+        let repository_id = request.entries[1].repository.as_ref().unwrap().id;
+        request.entries[1]
+            .repository
+            .as_mut()
+            .unwrap()
+            .relative_path = StoredPath::from("/private/cache/repository");
+        let annotation_id = request.entries[1].annotation.id;
+        request.entries[1]
+            .annotation
+            .anchor
+            .as_mut()
+            .unwrap()
+            .file_path = StoredPath::from("C:\\cache\\worktree\\secret.rs");
+        let sanitized = format_prompt(&request);
+        assert!(sanitized
+            .markdown
+            .contains(&format!("Repository `repository:{repository_id}`")));
+        assert!(sanitized
+            .markdown
+            .contains(&format!("captured-file:{annotation_id}")));
+        assert!(!sanitized.markdown.contains("/private/cache"));
+        assert!(!sanitized.markdown.contains("C:\\cache"));
+
+        request.workspace.display_name = "file:///private/var/tmp/logical-review".into();
+        request.entries[1]
+            .repository
+            .as_mut()
+            .unwrap()
+            .relative_path = StoredPath::from("file:///private/var/tmp/repository");
+        request.entries[1]
+            .annotation
+            .anchor
+            .as_mut()
+            .unwrap()
+            .file_path = StoredPath::from("~/Library/Caches/localreview/secret.rs");
+        let uri_and_home_sanitized = format_prompt(&request);
+        assert!(uri_and_home_sanitized
+            .markdown
+            .contains("Workspace: `logical-review`"));
+        assert!(!uri_and_home_sanitized.markdown.contains("file:///"));
+        assert!(!uri_and_home_sanitized.markdown.contains("/private/var/tmp"));
+        assert!(!uri_and_home_sanitized.markdown.contains("~/Library"));
+    }
+
+    #[test]
+    fn prompt_modes_separate_feedback_questions_and_every_open_annotation_kind() {
+        let workspace = workspace();
+        let annotation_set_id = AnnotationSetId::new();
+        let now = Utc::now();
+        let annotation = |kind, body: &str| Annotation {
+            id: AnnotationId::new(),
+            annotation_set_id,
+            kind,
+            state: AnnotationState::Open,
+            publication_state: PublicationState::LocalOnly,
+            labels: vec![],
+            body_markdown: body.into(),
+            anchor: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let comment = annotation(AnnotationKind::Comment, "comment body");
+        let suggestion = annotation(AnnotationKind::Suggestion, "suggestion body");
+        let question = annotation(AnnotationKind::Question, "question body");
+        let file_note = annotation(AnnotationKind::FileNote, "file note body");
+        let review_note = annotation(AnnotationKind::ReviewNote, "review note body");
+        let mut resolved = annotation(AnnotationKind::Comment, "resolved body");
+        resolved.state = AnnotationState::Resolved;
+        let entries = [
+            comment.clone(),
+            suggestion.clone(),
+            question.clone(),
+            file_note.clone(),
+            review_note.clone(),
+            resolved,
+        ]
+        .into_iter()
+        .map(|annotation| PromptEntry {
+            annotation,
+            repository: None,
+            comparison: None,
+            relevant_hunk: None,
+        })
+        .collect::<Vec<_>>();
+        let render = |scope| {
+            format_prompt(&PromptRequest {
+                workspace: workspace.clone(),
+                review_session_id: ReviewSessionId::new(),
+                annotation_set_id,
+                annotation_set_ids: vec![annotation_set_id],
+                scope,
+                workspace_aware_paths: false,
+                entries: entries.clone(),
+            })
+        };
+        let ids = |formatted: &FormattedPrompt| {
+            formatted
+                .annotation_ids
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+        };
+
+        let feedback = render(PromptScope::AllActionable);
+        assert_eq!(ids(&feedback), BTreeSet::from([comment.id, suggestion.id]));
+        assert!(feedback.markdown.contains("Feedback:\n\ncomment body"));
+        assert!(feedback.markdown.contains("Suggestion:\n\nsuggestion body"));
+        assert!(!feedback.markdown.contains("question body"));
+        assert!(!feedback.markdown.contains("file note body"));
+
+        let questions = render(PromptScope::AllQuestions);
+        assert_eq!(ids(&questions), BTreeSet::from([question.id]));
+        assert!(questions.markdown.contains("# Review questions"));
+        assert!(questions.markdown.contains("Question:\n\nquestion body"));
+        assert!(!questions.markdown.contains("Feedback:\n"));
+        assert!(!questions.markdown.contains("comment body"));
+
+        let full = render(PromptScope::CommentsAndQuestions);
+        assert_eq!(
+            ids(&full),
+            BTreeSet::from([
+                comment.id,
+                suggestion.id,
+                question.id,
+                file_note.id,
+                review_note.id,
+            ])
+        );
+        assert!(full.markdown.contains("# Full LocalReview prompt"));
+        assert!(full
+            .markdown
+            .contains("handle the included file and review notes"));
+        assert!(full.markdown.contains("File note:\n\nfile note body"));
+        assert!(full.markdown.contains("Review note:\n\nreview note body"));
+        assert!(!full.markdown.contains("resolved body"));
+        assert_eq!(
+            prompt_title_for_scope(&PromptScope::CommentsAndQuestions),
+            "Full review prompt"
+        );
+
+        let selected = render(PromptScope::Selected(vec![question.id, file_note.id]));
+        assert_eq!(ids(&selected), BTreeSet::from([question.id, file_note.id]));
+        assert!(selected.markdown.contains(
+            "Handle only the selected annotations below according to each annotation's stated kind and intent."
+        ));
+        assert!(!selected.markdown.contains("Address feedback"));
     }
 
     #[test]

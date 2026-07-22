@@ -799,12 +799,13 @@ export function makeMockApi(): ReviewApi {
           })()
         : data.annotations;
       let selected = source.filter((annotation) => request.annotationIds?.includes(annotation.id) ?? true);
-      if (request.scope === 'feedback') selected = selected.filter((annotation) => annotation.kind !== 'question');
-      if (request.scope === 'questions') selected = selected.filter((annotation) => annotation.kind === 'question');
+      if (request.scope === 'feedback') selected = selected.filter((annotation) => annotation.state === 'open' && (annotation.kind === 'comment' || annotation.kind === 'suggestion'));
+      if (request.scope === 'questions') selected = selected.filter((annotation) => annotation.state === 'open' && annotation.kind === 'question');
+      if (request.scope === 'all') selected = selected.filter((annotation) => annotation.state === 'open');
       if (request.scope === 'focused_question') selected = selected.filter((annotation) => annotation.kind === 'question').slice(0, 1);
       const content = formatPrompt(archivedReview ?? data, selected, request.portable ?? true, request.scope);
       const exportId = uid();
-      const item: ReviewHistoryItem = { id: `export:${exportId}`, type: 'export', label: `Exported ${selected.length} ${request.scope}`, annotationCount: selected.length, createdAt: now() };
+      const item: ReviewHistoryItem = { id: `export:${exportId}`, type: 'export', label: promptTitle(request.scope), annotationCount: selected.length, createdAt: now() };
       data.history.unshift(item);
       const preview = { exportId, title: promptTitle(request.scope), content, annotationCount: selected.length, estimatedTokens: Math.ceil(content.length / 4) };
       state.promptExports ??= {};
@@ -1023,7 +1024,46 @@ export function makeMockApi(): ReviewApi {
 }
 
 function promptTitle(scope: PromptRequest['scope']) {
-  return scope === 'focused_question' ? 'Focused code question' : scope === 'questions' ? 'Questions for investigation' : scope === 'feedback' ? 'Review feedback' : 'Review feedback and questions';
+  return scope === 'focused_question' ? 'Focused code question' : scope === 'questions' ? 'Questions for investigation' : scope === 'feedback' ? 'Review feedback' : scope === 'selected' ? 'Selected review annotations' : 'Full review prompt';
+}
+
+function promptRelativePath(value: string | undefined, fallback: string) {
+  if (!value) return fallback;
+  const windowsAbsolute = /^[a-z]:[\\/]/i.test(value) || value.startsWith('\\');
+  const unsafeSegment = value.split(/[\\/]/).some((segment) => segment === '..');
+  return value.startsWith('/') || value.startsWith('~') || windowsAbsolute || value.includes('://') || unsafeSegment || /[\0\r\n`]/.test(value) ? fallback : value;
+}
+
+function promptWorkspaceName(value: string) {
+  const trimmed = value.trim();
+  const candidate = trimmed.includes('/') || trimmed.includes('\\')
+    ? trimmed.split(/[\\/]/).filter(Boolean).at(-1) ?? 'workspace'
+    : trimmed;
+  return !candidate || /[\0\r\n`]/.test(candidate) ? 'workspace' : candidate;
+}
+
+function promptLogicalPath(repositoryPath: string, filePath: string) {
+  return repositoryPath === '.' ? filePath : `${repositoryPath}/${filePath}`;
+}
+
+function promptBodyLabel(kind: Annotation['kind']) {
+  return kind === 'question' ? 'Question' : kind === 'suggestion' ? 'Suggestion' : kind === 'file_note' ? 'File note' : kind === 'review_note' ? 'Review note' : 'Feedback';
+}
+
+function promptHeading(scope: PromptRequest['scope']) {
+  return scope === 'focused_question' ? '# Read-only review question' : scope === 'questions' ? '# Review questions' : scope === 'all' ? '# Full LocalReview prompt' : scope === 'selected' ? '# Selected review annotations' : '# LocalReview feedback';
+}
+
+function promptInstruction(scope: PromptRequest['scope']) {
+  return scope === 'focused_question'
+    ? 'Answer the question using the supplied review context. Do not modify source files.'
+    : scope === 'questions'
+      ? 'Answer every included question using the supplied review context. Do not modify source files.'
+      : scope === 'all'
+        ? 'Address the included feedback, answer the included questions, and handle the included file and review notes. Preserve unrelated behavior and report how each item was handled.'
+        : scope === 'selected'
+          ? "Handle only the selected annotations below according to each annotation's stated kind and intent. Preserve unrelated behavior and report how each selected item was handled."
+          : 'Address every actionable item below, preserve unrelated behavior, and report how each item was handled.';
 }
 
 export function formatPrompt(data: ReviewData, selected: Annotation[], portable: boolean, scope: PromptRequest['scope'] = 'all'): string {
@@ -1031,25 +1071,34 @@ export function formatPrompt(data: ReviewData, selected: Annotation[], portable:
   const fileById = new Map(data.files.map((file) => [file.id, file]));
   const ordered = [...selected].sort((a, b) => `${repositoryById.get(a.repositoryId)?.path}/${fileById.get(a.fileId)?.path}`.localeCompare(`${repositoryById.get(b.repositoryId)?.path}/${fileById.get(b.fileId)?.path}`));
   const lines = [
-    '# LocalReview review prompt',
+    promptHeading(scope),
     '',
-    scope === 'focused_question'
-      ? 'Read-only question: explain the selected code and answer the question. Do not propose or make unrelated changes.'
-      : 'Address every actionable item below. Preserve unrelated behavior and report how each item was handled.',
+    promptInstruction(scope),
     '',
-    `Workspace: ${data.workspace.name}`,
-    `Review source: ${data.workspace.location}`,
+    `Workspace: ${promptWorkspaceName(data.workspace.name)}`,
+    `Review source: ${data.workspace.source.join(' + ')}`,
     ''
   ];
   for (const item of ordered) {
-    const repository = repositoryById.get(item.repositoryId)!;
-    const file = fileById.get(item.fileId)!;
-    lines.push(`## ${repository.name} — ${file.path}`);
+    const repository = repositoryById.get(item.repositoryId);
+    const file = fileById.get(item.fileId);
+    if (item.kind === 'review_note' || !repository || !file) {
+      lines.push('## Overall review');
+      lines.push('Anchor: overall review');
+      lines.push(`Kind: ${item.kind}`);
+      lines.push('', `${promptBodyLabel(item.kind)}:`, '', item.body, '');
+      continue;
+    }
+    const repositoryPath = promptRelativePath(repository.path, `repository:${repository.id}`);
+    const filePath = promptRelativePath(file.path, `captured-file:${file.id}`);
+    lines.push(`## Repository \`${repositoryPath}\` — \`${filePath}\``);
     lines.push(`Comparison: ${repository.base} (${repository.mergeBase}) → ${repository.head}`);
-    if (!portable) lines.push(`Filesystem path: ${data.workspace.location}/${repository.path}/${file.path}`);
-    lines.push(`Anchor: ${item.side} lines ${item.startLine}${item.startLine === item.endLine ? '' : `-${item.endLine}`}`);
+    if (!portable) lines.push(`Logical path: \`${promptLogicalPath(repositoryPath, filePath)}\``);
+    lines.push(item.kind === 'file_note' || item.startLine <= 0
+      ? 'Anchor: whole file'
+      : `Anchor: ${item.side} lines ${item.startLine}${item.startLine === item.endLine ? '' : `-${item.endLine}`}`);
     lines.push(`Kind: ${item.kind}`);
-    lines.push('', item.body, '', 'Selected source:', '```');
+    lines.push('', `${promptBodyLabel(item.kind)}:`, '', item.body, '', 'Selected source:', '```');
     lines.push(item.selectedSource, '```', '');
   }
   return lines.join('\n');

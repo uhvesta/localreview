@@ -18,4 +18,20 @@ describe('safeSyntaxSegments', () => {
     const segments = safeSyntaxSegments(source, 0, [{ startByte: 3, endByte: 4, class: 'string' }]);
     expect(segments).toEqual([{ text: source }]);
   });
+
+  it('preserves every native semantic class as escaped renderer data', () => {
+    const classes = [
+      'attribute', 'boolean', 'comment', 'constant', 'constructor', 'embedded',
+      'escape', 'function', 'keyword', 'markup', 'module', 'number', 'operator',
+      'property', 'punctuation', 'string', 'tag', 'type', 'variable'
+    ] as const;
+    const source = 'x'.repeat(classes.length);
+    const segments = safeSyntaxSegments(
+      source,
+      0,
+      classes.map((className, index) => ({ startByte: index, endByte: index + 1, class: className }))
+    );
+    expect(segments.map((segment) => segment.text).join('')).toBe(source);
+    expect(segments.map((segment) => segment.class)).toEqual(classes);
+  });
 });

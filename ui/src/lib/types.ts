@@ -1,6 +1,6 @@
 export type WorkspaceSource = 'local' | 'github' | 'ssh';
 export type DiffMode = 'unified' | 'split' | 'full' | 'difftastic';
-export type DiffKind = 'context' | 'addition' | 'deletion' | 'header';
+export type DiffKind = 'context' | 'addition' | 'deletion' | 'modification' | 'header';
 export type DiffSide = 'old' | 'new';
 export type FullFileSide = DiffSide;
 export type SyntaxClass =

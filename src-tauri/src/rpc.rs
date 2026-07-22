@@ -2,8 +2,8 @@ use crate::api::activate_main_window;
 use crate::controller::{DesktopController, DesktopOperation, DispatchError};
 use crate::{AppState, DESKTOP_OPERATION_EVENT};
 use localreview_protocol::{
-    read_frame, write_frame, AppPaths, InstallationSecret, LocalCommand, LocalRequest,
-    LocalResponse, ProtocolError, RpcErrorCode, RuntimeRecord,
+    read_frame, write_frame, AppPaths, InstallationSecret, LocalRequest, LocalResponse,
+    ProtocolError, RpcErrorCode, RuntimeRecord,
 };
 use rand::RngCore;
 use std::io;
@@ -134,17 +134,16 @@ fn dispatch_request(
     {
         return dispatch_error(Some(request_id), error);
     }
-    let command_operation = operation_for_event(&request.command);
     match controller.dispatch(request.command, request_id) {
         Ok(response) => {
             activate_main_window(app);
-            // Local Open/Focus responses include the canonical workspace id.
+            // Every successful open/focus response includes the canonical
+            // workspace id, including GitHub and SSH opens. Emit only that
+            // durable target: Svelte intentionally never accepts paths, URLs,
+            // or provider commands over this focus-only event.
             // Emit it only after controller dispatch succeeded so the UI never
-            // focuses a phantom workspace. PR/SSH retain their request events
-            // until their provider flows materialize a workspace.
-            if let Some(operation) =
-                workspace_operation_for_response(&response).or(command_operation)
-            {
+            // focuses a phantom workspace.
+            if let Some(operation) = workspace_operation_for_response(&response) {
                 let _ = app.emit(DESKTOP_OPERATION_EVENT, operation);
             }
             response
@@ -160,18 +159,6 @@ fn workspace_operation_for_response(response: &LocalResponse) -> Option<DesktopO
                 workspace_id: workspace.id.clone(),
             })
         }
-        _ => None,
-    }
-}
-
-fn operation_for_event(command: &LocalCommand) -> Option<DesktopOperation> {
-    match command {
-        LocalCommand::OpenPullRequest { url } => {
-            Some(DesktopOperation::PullRequest { url: url.clone() })
-        }
-        LocalCommand::OpenSshWorkspace { target } => Some(DesktopOperation::SshWorkspace {
-            target: target.clone(),
-        }),
         _ => None,
     }
 }
@@ -223,7 +210,9 @@ fn dispatch_error(request_id: Option<String>, error: DispatchError) -> LocalResp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use localreview_protocol::{AuthProof, LocalCommand, WorkspaceSummary, PROTOCOL_VERSION};
+    use localreview_protocol::{
+        AuthProof, LocalCommand, WorkspaceSourceTag, WorkspaceSummary, PROTOCOL_VERSION,
+    };
 
     #[test]
     fn only_recent_requests_are_accepted() {
@@ -260,21 +249,44 @@ mod tests {
     }
 
     #[test]
-    fn successful_local_open_and_focus_emit_the_canonical_workspace_target() {
-        let response = LocalResponse::Opened {
-            request_id: "request-1".into(),
-            workspace: WorkspaceSummary {
-                id: "workspace-id".into(),
-                name: "Workspace".into(),
-                source_tags: vec![],
-                available: true,
-                location: None,
-            },
-            created: true,
-        };
-        assert!(matches!(
-            workspace_operation_for_response(&response),
-            Some(DesktopOperation::Workspace { workspace_id }) if workspace_id == "workspace-id"
-        ));
+    fn successful_local_github_and_ssh_opens_emit_only_the_canonical_workspace_target() {
+        for source_tags in [
+            vec![WorkspaceSourceTag::Local],
+            vec![WorkspaceSourceTag::Github],
+            vec![WorkspaceSourceTag::Ssh],
+        ] {
+            let response = LocalResponse::Opened {
+                request_id: "request-1".into(),
+                workspace: WorkspaceSummary {
+                    id: "workspace-id".into(),
+                    name: "Workspace".into(),
+                    source_tags,
+                    available: true,
+                    location: None,
+                },
+                created: true,
+            };
+            assert_eq!(
+                serde_json::to_value(workspace_operation_for_response(&response).unwrap()).unwrap(),
+                serde_json::json!({
+                    "kind": "workspace",
+                    "workspaceId": "workspace-id",
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_operation_events_match_the_svelte_listener_contract() {
+        assert_eq!(
+            serde_json::to_value(DesktopOperation::Workspace {
+                workspace_id: "workspace-id".into(),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "kind": "workspace",
+                "workspaceId": "workspace-id",
+            })
+        );
     }
 }

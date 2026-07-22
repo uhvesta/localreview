@@ -53,6 +53,8 @@ function review(value: Workspace): ReviewData {
 
 function installApi(workspaces: Workspace[]) {
   const reviews = new Map(workspaces.map((value) => [value.id, review(value)]));
+  const durableUiStates = new Map<string, Record<string, unknown>>();
+  const defaultUiState = { mode: 'unified', fullFileSide: 'new', scrollTop: 0, splitRatio: .5, rightTab: 'files' };
   const calls = {
     drafts: [] as Array<Record<string, unknown>>,
     uiStates: [] as Array<{ workspaceId: string; state: Record<string, unknown> }>,
@@ -69,7 +71,7 @@ function installApi(workspaces: Workspace[]) {
     },
     getWorkspaceUiState: async (workspaceId: string) => {
       calls.sessionReads.push(`ui:${workspaceId}`);
-      return { mode: 'unified', fullFileSide: 'new', scrollTop: 0, splitRatio: .5, rightTab: 'files' };
+      return structuredClone({ ...defaultUiState, ...(durableUiStates.get(workspaceId) ?? {}) });
     },
     getAnnotationDraft: async (workspaceId: string) => {
       calls.sessionReads.push(`draft:${workspaceId}`);
@@ -96,7 +98,9 @@ function installApi(workspaces: Workspace[]) {
     },
     saveWorkspaceUiState: async (workspaceId: string, state: Record<string, unknown>) => {
       calls.uiStates.push({ workspaceId, state: structuredClone(state) });
-      return state;
+      const saved = { ...defaultUiState, ...(durableUiStates.get(workspaceId) ?? {}), ...state };
+      durableUiStates.set(workspaceId, saved);
+      return structuredClone(saved);
     },
     saveAnnotationDraft: async (draft: Record<string, unknown>) => {
       calls.drafts.push(structuredClone(draft));
@@ -185,5 +189,41 @@ describe('App review-session persistence boundaries', () => {
     await settle();
     expect(calls.uiStates.some((call) => call.workspaceId === second.id && call.state.activeFileId === 'file-localreview')).toBe(false);
     expect(calls.drafts.some((draft) => draft.workspaceId === second.id && draft.fileId === 'file-localreview')).toBe(false);
+  });
+
+  it('persists Difftastic before its slow native presentation and restores it after teardown', async () => {
+    const local = workspace('workspace-localreview', 'Workspace A');
+    const calls = installApi([local]);
+    const first = mount(App, { target: target() });
+    components.push(first);
+    await settle(5);
+
+    const normalPresentation = harness.state.implementation.getPresentationWindow;
+    let releaseDifftastic: (() => void) | undefined;
+    harness.state.implementation.getPresentationWindow = (request: { mode: string }) => {
+      if (request.mode !== 'difftastic') return normalPresentation(request);
+      return new Promise((resolve) => {
+        releaseDifftastic = () => resolve(normalPresentation(request));
+      });
+    };
+
+    [...document.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
+      .find((button) => button.textContent === 'Difftastic')?.click();
+    await settle(4);
+
+    expect(calls.uiStates.some((call) => call.workspaceId === local.id && call.state.mode === 'difftastic')).toBe(true);
+    expect(releaseDifftastic).toBeTypeOf('function');
+
+    components.pop();
+    await unmount(first);
+    harness.state.implementation.getPresentationWindow = normalPresentation;
+    releaseDifftastic?.();
+    await settle(3);
+
+    components.push(mount(App, { target: target() }));
+    await settle(6);
+    const difftasticTab = [...document.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
+      .find((button) => button.textContent === 'Difftastic');
+    expect(difftasticTab?.getAttribute('aria-selected')).toBe('true');
   });
 });

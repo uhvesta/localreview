@@ -452,6 +452,40 @@ describe('review components', () => {
     unmount(component);
   });
 
+  it('renders paired structural rows as modifications with all Difftastic change classes', async () => {
+    const host = target();
+    const component = mount(VirtualDiff, { target: host, props: {
+      mode: 'difftastic', totalRows: 1,
+      difftastic: {
+        status: 'changed', display: 'side_by_side',
+        chunks: [{ rows: [{
+          old: { lineNumber: 4, text: 'call(old)', changedSpans: [{ start: 5, end: 8, highlight: 'normal' }] },
+          new: { lineNumber: 4, text: 'call(new)', changedSpans: [{ start: 4, end: 5, highlight: 'delimiter' }, { start: 5, end: 8, highlight: 'normal' }] }
+        }] }],
+        alignment: [{ oldLine: 4, newLine: 4 }]
+      }
+    } });
+    await settle();
+    const row = host.querySelector('.structural-row');
+    expect(row?.classList.contains('modified')).toBe(true);
+    expect(row?.getAttribute('aria-label')).toContain('modified change');
+    expect(row?.querySelector('.difftastic-normal')?.textContent).toBe('old');
+    expect(row?.querySelector('.difftastic-delimiter')?.textContent).toBe('(');
+    unmount(component);
+  });
+
+  it('explains an empty unchanged structural presentation such as a pure rename', async () => {
+    const host = target();
+    const component = mount(VirtualDiff, { target: host, props: {
+      mode: 'difftastic', totalRows: 0,
+      difftastic: { status: 'unchanged', display: 'side_by_side', chunks: [], alignment: [] }
+    } });
+    await settle();
+    expect(host.querySelector('.structural-empty')?.textContent).toBe('No structural changes detected by Difftastic.');
+    expect(host.querySelector('.structural-notice')?.textContent).toContain('unchanged');
+    unmount(component);
+  });
+
   it('keeps a 2MB captured presentation virtual and supports keyboard same-side ranges', async () => {
     const selections: Array<{ side: string; startLine: number; endLine: number }> = [];
     const payload = 'x'.repeat(2048);

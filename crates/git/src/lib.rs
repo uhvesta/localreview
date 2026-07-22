@@ -327,6 +327,61 @@ impl<E: GitExecutor> GitRepository<E> {
         })
     }
 
+    /// Resolves GitHub Linguist's per-path language override using Git's own
+    /// `.gitattributes` matcher. `check-attr -z` keeps repository-relative
+    /// paths containing whitespace or non-ASCII characters unambiguous.
+    /// Boolean/unset values are not language names and therefore return None.
+    pub fn linguist_language(&self, path: &StoredPath) -> Result<Option<String>, GitError> {
+        const MAX_ATTRIBUTE_OUTPUT_BYTES: usize = 4 * 1024;
+        const MAX_LANGUAGE_BYTES: usize = 128;
+        validate_repository_relative_path(path)?;
+        let output = self.require_success(GitCommand::new(
+            &self.root,
+            [
+                OsString::from("check-attr"),
+                OsString::from("-z"),
+                OsString::from("linguist-language"),
+                OsString::from("--"),
+                OsString::from(path.as_str()),
+            ],
+        ))?;
+        if output.stdout.len() > MAX_ATTRIBUTE_OUTPUT_BYTES {
+            return Err(GitError::OutputTooLarge {
+                operation: "linguist-language attribute",
+                limit: MAX_ATTRIBUTE_OUTPUT_BYTES,
+            });
+        }
+        let fields = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|field| !field.is_empty())
+            .collect::<Vec<_>>();
+        let [reported_path, attribute, value] = fields.as_slice() else {
+            return Err(GitError::Parse(
+                "git check-attr returned an incomplete linguist-language record".into(),
+            ));
+        };
+        if *reported_path != path.as_str().as_bytes() || *attribute != b"linguist-language" {
+            return Err(GitError::Parse(
+                "git check-attr returned a mismatched linguist-language record".into(),
+            ));
+        }
+        if matches!(*value, b"unspecified" | b"unset" | b"set") {
+            return Ok(None);
+        }
+        if value.is_empty() || value.len() > MAX_LANGUAGE_BYTES {
+            return Ok(None);
+        }
+        let value = std::str::from_utf8(value)
+            .map_err(|_| GitError::Parse("linguist-language was not UTF-8".into()))?
+            .trim();
+        if value.is_empty() || value.chars().any(char::is_control) {
+            Ok(None)
+        } else {
+            Ok(Some(value.to_owned()))
+        }
+    }
+
     pub fn resolve_comparison(
         &self,
         repository_id: RepositoryId,
@@ -1793,6 +1848,32 @@ mod tests {
         git(root, &["branch", "feature"]);
         git(root, &["switch", "feature"]);
         temporary
+    }
+
+    #[test]
+    fn resolves_linguist_language_with_git_attribute_semantics() {
+        let repository = initialized_repository();
+        fs::write(
+            repository.path().join(".gitattributes"),
+            "*.inc linguist-language=PHP\nplain.inc -linguist-language\n",
+        )
+        .unwrap();
+        let git = GitRepository::open(repository.path());
+        assert_eq!(
+            git.linguist_language(&StoredPath::from("source.inc"))
+                .unwrap()
+                .as_deref(),
+            Some("PHP")
+        );
+        assert_eq!(
+            git.linguist_language(&StoredPath::from("plain.inc"))
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            git.linguist_language(&StoredPath::from("../outside.inc")),
+            Err(GitError::UnsafeRepositoryPath { .. })
+        ));
     }
 
     #[derive(Debug)]
