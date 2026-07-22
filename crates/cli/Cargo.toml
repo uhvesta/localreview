@@ -1,0 +1,26 @@
+[package]
+name = "localreview-cli"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "LocalReview desktop forwarding CLI and SSH companion."
+
+[[bin]]
+name = "localreview"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+localreview-protocol = { path = "../protocol" }
+localreview-domain = { path = "../domain" }
+localreview-git = { path = "../git" }
+localreview-persistence = { path = "../persistence" }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+localreview-ssh = { path = "../ssh" }
+serde_cbor = "0.11"
+tempfile = "3"

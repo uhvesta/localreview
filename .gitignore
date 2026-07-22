@@ -1,0 +1,7 @@
+/target/
+/ui/node_modules/
+/ui/dist/
+/.localreview/
+/src-tauri/resources/localreview-sidecars/difft
+.DS_Store
+*.log

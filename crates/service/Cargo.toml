@@ -1,0 +1,26 @@
+[package]
+name = "localreview-service"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+localreview-diff = { path = "../diff" }
+localreview-domain = { path = "../domain" }
+localreview-git = { path = "../git" }
+localreview-github = { path = "../github" }
+localreview-persistence = { path = "../persistence" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

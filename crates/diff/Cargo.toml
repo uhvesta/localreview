@@ -1,0 +1,17 @@
+[package]
+name = "localreview-diff"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+localreview-domain = { path = "../domain" }
+roaring.workspace = true
+serde.workspace = true
+similar.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

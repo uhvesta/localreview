@@ -1,0 +1,49 @@
+[package]
+name = "localreview-desktop"
+version = "0.1.0"
+description = "LocalReview macOS desktop shell"
+authors = ["LocalReview contributors"]
+edition = "2021"
+rust-version = "1.78"
+
+[lib]
+name = "localreview_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "localreview-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+arboard = "3.4"
+chrono = { version = "0.4", features = ["serde"] }
+hex.workspace = true
+localreview-diff = { path = "../crates/diff" }
+localreview-difftastic = { path = "../crates/difftastic" }
+localreview-domain = { path = "../crates/domain" }
+localreview-git = { path = "../crates/git" }
+localreview-github = { path = "../crates/github" }
+localreview-highlight = { path = "../crates/highlight" }
+localreview-persistence = { path = "../crates/persistence" }
+localreview-protocol = { path = "../crates/protocol" }
+localreview-service = { path = "../crates/service" }
+localreview-ssh = { path = "../crates/ssh" }
+notify.workspace = true
+rand = "0.9"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tauri = { version = "2", features = [] }
+tauri-plugin-deep-link = "2"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+thiserror = "2"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
