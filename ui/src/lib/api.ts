@@ -627,9 +627,19 @@ export function makeMockApi(): ReviewApi {
         }
       };
     },
-    async deleteWorkspace(workspaceId) {
+    async archiveWorkspace(workspaceId) {
       const data = review(workspaceId);
       data.workspace = { ...data.workspace, archived: true };
+      saveState(state);
+    },
+    async deleteWorkspace(workspaceId) {
+      review(workspaceId);
+      delete state.reviews[workspaceId];
+      if (state.archivedReviews) {
+        for (const key of Object.keys(state.archivedReviews)) {
+          if (key.startsWith(`${workspaceId}:`)) delete state.archivedReviews[key];
+        }
+      }
       saveState(state);
     },
     async loadReview(workspaceId) { return structuredClone(review(workspaceId)); },
@@ -1223,6 +1233,7 @@ export function createNativeReviewApi(invoke: TauriInvoke): ReviewApi {
     listWorkspaces: () => invoke('list_workspaces'),
     listArchivedWorkspaces: () => invoke('list_archived_workspaces'),
     reopenArchivedWorkspace: (workspaceId) => invoke('reopen_archived_workspace', { workspaceId }),
+    archiveWorkspace: (workspaceId) => invoke('archive_workspace', { workspaceId }),
     updateWorkspaceMetadata: (workspaceId, metadata) => invoke('update_workspace_metadata', { workspaceId, ...metadata }),
     getPersistenceDiagnostics: () => invoke('get_persistence_diagnostics'),
     deleteWorkspace: (workspaceId) => invoke('delete_workspace', { workspaceId }),

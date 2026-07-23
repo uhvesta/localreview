@@ -44,7 +44,7 @@ describe('review components', () => {
     expect(document.querySelector('.review-panel')).not.toBeNull();
     expect(document.querySelector('.theme-root')?.classList.contains('large-text-root')).toBe(true);
     expect(document.querySelector('.actions-menu summary')?.textContent).toBe('Actions');
-    expect([...document.querySelectorAll<HTMLElement>('.actions-menu [role="menuitem"]')].map((button) => button.textContent)).toEqual(['Copy review prompt', 'Review setup', 'New review', 'History', 'Blame selected lines', 'Commit context', 'Changed since previous review', 'Settings']);
+    expect([...document.querySelectorAll<HTMLElement>('.actions-menu [role="menuitem"]')].map((button) => button.textContent)).toEqual(['Copy review prompt', 'Review setup', 'Start new review', 'History', 'Blame selected lines', 'Commit context', 'Changed since previous review', 'Settings']);
     document.querySelector<HTMLButtonElement>('.actions-menu [role="menuitem"]')?.click();
     await settle();
     expect(document.querySelector('[aria-labelledby="prompt-title"]')).not.toBeNull();
@@ -117,24 +117,30 @@ describe('review components', () => {
     unmount(component);
   });
 
-  it('exposes explicit SSH reconnect and recoverable-remove actions in the workspace rail', async () => {
+  it('exposes explicit SSH reconnect, archive, and permanent-delete actions in the workspace rail', async () => {
     const ssh: Workspace = { id: 'ssh', name: 'Remote', source: ['ssh'], location: 'host:/repo', detail: '', progress: { viewed: 0, total: 1 }, draftCount: 0, connection: 'offline' };
+    const archived: string[] = [];
     const removed: string[] = [];
     const reconnected: string[] = [];
     const component = mount(WorkspaceRail, {
       target: target(),
       props: {
         workspaces: [ssh], selectedId: ssh.id,
+        onArchive: (workspace: Workspace) => archived.push(workspace.id),
         onDelete: (workspace: Workspace) => removed.push(workspace.id),
         onReconnect: (workspace: Workspace) => reconnected.push(workspace.id)
       }
     });
     await settle();
     document.querySelector<HTMLButtonElement>('[aria-label="Reconnect Remote"]')?.click();
+    const archiveButton = document.querySelector<HTMLButtonElement>('[aria-label="Archive workspace Remote"]');
     const deleteButton = document.querySelector<HTMLButtonElement>('[aria-label="Delete workspace Remote"]');
+    expect(archiveButton?.textContent).toBe('Archive');
     expect(deleteButton?.textContent).toBe('Delete…');
+    archiveButton?.click();
     deleteButton?.click();
     expect(reconnected).toEqual(['ssh']);
+    expect(archived).toEqual(['ssh']);
     expect(removed).toEqual(['ssh']);
     unmount(component);
   });

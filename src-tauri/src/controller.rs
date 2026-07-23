@@ -4565,14 +4565,27 @@ impl DesktopController {
         })
     }
 
-    pub fn delete_workspace(&self, workspace_id: WorkspaceId) -> Result<(), DispatchError> {
+    pub fn archive_workspace(&self, workspace_id: WorkspaceId) -> Result<(), DispatchError> {
         let workspace = self
             .state()
             .workspace(workspace_id)?
             .ok_or_else(|| DispatchError::NotFound(workspace_id.to_string()))?;
         if matches!(workspace.source, WorkspaceSource::PullRequest { .. }) {
-            self.service
-                .delete_github_pull_request_workspace(workspace_id)?;
+            let managed_worktree_exists =
+                self.service
+                    .github_pull_request(workspace_id)
+                    .is_ok_and(|review| {
+                        Path::new(review.managed_worktree.worktree_path.as_str()).is_dir()
+                    });
+            if managed_worktree_exists {
+                self.service
+                    .delete_github_pull_request_workspace(workspace_id)?;
+            } else {
+                let mut archived = workspace;
+                archived.archived_at = Some(Utc::now());
+                archived.updated_at = Utc::now();
+                self.state().upsert_workspace(&archived)?;
+            }
             self.clear_refresh_available(workspace_id);
             return Ok(());
         }
@@ -4593,6 +4606,73 @@ impl DesktopController {
             watchers.remove(&workspace_id);
         }
         self.clear_refresh_available(workspace_id);
+        Ok(())
+    }
+
+    pub fn delete_workspace(&self, workspace_id: WorkspaceId) -> Result<(), DispatchError> {
+        let workspace = self
+            .state()
+            .workspace(workspace_id)?
+            .ok_or_else(|| DispatchError::NotFound(workspace_id.to_string()))?;
+
+        // A GitHub workspace owns exactly one isolated worktree. Reuse the
+        // conservative clean-worktree removal boundary before purging its
+        // durable review records; the shared mirror remains an app-wide cache.
+        if matches!(workspace.source, WorkspaceSource::PullRequest { .. }) {
+            let managed_worktree_exists =
+                self.service
+                    .github_pull_request(workspace_id)
+                    .is_ok_and(|review| {
+                        Path::new(review.managed_worktree.worktree_path.as_str()).is_dir()
+                    });
+            if managed_worktree_exists {
+                self.service
+                    .delete_github_pull_request_workspace(workspace_id)?;
+            }
+        }
+        if matches!(workspace.source, WorkspaceSource::RemoteDirectory { .. }) {
+            self.stop_remote_watchers(workspace_id);
+            if let Ok(mut sessions) = self.remote_sessions.lock() {
+                sessions.remove(&workspace_id);
+            }
+        }
+        if let Ok(mut watchers) = self.local_watchers.lock() {
+            watchers.remove(&workspace_id);
+        }
+        self.clear_refresh_available(workspace_id);
+
+        let mut settings = self.get_settings()?;
+        let workspace_id_string = workspace_id.to_string();
+        if settings.last_workspace_id.as_deref() == Some(workspace_id_string.as_str()) {
+            settings.last_workspace_id = None;
+            self.save_settings(settings)?;
+        }
+        let exact_setting_keys = vec![
+            legacy_annotation_draft_key(workspace_id),
+            remote_workspace_key(workspace_id),
+            legacy_remote_workspace_key(workspace_id),
+        ];
+        let per_session_setting_prefixes = vec![format!("{ANNOTATION_DRAFT_KEY_PREFIX}session.")];
+        if !self.state().purge_workspace(
+            workspace_id,
+            &exact_setting_keys,
+            &per_session_setting_prefixes,
+        )? {
+            return Err(DispatchError::NotFound(workspace_id.to_string()));
+        }
+
+        // Presentation caches contain no durable ownership index. A permanent
+        // deletion is rare, so clearing the bounded caches is simpler and
+        // safer than retaining source-derived entries from the purged review.
+        if let Ok(mut cache) = self.presentation_cache.lock() {
+            *cache = PresentationCache::default();
+        }
+        if let Ok(mut cache) = self.language_attribute_cache.lock() {
+            cache.clear();
+        }
+        if let Ok(mut jobs) = self.presentation_jobs.lock() {
+            *jobs = PresentationJobRegistry::default();
+        }
         Ok(())
     }
 
@@ -9744,7 +9824,7 @@ mod tests {
 
         fixture
             .controller
-            .delete_workspace(fixture.workspace_id)
+            .archive_workspace(fixture.workspace_id)
             .unwrap();
         assert!(matches!(
             fixture.controller.update_workspace_metadata(
@@ -10672,7 +10752,7 @@ mod tests {
 
         fixture
             .controller
-            .delete_workspace(fixture.workspace_id)
+            .archive_workspace(fixture.workspace_id)
             .unwrap();
         assert!(fixture.controller.list_workspaces().unwrap().is_empty());
         let archived = fixture.controller.list_archived_workspaces().unwrap();
@@ -10715,6 +10795,185 @@ mod tests {
     }
 
     #[test]
+    fn permanent_workspace_delete_purges_reviews_exports_drafts_backups_and_unshared_blobs() {
+        let fixture = review_fixture("before\n", "after\n");
+        let state_root = fixture.controller.state().root().to_path_buf();
+        let session = fixture
+            .controller
+            .service
+            .active_review_session(fixture.workspace_id)
+            .unwrap()
+            .unwrap();
+        fixture
+            .controller
+            .save_annotation(AnnotationView {
+                id: "optimistic-comment".into(),
+                file_id: fixture.file_id.to_string(),
+                repository_id: fixture.repository_id.to_string(),
+                kind: "comment".into(),
+                state: "open".into(),
+                side: "new".into(),
+                start_line: 1,
+                end_line: 1,
+                body: "remove this durable feedback".into(),
+                selected_source: String::new(),
+                labels: Vec::new(),
+                local_only: true,
+                created_at: Utc::now().to_rfc3339(),
+                published_id: None,
+            })
+            .unwrap();
+        fixture
+            .controller
+            .generate_prompt(
+                fixture.workspace_id,
+                PromptInput {
+                    scope: "feedback".into(),
+                    annotation_ids: Vec::new(),
+                    portable: None,
+                    path_style: Some("absolute".into()),
+                    include_diff_hunks: Some(false),
+                    include_git_state: Some(false),
+                    history_id: None,
+                },
+            )
+            .unwrap();
+        fixture
+            .controller
+            .save_annotation_draft(AnnotationDraft {
+                id: "draft".into(),
+                workspace_id: fixture.workspace_id.to_string(),
+                file_id: fixture.file_id.to_string(),
+                repository_id: fixture.repository_id.to_string(),
+                kind: "question".into(),
+                side: "new".into(),
+                start_line: 1,
+                end_line: 1,
+                body: "unfinished question".into(),
+                updated_at: Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        for key in [
+            legacy_annotation_draft_key(fixture.workspace_id),
+            remote_workspace_key(fixture.workspace_id),
+            legacy_remote_workspace_key(fixture.workspace_id),
+        ] {
+            fixture
+                .controller
+                .state()
+                .set_setting(&key, r#"{"owned":true}"#)
+                .unwrap();
+        }
+        fixture
+            .controller
+            .save_settings(ReviewSettings {
+                last_workspace_id: Some(fixture.workspace_id.to_string()),
+                ..ReviewSettings::default()
+            })
+            .unwrap();
+
+        let database = rusqlite::Connection::open(state_root.join("state.sqlite")).unwrap();
+        let blob_hash: String = database
+            .query_row(
+                "SELECT blob_hash FROM review_file WHERE blob_hash IS NOT NULL LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(database);
+        let blob_path = state_root
+            .join("blobs")
+            .join(&blob_hash[..2])
+            .join(&blob_hash[2..]);
+        assert!(blob_path.is_file());
+        let backup = fixture.controller.state().backup_now().unwrap();
+        // Pre-migration recovery snapshots can legitimately predate the
+        // retired-worktree table. Permanent deletion must scrub those older
+        // snapshots too instead of failing halfway through the operation.
+        let old_backup = rusqlite::Connection::open(&backup.path).unwrap();
+        old_backup
+            .execute_batch(
+                "DROP TABLE retired_managed_worktree;
+                 PRAGMA user_version = 5;",
+            )
+            .unwrap();
+        drop(old_backup);
+
+        fixture
+            .controller
+            .delete_workspace(fixture.workspace_id)
+            .unwrap();
+
+        assert!(fixture
+            .controller
+            .state()
+            .workspace(fixture.workspace_id)
+            .unwrap()
+            .is_none());
+        assert!(fixture.controller.list_workspaces().unwrap().is_empty());
+        assert!(fixture
+            .controller
+            .list_archived_workspaces()
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            fixture.controller.load_review(fixture.workspace_id),
+            Err(DispatchError::NotFound(_))
+        ));
+        assert!(!blob_path.exists());
+        assert!(fixture
+            ._workspace_directory
+            .path()
+            .join("review.rs")
+            .is_file());
+        assert_eq!(
+            fixture.controller.get_settings().unwrap().last_workspace_id,
+            None
+        );
+        for key in [
+            annotation_draft_key(session.id),
+            legacy_annotation_draft_key(fixture.workspace_id),
+            remote_workspace_key(fixture.workspace_id),
+            legacy_remote_workspace_key(fixture.workspace_id),
+        ] {
+            assert_eq!(fixture.controller.state().setting(&key).unwrap(), None);
+        }
+
+        for database_path in [state_root.join("state.sqlite"), backup.path] {
+            let database = rusqlite::Connection::open(database_path).unwrap();
+            let workspace_count: i64 = database
+                .query_row(
+                    "SELECT COUNT(*) FROM workspace WHERE id = ?1",
+                    [fixture.workspace_id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let review_count: i64 = database
+                .query_row(
+                    "SELECT COUNT(*) FROM review_session WHERE workspace_id = ?1",
+                    [fixture.workspace_id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let annotation_count: i64 = database
+                .query_row("SELECT COUNT(*) FROM annotation", [], |row| row.get(0))
+                .unwrap();
+            let export_count: i64 = database
+                .query_row("SELECT COUNT(*) FROM prompt_export", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                (
+                    workspace_count,
+                    review_count,
+                    annotation_count,
+                    export_count
+                ),
+                (0, 0, 0, 0)
+            );
+        }
+    }
+
+    #[test]
     fn opening_archived_local_path_reactivates_and_focuses_its_captured_review() {
         let fixture = review_fixture("before\n", "after\n");
         let git = std::process::Command::new("git")
@@ -10753,7 +11012,7 @@ mod tests {
             .unwrap();
         fixture
             .controller
-            .delete_workspace(fixture.workspace_id)
+            .archive_workspace(fixture.workspace_id)
             .unwrap();
         assert!(fixture.controller.list_workspaces().unwrap().is_empty());
 

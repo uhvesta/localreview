@@ -10,6 +10,7 @@
   export let onExpand: () => void = () => {};
   export let onCollapse: () => void = () => {};
   export let onSettings: () => void = () => {};
+  export let onArchive: (workspace: Workspace) => void = () => {};
   export let onDelete: (workspace: Workspace) => void = () => {};
   export let onReconnect: (workspace: Workspace) => void = () => {};
   export let onPin: (workspace: Workspace) => void = () => {};
@@ -82,7 +83,8 @@
             {#if workspace.source.includes('ssh')}
               <button class="workspace-action" aria-label={`Reconnect ${workspace.name}`} on:click={() => onReconnect(workspace)}>Reconnect</button>
             {/if}
-            <button class="workspace-action destructive" aria-label={`Delete workspace ${workspace.name}`} title="Archive this workspace and remove it from the rail" on:click={() => onDelete(workspace)}>Delete…</button>
+            <button class="workspace-action" aria-label={`Archive workspace ${workspace.name}`} title="Hide this workspace but keep all review history" on:click={() => onArchive(workspace)}>Archive</button>
+            <button class="workspace-action destructive" aria-label={`Delete workspace ${workspace.name}`} title="Permanently delete this workspace and all LocalReview history" on:click={() => onDelete(workspace)}>Delete…</button>
           </div>
         </div>
       {/each}

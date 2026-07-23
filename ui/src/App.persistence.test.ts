@@ -84,6 +84,7 @@ function review(value: Workspace): ReviewData {
 function installApi(workspaces: Workspace[], initialSettings: ReviewSettings = settings) {
   const reviews = new Map(workspaces.map((value) => [value.id, review(value)]));
   const archivedWorkspaceIds = new Set(workspaces.filter((value) => value.archived).map((value) => value.id));
+  const deletedWorkspaceIds = new Set<string>();
   let savedSettings = structuredClone(initialSettings);
   const durableUiStates = new Map<string, Record<string, unknown>>();
   const defaultUiState = { mode: 'unified', fullFileSide: 'new', scrollTop: 0, splitRatio: .5, rightTab: 'files' };
@@ -98,13 +99,14 @@ function installApi(workspaces: Workspace[], initialSettings: ReviewSettings = s
     startRequests: [] as Array<{ workspaceId: string; request?: Record<string, unknown> }>,
     refreshRequests: [] as Array<{ workspaceId: string; request?: Record<string, unknown> }>,
     settingsWrites: [] as Array<Partial<ReviewSettings>>,
+    workspaceArchives: [] as string[],
     workspaceDeletes: [] as string[],
     operationOrder: [] as string[]
   };
   harness.state.implementation = {
-    listWorkspaces: async () => structuredClone(workspaces.filter((workspace) => !archivedWorkspaceIds.has(workspace.id))),
+    listWorkspaces: async () => structuredClone(workspaces.filter((workspace) => !deletedWorkspaceIds.has(workspace.id) && !archivedWorkspaceIds.has(workspace.id))),
     listArchivedWorkspaces: async () => structuredClone(workspaces
-      .filter((workspace) => archivedWorkspaceIds.has(workspace.id))
+      .filter((workspace) => !deletedWorkspaceIds.has(workspace.id) && archivedWorkspaceIds.has(workspace.id))
       .map((workspace) => ({ ...workspace, archived: true }))),
     reopenArchivedWorkspace: async (workspaceId: string) => {
       archivedWorkspaceIds.delete(workspaceId);
@@ -112,12 +114,19 @@ function installApi(workspaces: Workspace[], initialSettings: ReviewSettings = s
       value.workspace = { ...value.workspace, archived: false };
       return structuredClone(value.workspace);
     },
-    deleteWorkspace: async (workspaceId: string) => {
-      calls.operationOrder.push(`delete:${workspaceId}`);
-      calls.workspaceDeletes.push(workspaceId);
+    archiveWorkspace: async (workspaceId: string) => {
+      calls.operationOrder.push(`archive:${workspaceId}`);
+      calls.workspaceArchives.push(workspaceId);
       archivedWorkspaceIds.add(workspaceId);
       const value = reviews.get(workspaceId)!;
       value.workspace = { ...value.workspace, archived: true };
+    },
+    deleteWorkspace: async (workspaceId: string) => {
+      calls.operationOrder.push(`delete:${workspaceId}`);
+      calls.workspaceDeletes.push(workspaceId);
+      archivedWorkspaceIds.delete(workspaceId);
+      deletedWorkspaceIds.add(workspaceId);
+      reviews.delete(workspaceId);
     },
     getReviewHistory: async (workspaceId: string) => structuredClone(reviews.get(workspaceId)?.history ?? []),
     getSettings: async () => structuredClone(savedSettings),
@@ -476,18 +485,18 @@ describe('App review-session persistence boundaries', () => {
     draft.value = 'Keep this unsaved thought across archival';
     draft.dispatchEvent(new Event('input', { bubbles: true }));
 
-    document.querySelector<HTMLButtonElement>('[aria-label="Delete workspace Short-lived review"]')?.click();
+    document.querySelector<HTMLButtonElement>('[aria-label="Archive workspace Short-lived review"]')?.click();
     await settle();
-    expect(document.querySelector('#delete-workspace-title')?.textContent).toContain('Delete Short-lived review from LocalReview?');
-    expect(document.querySelector('[aria-labelledby="delete-workspace-title"]')?.textContent).toContain('folder and Git repositories on disk are not deleted');
+    expect(document.querySelector('#archive-workspace-title')?.textContent).toContain('Archive Short-lived review?');
+    expect(document.querySelector('[aria-labelledby="archive-workspace-title"]')?.textContent).toContain('folder and Git repositories on disk are untouched');
     [...document.querySelectorAll<HTMLButtonElement>('button')]
       .find((button) => button.textContent === 'Archive workspace')?.click();
     await settle(10);
 
-    expect(calls.workspaceDeletes).toEqual([local.id]);
-    const deleteIndex = calls.operationOrder.lastIndexOf(`delete:${local.id}`);
-    expect(calls.operationOrder.lastIndexOf(`draft:${local.id}`)).toBeLessThan(deleteIndex);
-    expect(calls.operationOrder.lastIndexOf(`ui:${local.id}`)).toBeLessThan(deleteIndex);
+    expect(calls.workspaceArchives).toEqual([local.id]);
+    const archiveIndex = calls.operationOrder.lastIndexOf(`archive:${local.id}`);
+    expect(calls.operationOrder.lastIndexOf(`draft:${local.id}`)).toBeLessThan(archiveIndex);
+    expect(calls.operationOrder.lastIndexOf(`ui:${local.id}`)).toBeLessThan(archiveIndex);
     expect(calls.drafts.at(-1)).toMatchObject({
       workspaceId: local.id,
       body: 'Keep this unsaved thought across archival'
@@ -502,6 +511,45 @@ describe('App review-session persistence boundaries', () => {
       .find((button) => button.textContent === 'Reopen snapshot')?.click();
     await settle(8);
     expect(document.querySelector('.workspace-card.selected')?.textContent).toContain('Short-lived review');
+  });
+
+  it('requires the exact workspace name before permanently deleting all local history', async () => {
+    const doomed = workspace('workspace-doomed', 'Disposable review');
+    const survivor = workspace('workspace-survivor', 'Keep me');
+    const calls = installApi([doomed, survivor], { ...settings, lastWorkspaceId: doomed.id });
+    components.push(mount(App, { target: target() }));
+    await settle(8);
+
+    document.querySelector<HTMLButtonElement>('[aria-label="Delete workspace Disposable review"]')?.click();
+    await settle();
+    const dialog = document.querySelector('[aria-labelledby="delete-workspace-title"]');
+    expect(dialog?.textContent).toContain('This cannot be undone');
+    expect(dialog?.textContent).toContain('erased from LocalReview and its backups');
+    const confirmButton = [...dialog!.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent === 'Delete permanently')!;
+    expect(confirmButton.disabled).toBe(true);
+
+    const confirmation = dialog!.querySelector<HTMLInputElement>('[aria-label="Workspace name confirmation"]')!;
+    confirmation.value = 'wrong';
+    confirmation.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    expect(confirmButton.disabled).toBe(true);
+    confirmation.value = doomed.name;
+    confirmation.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    expect(confirmButton.disabled).toBe(false);
+    confirmButton.click();
+    await settle(10);
+
+    expect(calls.workspaceDeletes).toEqual([doomed.id]);
+    expect(calls.workspaceArchives).toEqual([]);
+    expect(document.querySelector('[aria-label="Delete workspace Disposable review"]')).toBeNull();
+    expect(document.querySelector('.workspace-card.selected')?.textContent).toContain('Keep me');
+
+    [...document.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent === 'History')?.click();
+    await settle(5);
+    expect(document.querySelector('.archived-workspaces')?.textContent ?? '').not.toContain('Disposable review');
   });
 
   it('resumes initial setup after restart without reading a missing review session', async () => {
@@ -524,7 +572,7 @@ describe('App review-session persistence boundaries', () => {
     expect(document.querySelector<HTMLButtonElement>('.finish-button')?.disabled).toBe(true);
     expect(document.querySelector<HTMLButtonElement>('[aria-label="Copy review content"]')?.disabled).toBe(true);
     expect([...document.querySelectorAll<HTMLButtonElement>('.actions-menu [role="menuitem"]')]
-      .find((button) => button.textContent === 'New review')?.disabled).toBe(true);
+      .find((button) => button.textContent === 'Start new review')?.disabled).toBe(true);
 
     document.querySelector<HTMLButtonElement>('[aria-label="Close review setup"]')?.click();
     await settle();

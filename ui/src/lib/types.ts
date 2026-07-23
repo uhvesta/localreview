@@ -605,7 +605,9 @@ export interface ReviewApi {
   updateWorkspaceMetadata(workspaceId: string, metadata: { name?: string; pinned?: boolean }): Promise<Workspace>;
   /** Source-free persistence health and aggregate backup-storage facts. */
   getPersistenceDiagnostics(): Promise<PersistenceDiagnostics>;
-  /** Archives a workspace; GitHub review worktrees are removed only when clean. */
+  /** Removes a workspace from the live rail while preserving its recoverable review history. */
+  archiveWorkspace(workspaceId: string): Promise<void>;
+  /** Permanently purges LocalReview-owned data; GitHub worktrees are removed only when clean. */
   deleteWorkspace(workspaceId: string): Promise<void>;
   loadReview(workspaceId: string): Promise<ReviewData>;
   /** Opens a native `review:<uuid>` history entry without restoring or recapturing it. */

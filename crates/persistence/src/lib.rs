@@ -604,6 +604,58 @@ impl StateStore {
         })
     }
 
+    /// Permanently removes one workspace and every LocalReview-owned record
+    /// beneath it. Unlike workspace archival, this also scrubs retained
+    /// SQLite recovery snapshots so an explicit permanent deletion cannot be
+    /// undone by restoring an older app backup. Content-addressed source
+    /// blobs are reclaimed afterward only when no remaining review references
+    /// them.
+    pub fn purge_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        exact_setting_keys: &[String],
+        per_session_setting_prefixes: &[String],
+    ) -> Result<bool, PersistenceError> {
+        if self.workspace(workspace_id)?.is_none() {
+            return Ok(false);
+        }
+
+        // Recovery backups are part of LocalReview-owned durable history.
+        // Scrub them before the live database: if an old snapshot cannot be
+        // updated, the live record remains intact and the user can retry.
+        for backup in self.list_backups()? {
+            let mut connection = Connection::open(&backup.path)?;
+            connection.pragma_update(None, "foreign_keys", "ON")?;
+            connection.pragma_update(None, "secure_delete", "ON")?;
+            let transaction = connection.transaction()?;
+            purge_workspace_rows(
+                &transaction,
+                workspace_id,
+                exact_setting_keys,
+                per_session_setting_prefixes,
+            )?;
+            transaction.commit()?;
+            connection.execute_batch("VACUUM;")?;
+            set_private_file(&backup.path)?;
+        }
+
+        self.with_connection(|connection| {
+            connection.pragma_update(None, "secure_delete", "ON")?;
+            let transaction = connection.transaction()?;
+            let removed = purge_workspace_rows(
+                &transaction,
+                workspace_id,
+                exact_setting_keys,
+                per_session_setting_prefixes,
+            )?;
+            transaction.commit()?;
+            connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+            Ok(removed)
+        })?;
+        self.gc_unreferenced_blobs()?;
+        Ok(true)
+    }
+
     pub fn upsert_repository(&self, repository: &Repository) -> Result<(), PersistenceError> {
         self.with_connection(|connection| {
             connection.execute(
@@ -2448,6 +2500,80 @@ fn upsert_application_setting(
         params![key, value_json, timestamp(Some(Utc::now()))],
     )?;
     Ok(())
+}
+
+fn purge_workspace_rows(
+    connection: &Connection,
+    workspace_id: WorkspaceId,
+    exact_setting_keys: &[String],
+    per_session_setting_prefixes: &[String],
+) -> Result<bool, PersistenceError> {
+    let workspace_id = workspace_id.to_string();
+    for prefix in per_session_setting_prefixes {
+        connection.execute(
+            "DELETE FROM application_setting
+             WHERE key IN (
+               SELECT ?2 || id FROM review_session WHERE workspace_id = ?1
+             )",
+            params![workspace_id, prefix],
+        )?;
+    }
+    for key in exact_setting_keys {
+        connection.execute(
+            "DELETE FROM application_setting WHERE key = ?1",
+            params![key],
+        )?;
+    }
+
+    // These two RESTRICT edges intentionally protect ordinary history from an
+    // accidental cascading delete. Permanent workspace deletion is the one
+    // explicit operation which removes their children first.
+    connection.execute(
+        "DELETE FROM annotation
+         WHERE annotation_set_id IN (
+           SELECT annotation_set.id
+           FROM annotation_set
+           INNER JOIN review_session
+             ON review_session.id = annotation_set.review_session_id
+           WHERE review_session.workspace_id = ?1
+         )",
+        params![workspace_id],
+    )?;
+    connection.execute(
+        "DELETE FROM prompt_export
+         WHERE review_session_id IN (
+           SELECT id FROM review_session WHERE workspace_id = ?1
+         )",
+        params![workspace_id],
+    )?;
+    connection.execute(
+        "DELETE FROM managed_worktree WHERE workspace_id = ?1",
+        params![workspace_id],
+    )?;
+    if sqlite_table_exists(connection, "retired_managed_worktree")? {
+        connection.execute(
+            "DELETE FROM retired_managed_worktree WHERE workspace_id = ?1",
+            params![workspace_id],
+        )?;
+    }
+    let removed =
+        connection.execute("DELETE FROM workspace WHERE id = ?1", params![workspace_id])?;
+    Ok(removed > 0)
+}
+
+fn sqlite_table_exists(
+    connection: &Connection,
+    table_name: &str,
+) -> Result<bool, PersistenceError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
+             )",
+            params![table_name],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
 }
 
 fn insert_review_generation(

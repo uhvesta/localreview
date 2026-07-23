@@ -1,6 +1,6 @@
 [package]
 name = "localreview-protocol"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 license = "MIT"
 description = "Versioned, authenticated RPC types for LocalReview desktop, CLI, and SSH companion."

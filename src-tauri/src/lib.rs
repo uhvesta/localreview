@@ -9,13 +9,13 @@ mod controller;
 mod rpc;
 
 use api::{
-    abandon_finish_review, apply_repository_base, archive_annotations, clear_annotation_draft,
-    configure_baselines, copy_review_item, copy_to_clipboard, delete_annotation, delete_workspace,
-    expand_hunk_context, fetch_repositories, finish_review, focus_workspace, generate_prompt,
-    get_annotation_draft, get_captured_blame, get_captured_source_range,
-    get_changed_since_previous_review, get_commit_context, get_github_conversation,
-    get_github_pull_request, get_github_threads, get_github_update_status, get_outline,
-    get_persistence_diagnostics, get_presentation_rows, get_presentation_window,
+    abandon_finish_review, apply_repository_base, archive_annotations, archive_workspace,
+    clear_annotation_draft, configure_baselines, copy_review_item, copy_to_clipboard,
+    delete_annotation, delete_workspace, expand_hunk_context, fetch_repositories, finish_review,
+    focus_workspace, generate_prompt, get_annotation_draft, get_captured_blame,
+    get_captured_source_range, get_changed_since_previous_review, get_commit_context,
+    get_github_conversation, get_github_pull_request, get_github_threads, get_github_update_status,
+    get_outline, get_persistence_diagnostics, get_presentation_rows, get_presentation_window,
     get_repository_setup, get_review_file_classifications, get_review_history, get_ui_settings,
     get_workspace_ui_state, list_archived_workspaces, list_workspaces, load_archived_review,
     load_review, open_github_pr, open_in_external_editor, open_ssh_workspace, open_workspace,
@@ -119,6 +119,7 @@ pub fn run() {
             list_workspaces,
             list_archived_workspaces,
             reopen_archived_workspace,
+            archive_workspace,
             update_workspace_metadata,
             get_persistence_diagnostics,
             load_review,

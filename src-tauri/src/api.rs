@@ -35,6 +35,7 @@ pub const REVIEW_API_COMMANDS: &[&str] = &[
     "list_workspaces",
     "list_archived_workspaces",
     "reopen_archived_workspace",
+    "archive_workspace",
     "update_workspace_metadata",
     "get_persistence_diagnostics",
     "load_review",
@@ -925,6 +926,14 @@ pub fn preview_finish_review(
 }
 
 #[tauri::command]
+pub fn archive_workspace(workspace_id: String, state: State<'_, AppState>) -> Result<(), ApiError> {
+    state
+        .controller
+        .archive_workspace(parse_workspace(&workspace_id)?)
+        .map_err(ApiError::from)
+}
+
+#[tauri::command]
 pub fn delete_workspace(workspace_id: String, state: State<'_, AppState>) -> Result<(), ApiError> {
     state
         .controller
@@ -1310,6 +1319,7 @@ mod tests {
                 "list_workspaces",
                 "list_archived_workspaces",
                 "reopen_archived_workspace",
+                "archive_workspace",
                 "update_workspace_metadata",
                 "get_persistence_diagnostics",
                 "load_review",

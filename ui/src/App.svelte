@@ -108,9 +108,13 @@
   let largePromptCopyWarning = false;
   let showHistory = false;
   let archivedWorkspaces: Workspace[] = [];
+  let showArchiveWorkspace = false;
+  let workspacePendingArchive: Workspace | undefined;
+  let archiveWorkspaceError = '';
   let showDeleteWorkspace = false;
   let workspacePendingDeletion: Workspace | undefined;
   let deleteWorkspaceError = '';
+  let deleteWorkspaceConfirmation = '';
   let workspacePendingRename: Workspace | undefined;
   let workspaceRenameValue = '';
   let showFinish = false;
@@ -199,7 +203,7 @@
   const commandItems: Array<{ label: string; shortcut: string; run: () => void }> = [
     { label: 'Open file picker', shortcut: '⌘P', run: () => showFilePicker = true },
     { label: 'Refresh review', shortcut: '', run: () => void refresh() },
-    { label: 'New review', shortcut: '', run: () => { if (canMutateReview) showNewReview = true; } },
+    { label: 'Start new review', shortcut: '', run: () => { if (canMutateReview) showNewReview = true; } },
     { label: 'Copy feedback prompt', shortcut: '', run: () => void previewPrompt('feedback') },
     { label: 'Ask focused question', shortcut: '⌘⇧Q', run: () => void previewFocusedQuestion() },
     { label: 'Previous annotation', shortcut: '⌥⇞', run: () => void navigateAnnotation(-1) },
@@ -948,6 +952,7 @@
     if (showFinish) { closeFinishReview(); return; }
     if (showClear) { showClear = false; return; }
     if (showNewReview) { showNewReview = false; return; }
+    if (showArchiveWorkspace) { showArchiveWorkspace = false; workspacePendingArchive = undefined; return; }
     if (showDeleteWorkspace) { showDeleteWorkspace = false; workspacePendingDeletion = undefined; return; }
     if (workspacePendingRename) { workspacePendingRename = undefined; return; }
     if (showHistory) showHistory = false;
@@ -2460,43 +2465,85 @@
     }
   }
 
-  function requestWorkspaceDeletion(workspace: Workspace) {
+  function requestWorkspaceArchive(workspace: Workspace) {
     const workspaceRefreshState = refreshStates[workspace.id];
     if (workspaceRefreshState?.stage === 'capturing' || workspaceRefreshState?.stage === 'preparing') {
       statusMessage = 'Wait for this workspace refresh to finish before archiving it.';
       return;
     }
-    workspacePendingDeletion = workspace;
-    deleteWorkspaceError = '';
-    showDeleteWorkspace = true;
+    workspacePendingArchive = workspace;
+    archiveWorkspaceError = '';
+    showArchiveWorkspace = true;
   }
 
-  async function confirmWorkspaceDeletion() {
-    const workspace = workspacePendingDeletion;
+  async function confirmWorkspaceArchive() {
+    const workspace = workspacePendingArchive;
     if (!workspace) return;
     busy = true;
-    deleteWorkspaceError = '';
+    archiveWorkspaceError = '';
     try {
       // Archiving must be a persistence boundary just like switching or
       // closing a workspace. Flush the active composer and exact viewport
       // before the workspace leaves the rail so a restart/reopen cannot lose
       // the reviewer's last few keystrokes or location.
       if (review?.workspace.id === workspace.id) await flushReviewPersistence();
-      await api.deleteWorkspace(workspace.id);
+      await api.archiveWorkspace(workspace.id);
       workspaces = mergeWorkspaceList(await api.listWorkspaces());
+      archivedWorkspaces = await api.listArchivedWorkspaces();
       if (review?.workspace.id === workspace.id) {
         review = undefined;
         activeFileId = '';
         const next = workspaces[0];
         if (next) await selectWorkspace(next.id);
-        else {
-          await setSettings({ lastWorkspaceId: '' });
-          statusMessage = 'Workspace archived. Its captured review remains recoverable in Review history.';
-        }
-      } else {
-        statusMessage = `${workspace.name} was archived. Its captured review remains recoverable in Review history.`;
+        else await setSettings({ lastWorkspaceId: '' });
       }
+      statusMessage = `${workspace.name} was archived. Its captured reviews remain recoverable in History.`;
+      workspacePendingArchive = undefined;
+      showArchiveWorkspace = false;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'unknown error';
+      archiveWorkspaceError = message.includes('managed PR worktree must be clean')
+        ? 'The isolated PR worktree is dirty, so it was kept intact. Commit, stash, or discard those changes in that worktree, then try again.'
+        : message;
+    } finally { busy = false; }
+  }
+
+  function requestWorkspaceDeletion(workspace: Workspace) {
+    const workspaceRefreshState = refreshStates[workspace.id];
+    if (workspaceRefreshState?.stage === 'capturing' || workspaceRefreshState?.stage === 'preparing') {
+      statusMessage = 'Wait for this workspace refresh to finish before deleting it.';
+      return;
+    }
+    workspacePendingDeletion = workspace;
+    deleteWorkspaceError = '';
+    deleteWorkspaceConfirmation = '';
+    showHistory = false;
+    showDeleteWorkspace = true;
+  }
+
+  async function confirmWorkspaceDeletion() {
+    const workspace = workspacePendingDeletion;
+    if (!workspace || deleteWorkspaceConfirmation !== workspace.name) return;
+    busy = true;
+    deleteWorkspaceError = '';
+    try {
+      // Flush any queued writes before the single native purge boundary. They
+      // are intentionally deleted with the rest of this workspace rather than
+      // racing in afterward and recreating detached recovery state.
+      if (review?.workspace.id === workspace.id) await flushReviewPersistence();
+      await api.deleteWorkspace(workspace.id);
+      workspaces = mergeWorkspaceList(await api.listWorkspaces());
+      archivedWorkspaces = await api.listArchivedWorkspaces();
+      if (review?.workspace.id === workspace.id) {
+        review = undefined;
+        activeFileId = '';
+        const next = workspaces[0];
+        if (next) await selectWorkspace(next.id);
+        else await setSettings({ lastWorkspaceId: '' });
+      }
+      statusMessage = `${workspace.name} and all of its LocalReview history were permanently deleted.`;
       workspacePendingDeletion = undefined;
+      deleteWorkspaceConfirmation = '';
       showDeleteWorkspace = false;
     } catch (error) {
       const message = error instanceof Error ? error.message : 'unknown error';
@@ -2579,7 +2626,7 @@
 
 <div class="theme-root" class:large-text-root={settings.fontScale > 1.25} data-theme={appTheme} style={`${codeStyle};--font-scale:${settings.fontScale}`}>
 <main class="app-shell" style={`${layoutStyle};${codeStyle}`} data-theme={appTheme} class:show-whitespace={settings.showWhitespace} class:large-text={settings.fontScale > 1.25} aria-busy={busy} on:dragover={(event) => { if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'; event.preventDefault(); }} on:drop={handleWorkspaceDrop}>
-  <WorkspaceRail workspaces={workspaces} refreshStages={workspaceRefreshStages} selectedId={activeWorkspaceId} collapsed={settings.leftCollapsed} onSelect={selectWorkspace} onOpen={() => { localOpenError = ''; showOpen = true; }} onExpand={() => restorePanel('left')} onCollapse={() => togglePanel('left')} onSettings={() => showSettings = true} onDelete={requestWorkspaceDeletion} onReconnect={reconnectSshWorkspace} onPin={toggleWorkspacePin} onRename={requestWorkspaceRename} />
+  <WorkspaceRail workspaces={workspaces} refreshStages={workspaceRefreshStages} selectedId={activeWorkspaceId} collapsed={settings.leftCollapsed} onSelect={selectWorkspace} onOpen={() => { localOpenError = ''; showOpen = true; }} onExpand={() => restorePanel('left')} onCollapse={() => togglePanel('left')} onSettings={() => showSettings = true} onArchive={requestWorkspaceArchive} onDelete={requestWorkspaceDeletion} onReconnect={reconnectSshWorkspace} onPin={toggleWorkspacePin} onRename={requestWorkspaceRename} />
   <!-- svelte-ignore a11y_no_noninteractive_tabindex a11y_no_noninteractive_element_interactions -- ARIA separator follows the splitter pattern and handles pointer plus arrow keys -->
   <div class="resize-handle left-handle" class:collapsed={settings.leftCollapsed} role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize workspace rail" aria-valuemin="180" aria-valuemax="420" aria-valuenow={settings.leftWidth} on:pointerdown={() => resizeSide = 'left'} on:keydown={(event) => resizePanelKey('left', event)} on:dblclick={() => resetDivider('left')}></div>
 
@@ -2619,7 +2666,7 @@
               <button role="menuitem" disabled={!canExportReview || review?.historical} on:click={() => { actionsOpen = false; void previewPrompt('all'); }}>Copy full review prompt</button>
             {/if}
             <button role="menuitem" disabled={review?.historical || refreshLocksReview} on:click={() => { actionsOpen = false; void openBaselineSetup(); }}>Review setup</button>
-            <button role="menuitem" disabled={!canMutateReview} on:click={() => { actionsOpen = false; showNewReview = true; }}>New review</button>
+            <button role="menuitem" disabled={!canMutateReview} on:click={() => { actionsOpen = false; showNewReview = true; }}>Start new review</button>
             <button role="menuitem" on:click={() => { actionsOpen = false; void openHistory(); }}>History</button>
             <button role="menuitem" disabled={!canExportReview} on:click={() => { actionsOpen = false; void openBlame(); }}>Blame selected lines</button>
             <button role="menuitem" disabled={!canExportReview} on:click={() => { actionsOpen = false; void openCommitContext(); }}>Commit context</button>
@@ -2781,11 +2828,28 @@
 {/if}
 
 {#if showHistory}
-  <div class="modal-backdrop" role="presentation"><dialog open class="modal history-modal" aria-modal="true" aria-labelledby="history-title" use:focusTrap={{ onClose: () => showHistory = false }}><header><div><span class="eyebrow">DURABLE REVIEW DATA</span><h2 id="history-title">Review history</h2><p>Each workspace has one current review. Prior reviews are frozen here and remain available after restart.</p></div><button class="icon-button" on:click={() => showHistory = false}>×</button></header>{#if archivedWorkspaces.length}<section class="archived-workspaces" aria-label="Archived workspaces"><strong>Archived workspaces</strong>{#each archivedWorkspaces as workspace (workspace.id)}<article><div><strong>{workspace.name}</strong><p>{workspace.source.join(' + ')} · {workspace.location}</p><small>{workspace.detail} · {workspace.progress.total} captured files</small></div><button class="secondary-button" on:click={() => reopenArchivedWorkspace(workspace)}>Reopen snapshot</button></article>{/each}</section>{/if}<div class="history-list">{#each historyEntries as entry}<article><span class="history-type {entry.type}">{entry.type}</span><div><strong>{entry.label}</strong><p>{new Date(entry.createdAt).toLocaleString()} · {entry.annotationCount} annotations</p></div><div class="history-actions">{#if entry.type === 'review'}<button class="secondary-button" on:click={() => browseArchivedReview(entry.id)}>Browse frozen diff</button>{/if}<button class="secondary-button" on:click={() => previewPromptFromHistory(entry.id)}>{entry.type === 'export' ? 'Open exact export' : 'Export'}</button>{#if entry.annotations?.length}<button class="secondary-button" disabled={review?.historical} on:click={() => restoreHistory(entry.id)}>Restore</button>{/if}</div></article>{:else}{#if !archivedWorkspaces.length}<div class="empty-state">No review history yet.</div>{/if}{/each}</div><footer><button class="primary-button" on:click={() => showHistory = false}>Done</button></footer></dialog></div>
+  <div class="modal-backdrop" role="presentation"><dialog open class="modal history-modal" aria-modal="true" aria-labelledby="history-title" use:focusTrap={{ onClose: () => showHistory = false }}><header><div><span class="eyebrow">DURABLE REVIEW DATA</span><h2 id="history-title">Review history</h2><p>Each workspace has one current review. Prior reviews are frozen here and remain available after restart.</p></div><button class="icon-button" on:click={() => showHistory = false}>×</button></header>{#if archivedWorkspaces.length}<section class="archived-workspaces" aria-label="Archived workspaces"><strong>Archived workspaces</strong>{#each archivedWorkspaces as workspace (workspace.id)}<article><div><strong>{workspace.name}</strong><p>{workspace.source.join(' + ')} · {workspace.location}</p><small>{workspace.detail} · {workspace.progress.total} captured files</small></div><div class="history-actions"><button class="secondary-button" on:click={() => reopenArchivedWorkspace(workspace)}>Reopen snapshot</button><button class="secondary-button destructive" on:click={() => requestWorkspaceDeletion(workspace)}>Delete permanently…</button></div></article>{/each}</section>{/if}<div class="history-list">{#each historyEntries as entry}<article><span class="history-type {entry.type}">{entry.type}</span><div><strong>{entry.label}</strong><p>{new Date(entry.createdAt).toLocaleString()} · {entry.annotationCount} annotations</p></div><div class="history-actions">{#if entry.type === 'review'}<button class="secondary-button" on:click={() => browseArchivedReview(entry.id)}>Browse frozen diff</button>{/if}<button class="secondary-button" on:click={() => previewPromptFromHistory(entry.id)}>{entry.type === 'export' ? 'Open exact export' : 'Export'}</button>{#if entry.annotations?.length}<button class="secondary-button" disabled={review?.historical} on:click={() => restoreHistory(entry.id)}>Restore</button>{/if}</div></article>{:else}{#if !archivedWorkspaces.length}<div class="empty-state">No review history yet.</div>{/if}{/each}</div><footer><button class="primary-button" on:click={() => showHistory = false}>Done</button></footer></dialog></div>
+{/if}
+
+{#if showArchiveWorkspace}
+  <div class="modal-backdrop" role="presentation">
+    <dialog open class="modal confirm-modal" aria-modal="true" aria-labelledby="archive-workspace-title" use:focusTrap={{ onClose: () => { showArchiveWorkspace = false; workspacePendingArchive = undefined; } }}>
+      <header><span class="warning-icon">↧</span><div><span class="eyebrow">RECOVERABLE WORKSPACE ARCHIVE</span><h2 id="archive-workspace-title">Archive {workspacePendingArchive?.name}?</h2>{#if workspacePendingArchive?.source.includes('github')}<p>The clean app-owned PR worktree will be removed and the shared clone cache will stay. Every captured review, comment, question, and exported prompt remains recoverable in History.</p>{:else if workspacePendingArchive?.source.includes('ssh')}<p>The SSH session will close, but no remote files are deleted. Every captured review, comment, question, and exported prompt remains recoverable in History.</p>{:else}<p>The folder and Git repositories on disk are untouched. Every captured review, comment, question, and exported prompt remains recoverable in History.</p>{/if}</div></header>
+      {#if archiveWorkspaceError}<p class="modal-error" role="alert">{archiveWorkspaceError}</p>{/if}
+      <footer><button class="secondary-button" on:click={() => { showArchiveWorkspace = false; workspacePendingArchive = undefined; }}>Cancel</button><button class="primary-button" disabled={busy} on:click={confirmWorkspaceArchive}>{busy ? 'Archiving…' : 'Archive workspace'}</button></footer>
+    </dialog>
+  </div>
 {/if}
 
 {#if showDeleteWorkspace}
-  <div class="modal-backdrop" role="presentation"><dialog open class="modal confirm-modal" aria-modal="true" aria-labelledby="delete-workspace-title" use:focusTrap={{ onClose: () => { showDeleteWorkspace = false; workspacePendingDeletion = undefined; } }}><header><span class="warning-icon">!</span><div><span class="eyebrow">RECOVERABLE WORKSPACE ARCHIVE</span><h2 id="delete-workspace-title">Delete {workspacePendingDeletion?.name} from LocalReview?</h2>{#if workspacePendingDeletion?.source.includes('github')}<p>The clean app-owned PR worktree will be deleted. The shared repository cache, captured diff, comments, questions, and exported prompts remain recoverable in Review history.</p>{:else if workspacePendingDeletion?.source.includes('ssh')}<p>The SSH session will close, but no files on the remote machine are deleted. The captured diff, comments, questions, and exported prompts remain recoverable in Review history.</p>{:else}<p>The folder and Git repositories on disk are not deleted. The captured diff, comments, questions, and exported prompts remain recoverable in Review history.</p>{/if}</div></header>{#if deleteWorkspaceError}<p class="modal-error" role="alert">{deleteWorkspaceError}</p>{/if}<footer><button class="secondary-button" on:click={() => { showDeleteWorkspace = false; workspacePendingDeletion = undefined; }}>Cancel</button><button class="primary-button warning" disabled={busy} on:click={confirmWorkspaceDeletion}>{workspacePendingDeletion?.source.includes('github') ? 'Delete worktree and archive' : 'Archive workspace'}</button></footer></dialog></div>
+  <div class="modal-backdrop" role="presentation">
+    <dialog open class="modal confirm-modal" aria-modal="true" aria-labelledby="delete-workspace-title" use:focusTrap={{ onClose: () => { showDeleteWorkspace = false; workspacePendingDeletion = undefined; deleteWorkspaceConfirmation = ''; } }}>
+      <header><span class="warning-icon">!</span><div><span class="eyebrow">PERMANENT DELETION</span><h2 id="delete-workspace-title">Permanently delete {workspacePendingDeletion?.name}?</h2><p>This cannot be undone. All captured reviews, comments, questions, drafts, prompts, and History entries for this workspace will be erased from LocalReview and its backups.</p>{#if workspacePendingDeletion?.source.includes('github')}<p>The clean app-owned PR worktree will also be removed; the shared clone cache remains. The GitHub repository and PR are untouched.</p>{:else if workspacePendingDeletion?.source.includes('ssh')}<p>The SSH session will close. Files on the remote machine are untouched.</p>{:else}<p>The folder and Git repositories on disk are untouched.</p>{/if}</div></header>
+      <div class="setup-content"><label>Type <strong>{workspacePendingDeletion?.name}</strong> to confirm<input data-dialog-initial-focus bind:value={deleteWorkspaceConfirmation} autocomplete="off" aria-label="Workspace name confirmation" /></label></div>
+      {#if deleteWorkspaceError}<p class="modal-error" role="alert">{deleteWorkspaceError}</p>{/if}
+      <footer><button class="secondary-button" on:click={() => { showDeleteWorkspace = false; workspacePendingDeletion = undefined; deleteWorkspaceConfirmation = ''; }}>Cancel</button><button class="primary-button warning" disabled={busy || deleteWorkspaceConfirmation !== workspacePendingDeletion?.name} on:click={confirmWorkspaceDeletion}>{busy ? 'Deleting permanently…' : 'Delete permanently'}</button></footer>
+    </dialog>
+  </div>
 {/if}
 
 {#if workspacePendingRename}

@@ -344,7 +344,7 @@ describe('browser fallback API', () => {
   it('keeps removed workspaces recoverable and can reopen their captured snapshot', async () => {
     const api = makeMockApi();
     const before = await api.loadReview('workspace-localreview');
-    await api.deleteWorkspace(before.workspace.id);
+    await api.archiveWorkspace(before.workspace.id);
     expect((await api.listWorkspaces()).some((workspace) => workspace.id === before.workspace.id)).toBe(false);
     expect(await api.listArchivedWorkspaces()).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: before.workspace.id, archived: true })
@@ -359,13 +359,24 @@ describe('browser fallback API', () => {
   it('reactivates an archived local workspace when its path is opened again', async () => {
     const api = makeMockApi();
     const before = await api.loadReview('workspace-localreview');
-    await api.deleteWorkspace(before.workspace.id);
+    await api.archiveWorkspace(before.workspace.id);
 
     const reopened = await api.openWorkspace({ path: before.workspace.location });
     expect(reopened.id).toBe(before.workspace.id);
     expect(reopened.archived).not.toBe(true);
     expect((await api.listArchivedWorkspaces()).some((workspace) => workspace.id === before.workspace.id)).toBe(false);
     expect((await api.loadReview(reopened.id)).files).toEqual(before.files);
+  });
+
+  it('permanently deletes a workspace instead of leaving recoverable history', async () => {
+    const api = makeMockApi();
+    const before = await api.loadReview('workspace-localreview');
+    await api.generatePrompt(before.workspace.id, { scope: 'feedback', portable: true });
+    await api.deleteWorkspace(before.workspace.id);
+
+    expect((await api.listWorkspaces()).some((workspace) => workspace.id === before.workspace.id)).toBe(false);
+    expect((await api.listArchivedWorkspaces()).some((workspace) => workspace.id === before.workspace.id)).toBe(false);
+    await expect(api.loadReview(before.workspace.id)).rejects.toThrow('does not exist');
   });
 
   it('reconnects only SSH workspaces through the explicit recovery action', async () => {
@@ -432,6 +443,7 @@ describe('browser fallback API', () => {
     await api.reconnectSshWorkspace('workspace-1');
     await api.listArchivedWorkspaces();
     await api.reopenArchivedWorkspace('workspace-1');
+    await api.archiveWorkspace('workspace-1');
     await api.deleteWorkspace('workspace-1');
     await api.loadArchivedReview('workspace-1', 'review:history-1');
     await api.getReviewFileClassifications('workspace-1');
@@ -476,6 +488,7 @@ describe('browser fallback API', () => {
       ['reconnect_ssh_workspace', { workspaceId: 'workspace-1' }],
       ['list_archived_workspaces'],
       ['reopen_archived_workspace', { workspaceId: 'workspace-1' }],
+      ['archive_workspace', { workspaceId: 'workspace-1' }],
       ['delete_workspace', { workspaceId: 'workspace-1' }],
       ['load_archived_review', { workspaceId: 'workspace-1', historyId: 'review:history-1' }],
       ['get_review_file_classifications', { workspaceId: 'workspace-1' }],

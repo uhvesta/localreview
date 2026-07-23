@@ -128,11 +128,15 @@ Linux it forwards to an already-running authenticated desktop endpoint, or
 through the managed SSH reverse channel when invoked in a connected remote
 shell.
 
-Deleting a workspace in the desktop archives its captured reviews, inline
-comments/questions, prompt exports, and UI location. Local folders and remote
-files are never deleted. An app-owned GitHub PR worktree is removed only when
-clean, while the shared repository cache is retained. Archived workspaces can
-be reopened from **Review history** after restarting the app.
+Workspace lifecycle actions are deliberately separate. **Start new review**
+archives the current review round and immediately captures a clean round for
+the same workspace. **Archive** removes the workspace from the live rail while
+keeping every captured review, inline comment/question, prompt export, and UI
+location recoverable in **Review history** after restart. **Delete** requires
+typing the workspace name and permanently purges that LocalReview data,
+including its entries in retained app backups. Local folders and remote files
+are never deleted. An app-owned GitHub PR worktree is removed only when clean,
+while the shared repository cache is retained.
 
 GitHub PR reviews expose Feedback, Questions, and Full prompt exports from the
 review Actions menu as well as the Comments panel. New exports identify the
