@@ -341,8 +341,13 @@ export interface ReviewSettings {
   showWhitespace: boolean;
   wrapLines: boolean;
   vimNavigation: boolean;
+  promptPathStyle: PromptPathStyle;
+  promptIncludeDiffHunks: boolean;
+  promptIncludeGitState: boolean;
   shortcuts: Record<string, string>;
 }
+
+export type PromptPathStyle = 'portable' | 'qualified' | 'absolute';
 
 export interface WorkspaceUiState {
   activeFileId?: string;
@@ -361,7 +366,11 @@ export interface WorkspaceUiState {
 export interface PromptRequest {
   scope: 'feedback' | 'questions' | 'all' | 'selected' | 'focused_question';
   annotationIds?: string[];
+  /** Legacy compatibility for pre-v0.1.3 native clients. */
   portable?: boolean;
+  pathStyle?: PromptPathStyle;
+  includeDiffHunks?: boolean;
+  includeGitState?: boolean;
   /** Export an archived annotation checkpoint without modifying the active set. */
   historyId?: string;
 }

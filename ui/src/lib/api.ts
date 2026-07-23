@@ -323,6 +323,9 @@ const defaultSettings: ReviewSettings = {
   showWhitespace: false,
   wrapLines: false,
   vimNavigation: false,
+  promptPathStyle: 'absolute',
+  promptIncludeDiffHunks: false,
+  promptIncludeGitState: false,
   shortcuts: {
     nextHunk: 'Alt+ArrowDown', previousHunk: 'Alt+ArrowUp', filePicker: 'Meta+P',
     commandPalette: 'Meta+Shift+P', saveAnnotation: 'Meta+Enter', focusQuestion: 'Meta+Shift+Q'
@@ -905,7 +908,10 @@ export function makeMockApi(): ReviewApi {
       if (request.scope === 'questions') selected = selected.filter((annotation) => annotation.state === 'open' && annotation.kind === 'question');
       if (request.scope === 'all') selected = selected.filter((annotation) => annotation.state === 'open');
       if (request.scope === 'focused_question') selected = selected.filter((annotation) => annotation.kind === 'question').slice(0, 1);
-      const content = formatPrompt(archivedReview ?? data, selected, request.portable ?? true, request.scope);
+      const portable = request.pathStyle
+        ? request.pathStyle === 'portable'
+        : request.portable ?? true;
+      const content = formatPrompt(archivedReview ?? data, selected, portable, request.scope);
       const exportId = uid();
       const item: ReviewHistoryItem = { id: `export:${exportId}`, type: 'export', label: promptTitle(request.scope), annotationCount: selected.length, createdAt: now() };
       data.history.unshift(item);

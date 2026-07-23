@@ -119,6 +119,9 @@ pub struct PartialReviewSettings {
     pub show_whitespace: Option<bool>,
     pub wrap_lines: Option<bool>,
     pub vim_navigation: Option<bool>,
+    pub prompt_path_style: Option<String>,
+    pub prompt_include_diff_hunks: Option<bool>,
+    pub prompt_include_git_state: Option<bool>,
     pub shortcuts: Option<std::collections::BTreeMap<String, String>>,
 }
 
@@ -1015,6 +1018,15 @@ pub fn save_ui_settings(
     if let Some(value) = settings.vim_navigation {
         merged.vim_navigation = value;
     }
+    if let Some(value) = settings.prompt_path_style {
+        merged.prompt_path_style = value;
+    }
+    if let Some(value) = settings.prompt_include_diff_hunks {
+        merged.prompt_include_diff_hunks = value;
+    }
+    if let Some(value) = settings.prompt_include_git_state {
+        merged.prompt_include_git_state = value;
+    }
     if let Some(value) = settings.shortcuts {
         merged.shortcuts = value;
     }
@@ -1476,7 +1488,7 @@ mod tests {
             ("workspace".into(), "file".into(), Some(19))
         );
         let settings: PartialReviewSettings =
-            serde_json::from_str(r#"{"lastWorkspaceId":"workspace-last","fontScale":1.2,"leftCollapsed":true,"theme":"light","codeFont":"JetBrains Mono","tabWidth":4,"showWhitespace":true,"wrapLines":true,"vimNavigation":true,"shortcuts":{"nextHunk":"Alt+J"}}"#).unwrap();
+            serde_json::from_str(r#"{"lastWorkspaceId":"workspace-last","fontScale":1.2,"leftCollapsed":true,"theme":"light","codeFont":"JetBrains Mono","tabWidth":4,"showWhitespace":true,"wrapLines":true,"vimNavigation":true,"promptPathStyle":"qualified","promptIncludeDiffHunks":true,"promptIncludeGitState":true,"shortcuts":{"nextHunk":"Alt+J"}}"#).unwrap();
         assert_eq!(
             settings.last_workspace_id.as_deref(),
             Some("workspace-last")
@@ -1486,6 +1498,9 @@ mod tests {
         assert_eq!(settings.theme.as_deref(), Some("light"));
         assert_eq!(settings.tab_width, Some(4));
         assert_eq!(settings.wrap_lines, Some(true));
+        assert_eq!(settings.prompt_path_style.as_deref(), Some("qualified"));
+        assert_eq!(settings.prompt_include_diff_hunks, Some(true));
+        assert_eq!(settings.prompt_include_git_state, Some(true));
         assert_eq!(
             settings
                 .shortcuts

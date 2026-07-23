@@ -83,7 +83,7 @@
   let changedFileIds = new Set<string>();
   let activeLine: number | undefined;
   let activeSelection: DiffSelection | undefined;
-  let settings: ReviewSettings = { fontScale: 1, leftWidth: 244, rightWidth: 332, leftCollapsed: false, rightCollapsed: false, fetchOnReview: false, theme: 'dark', codeFont: 'SF Mono', externalEditor: 'system', tabWidth: 2, showWhitespace: false, wrapLines: false, vimNavigation: false, shortcuts: {} };
+  let settings: ReviewSettings = { fontScale: 1, leftWidth: 244, rightWidth: 332, leftCollapsed: false, rightCollapsed: false, fetchOnReview: false, theme: 'dark', codeFont: 'SF Mono', externalEditor: 'system', tabWidth: 2, showWhitespace: false, wrapLines: false, vimNavigation: false, promptPathStyle: 'absolute', promptIncludeDiffHunks: false, promptIncludeGitState: false, shortcuts: {} };
   let zoomToast = '';
   let busy = false;
   type RefreshStage = 'capturing' | 'preparing' | 'updated' | 'failed';
@@ -104,7 +104,7 @@
   let prompt: PromptPreview | undefined;
   let promptScope: PromptRequest['scope'] = 'feedback';
   let promptHistoryId: string | undefined;
-  let promptPortable = true;
+  let promptFocusedAnnotationId: string | undefined;
   let largePromptCopyWarning = false;
   let showHistory = false;
   let archivedWorkspaces: Workspace[] = [];
@@ -1229,12 +1229,22 @@
 
   async function previewPrompt(scope = promptScope, historyId = promptHistoryId, focusedAnnotationId?: string, closeHistoryOnSuccess = false) {
     if (!review || (!canExportReview && !historyId)) return;
-    const nextPrompt = await api.generatePrompt(review.workspace.id, { scope, portable: promptPortable, historyId, annotationIds: scope === 'focused_question' ? (focusedAnnotationId ? [focusedAnnotationId] : []) : scope === 'selected' ? [...selectedAnnotationIds] : undefined });
+    const nextPrompt = await api.generatePrompt(review.workspace.id, {
+      scope,
+      pathStyle: settings.promptPathStyle,
+      includeDiffHunks: settings.promptIncludeDiffHunks,
+      includeGitState: settings.promptIncludeGitState,
+      historyId,
+      annotationIds: scope === 'focused_question'
+        ? (focusedAnnotationId ? [focusedAnnotationId] : [])
+        : scope === 'selected' ? [...selectedAnnotationIds] : undefined
+    });
     // A history export is a modal-to-modal handoff. Commit the preview state
     // and dismiss History in the same render so the later History backdrop
     // cannot remain above the prompt and make the action appear inert.
     promptScope = scope;
     promptHistoryId = historyId;
+    promptFocusedAnnotationId = scope === 'focused_question' ? focusedAnnotationId : undefined;
     largePromptCopyWarning = false;
     prompt = nextPrompt;
     if (closeHistoryOnSuccess) showHistory = false;
@@ -1242,9 +1252,16 @@
 
   async function previewPromptFromHistory(historyId: string) {
     try {
-      await previewPrompt('all', historyId, undefined, true);
+      await previewPrompt('feedback', historyId, undefined, true);
     } catch (error) {
       statusMessage = `Could not open review-history export: ${error instanceof Error ? error.message : 'unknown error'}`;
+    }
+  }
+
+  async function updatePromptDefaults(partial: Partial<ReviewSettings>) {
+    await setSettings(partial);
+    if (prompt && !promptHistoryId?.startsWith('export:')) {
+      await previewPrompt(promptScope, promptHistoryId, promptFocusedAnnotationId);
     }
   }
 
@@ -1406,9 +1423,9 @@
   }
   function primaryFinishAction() {
     if (!canExportReview) return;
-    if (review?.historical) { void previewPrompt('all'); return; }
+    if (review?.historical) { void previewPrompt('feedback'); return; }
     if (githubReview) openFinishReview();
-    else void previewPrompt('all');
+    else void previewPrompt('feedback');
   }
   async function submitReview() {
     if (!review || review.historical || !finishPreview || finishSubmitting) return;
@@ -2594,7 +2611,21 @@
         <button class="status-button" class:refreshing={refreshLocksReview} class:updated={activeRefreshState?.stage === 'updated'} class:failed={activeRefreshState?.stage === 'failed'} disabled={!canMutateReview} aria-label={refreshButtonAriaLabel} aria-live="polite" aria-busy={refreshLocksReview} aria-describedby={refreshLocksReview ? 'refresh-status' : undefined} on:click={refresh} title={review?.historical ? 'Archived review snapshots are read-only' : !reviewCaptureReady ? 'Finish initial setup before refreshing' : refreshLocksReview ? 'This workspace refresh is already running' : activeRefreshState?.stage === 'failed' ? 'Retry starting the next review round' : 'Archive this round and capture the next one'}><span class:available={review?.workspace.refreshAvailable && !activeRefreshState} class:refreshing={refreshLocksReview} class:updated={activeRefreshState?.stage === 'updated'} class:failed={activeRefreshState?.stage === 'failed'} class="status-light"></span><span class="status-button-label">{refreshButtonLabel}</span></button>
         <details class="actions-menu" bind:open={actionsOpen}>
           <summary aria-label="More review actions">Actions</summary>
-          <div role="menu" aria-label="Review actions"><button role="menuitem" disabled={!canExportReview || review?.historical || (githubReview && refreshLocksReview)} on:click={() => { actionsOpen = false; primaryFinishAction(); }}>{githubReview ? 'Finish review' : 'Copy review prompt'}</button><button role="menuitem" disabled={review?.historical || refreshLocksReview} on:click={() => { actionsOpen = false; void openBaselineSetup(); }}>Review setup</button><button role="menuitem" disabled={!canMutateReview} on:click={() => { actionsOpen = false; showNewReview = true; }}>New review</button><button role="menuitem" on:click={() => { actionsOpen = false; void openHistory(); }}>History</button><button role="menuitem" disabled={!canExportReview} on:click={() => { actionsOpen = false; void openBlame(); }}>Blame selected lines</button><button role="menuitem" disabled={!canExportReview} on:click={() => { actionsOpen = false; void openCommitContext(); }}>Commit context</button><button role="menuitem" disabled={!canMutateReview} on:click={() => { actionsOpen = false; void showChangedSincePreviousReview(); }}>Changed since previous review</button><button role="menuitem" on:click={() => { actionsOpen = false; showSettings = true; }}>Settings</button></div>
+          <div role="menu" aria-label="Review actions">
+            <button role="menuitem" disabled={!canExportReview || review?.historical || (githubReview && refreshLocksReview)} on:click={() => { actionsOpen = false; primaryFinishAction(); }}>{githubReview ? 'Finish review' : 'Copy review prompt'}</button>
+            {#if githubReview}
+              <button role="menuitem" disabled={!canExportReview || review?.historical} on:click={() => { actionsOpen = false; void previewPrompt('feedback'); }}>Copy feedback prompt</button>
+              <button role="menuitem" disabled={!canExportReview || review?.historical} on:click={() => { actionsOpen = false; void previewPrompt('questions'); }}>Copy questions prompt</button>
+              <button role="menuitem" disabled={!canExportReview || review?.historical} on:click={() => { actionsOpen = false; void previewPrompt('all'); }}>Copy full review prompt</button>
+            {/if}
+            <button role="menuitem" disabled={review?.historical || refreshLocksReview} on:click={() => { actionsOpen = false; void openBaselineSetup(); }}>Review setup</button>
+            <button role="menuitem" disabled={!canMutateReview} on:click={() => { actionsOpen = false; showNewReview = true; }}>New review</button>
+            <button role="menuitem" on:click={() => { actionsOpen = false; void openHistory(); }}>History</button>
+            <button role="menuitem" disabled={!canExportReview} on:click={() => { actionsOpen = false; void openBlame(); }}>Blame selected lines</button>
+            <button role="menuitem" disabled={!canExportReview} on:click={() => { actionsOpen = false; void openCommitContext(); }}>Commit context</button>
+            <button role="menuitem" disabled={!canMutateReview} on:click={() => { actionsOpen = false; void showChangedSincePreviousReview(); }}>Changed since previous review</button>
+            <button role="menuitem" on:click={() => { actionsOpen = false; showSettings = true; }}>Settings</button>
+          </div>
         </details>
         <button class="finish-button" disabled={!canExportReview || review?.historical || (githubReview && refreshLocksReview)} on:click={primaryFinishAction}>{review?.historical ? 'Archived review' : githubReview ? 'Finish review' : 'Copy review prompt'} <span>⌘↵</span></button>
       </div>
@@ -2698,7 +2729,7 @@
             {#if githubConversation.length}<div class="github-import-group github-conversation"><strong>Imported general conversation ({githubConversation.length})</strong>{#each githubConversation as comment (comment.id)}<article><p><strong>{comment.author ? `@${comment.author}` : 'GitHub user'}</strong> {comment.body_markdown}</p></article>{/each}</div>{/if}
           </section>
         {/if}
-        <div class="comment-actions"><button class="primary-button" disabled={!canExportReview} on:click={() => previewPrompt('feedback', undefined)}>Copy feedback prompt</button><button class="secondary-button" disabled={!canExportReview} on:click={() => previewPrompt('questions', undefined)}>Questions</button><button class="secondary-button" disabled={!canExportReview || !selectedAnnotationIds.size} on:click={() => previewPrompt('selected', undefined)}>Selected ({selectedAnnotationIds.size})</button><button class="secondary-button" disabled={!canMutateReview} on:click={startQuestion}>Ask question</button><button class="secondary-button" disabled={!canMutateReview || !activeFile} on:click={startFileNote}>File note</button><button class="secondary-button" disabled={!canMutateReview} on:click={startReviewNote}>Review note</button><button class="secondary-button" disabled={!shownAnnotations.some(hasLineAnchor)} on:click={() => void navigateAnnotation(-1)} aria-label="Previous annotation">‹ Annotation</button><button class="secondary-button" disabled={!shownAnnotations.some(hasLineAnchor)} on:click={() => void navigateAnnotation(1)} aria-label="Next annotation">Annotation ›</button><button class="secondary-button destructive" disabled={!canMutateReview} on:click={() => showClear = true}>Clear</button></div>
+        <div class="comment-actions"><button class="primary-button" disabled={!canExportReview} on:click={() => previewPrompt('feedback', undefined)}>Copy feedback prompt</button><button class="secondary-button" disabled={!canExportReview} on:click={() => previewPrompt('questions', undefined)}>Copy questions prompt</button><button class="secondary-button" disabled={!canExportReview || !selectedAnnotationIds.size} on:click={() => previewPrompt('selected', undefined)}>Selected ({selectedAnnotationIds.size})</button><button class="secondary-button" disabled={!canMutateReview} on:click={startQuestion}>Ask question</button><button class="secondary-button" disabled={!canMutateReview || !activeFile} on:click={startFileNote}>File note</button><button class="secondary-button" disabled={!canMutateReview} on:click={startReviewNote}>Review note</button><button class="secondary-button" disabled={!shownAnnotations.some(hasLineAnchor)} on:click={() => void navigateAnnotation(-1)} aria-label="Previous annotation">‹ Annotation</button><button class="secondary-button" disabled={!shownAnnotations.some(hasLineAnchor)} on:click={() => void navigateAnnotation(1)} aria-label="Next annotation">Annotation ›</button><button class="secondary-button destructive" disabled={!canMutateReview} on:click={() => showClear = true}>Clear</button></div>
         <div class="comment-filters" aria-label="Filter local annotations"><select bind:value={annotationKindFilter} aria-label="Filter comments by kind"><option value="all">All kinds</option><option value="comment">Comments</option><option value="question">Questions</option><option value="suggestion">Suggestions</option><option value="file_note">File notes</option><option value="review_note">Review notes</option></select><select bind:value={annotationStateFilter} aria-label="Filter comments by state"><option value="all">All states</option><option value="open">Open</option><option value="resolved">Resolved</option><option value="outdated">Outdated</option></select><select bind:value={annotationPublicationFilter} aria-label="Filter comments by publication"><option value="all">All publication states</option><option value="published">Published</option><option value="unpublished">Unpublished</option><option value="local_only">Local only</option></select><select bind:value={annotationLabelFilter} aria-label="Filter comments by label"><option value="all">All labels</option><option value="blocking">Blocking</option><option value="important">Important</option><option value="nit">Nit</option><option value="security">Security</option><option value="performance">Performance</option><option value="question">Question</option></select></div>
         <div class="comment-list">
           {#each shownAnnotations as annotation (annotation.id)}
@@ -2721,7 +2752,32 @@
 {#if zoomToast}<div class="zoom-toast" role="status">{zoomToast}</div>{/if}
 
 {#if prompt}
-  <div class="modal-backdrop" role="presentation"><dialog open class="modal prompt-modal" aria-modal="true" aria-labelledby="prompt-title" use:focusTrap={{ onClose: () => prompt = undefined }}><header><div><span class="eyebrow">STRUCTURED EXPORT</span><h2 id="prompt-title">{prompt.title}</h2><p>{prompt.annotationCount} annotations · about {prompt.estimatedTokens.toLocaleString()} tokens</p></div><button class="icon-button" on:click={() => prompt = undefined} aria-label="Close prompt preview">×</button></header>{#if promptHistoryId?.startsWith('export:')}<div class="prompt-exact-note" role="status">Exact durable export · original Markdown and path mode are read-only.</div>{:else}<div class="prompt-scopes" role="group" aria-label="Prompt scope"><button aria-pressed={promptScope === 'feedback'} class:active={promptScope === 'feedback'} on:click={() => previewPrompt('feedback')}>Feedback</button><button aria-pressed={promptScope === 'questions'} class:active={promptScope === 'questions'} on:click={() => previewPrompt('questions')}>Questions</button><button aria-pressed={promptScope === 'all'} class:active={promptScope === 'all'} on:click={() => previewPrompt('all')}>Full</button><span class="prompt-path-mode" aria-label="Prompt path mode"><button aria-pressed={promptPortable} class:active={promptPortable} on:click={() => { promptPortable = true; void previewPrompt(promptScope); }}>Portable paths</button><button aria-pressed={!promptPortable} class:active={!promptPortable} on:click={() => { promptPortable = false; void previewPrompt(promptScope); }}>Qualified paths</button></span></div>{/if}{#if promptNeedsLargeCopyWarning()}<div class="prompt-size-warning" role="alert">This prompt is unusually large. Copying can exceed clipboard or model limits; it remains unchanged unless you choose to copy it.</div>{/if}<pre>{prompt.content}</pre><footer><span>{promptHistoryId?.startsWith('export:') ? 'Exact durable export; copy and saves never alter annotations.' : promptPortable ? 'Portable prompt: no local filesystem paths.' : 'Qualified prompt: repository-qualified logical paths; no local filesystem roots.'}</span><div><button class="secondary-button" on:click={() => savePrompt('markdown')}>Save Markdown…</button><button class="secondary-button" on:click={() => savePrompt('json')}>Save JSON…</button><button class="secondary-button" on:click={() => prompt = undefined}>Close</button><button class="primary-button" on:click={() => copyPrompt(largePromptCopyWarning)}>{largePromptCopyWarning ? 'Copy large prompt anyway' : 'Copy prompt'}</button></div></footer></dialog></div>
+  <div class="modal-backdrop" role="presentation"><dialog open class="modal prompt-modal" aria-modal="true" aria-labelledby="prompt-title" use:focusTrap={{ onClose: () => prompt = undefined }}>
+    <header><div><span class="eyebrow">STRUCTURED EXPORT</span><h2 id="prompt-title">{prompt.title}</h2><p>{prompt.annotationCount} annotations · about {prompt.estimatedTokens.toLocaleString()} tokens</p></div><button class="icon-button" on:click={() => prompt = undefined} aria-label="Close prompt preview">×</button></header>
+    {#if promptHistoryId?.startsWith('export:')}
+      <div class="prompt-exact-note" role="status">Exact durable export · original scope and formatting options are read-only.</div>
+    {:else}
+      <div class="prompt-options">
+        <div class="prompt-scopes" role="group" aria-label="Prompt scope">
+          <button aria-pressed={promptScope === 'feedback'} class:active={promptScope === 'feedback'} on:click={() => previewPrompt('feedback', promptHistoryId)}>Feedback</button>
+          <button aria-pressed={promptScope === 'questions'} class:active={promptScope === 'questions'} on:click={() => previewPrompt('questions', promptHistoryId)}>Questions</button>
+          <button aria-pressed={promptScope === 'all'} class:active={promptScope === 'all'} on:click={() => previewPrompt('all', promptHistoryId)}>Full</button>
+        </div>
+        <div class="prompt-formatting">
+          <span class="prompt-path-mode" role="group" aria-label="Prompt path style">
+            {#each [['portable', 'Portable'], ['qualified', 'Qualified'], ['absolute', 'Absolute']] as pathOption}
+              <button aria-pressed={settings.promptPathStyle === pathOption[0]} class:active={settings.promptPathStyle === pathOption[0]} on:click={() => void updatePromptDefaults({ promptPathStyle: pathOption[0] as ReviewSettings['promptPathStyle'] })}>{pathOption[1]}</button>
+            {/each}
+          </span>
+          <label><input type="checkbox" checked={settings.promptIncludeDiffHunks} on:change={(event) => void updatePromptDefaults({ promptIncludeDiffHunks: event.currentTarget.checked })} /> Diff hunks</label>
+          <label><input type="checkbox" checked={settings.promptIncludeGitState} on:change={(event) => void updatePromptDefaults({ promptIncludeGitState: event.currentTarget.checked })} /> Git state</label>
+        </div>
+      </div>
+    {/if}
+    {#if promptNeedsLargeCopyWarning()}<div class="prompt-size-warning" role="alert">This prompt is unusually large. Copying can exceed clipboard or model limits; it remains unchanged unless you choose to copy it.</div>{/if}
+    <pre>{prompt.content}</pre>
+    <footer><span>{promptHistoryId?.startsWith('export:') ? 'Exact durable export; copy and saves never alter annotations.' : settings.promptPathStyle === 'portable' ? 'Portable: paths are relative to each repository.' : settings.promptPathStyle === 'qualified' ? 'Qualified: paths include the repository identity.' : githubReview ? 'Absolute: pinned GitHub URLs; private cache paths are excluded.' : 'Absolute: complete working-tree paths.'}</span><div><button class="secondary-button" on:click={() => savePrompt('markdown')}>Save Markdown…</button><button class="secondary-button" on:click={() => savePrompt('json')}>Save JSON…</button><button class="secondary-button" on:click={() => prompt = undefined}>Close</button><button class="primary-button" on:click={() => copyPrompt(largePromptCopyWarning)}>{largePromptCopyWarning ? 'Copy large prompt anyway' : 'Copy prompt'}</button></div></footer>
+  </dialog></div>
 {/if}
 
 {#if showHistory}
@@ -2885,6 +2941,12 @@
       <label class="fetch-setting"><input type="checkbox" checked={settings.showWhitespace} on:change={(event) => setSettings({ showWhitespace: event.currentTarget.checked })} /> Show whitespace</label>
       <label class="fetch-setting"><input type="checkbox" checked={settings.wrapLines} on:change={(event) => setSettings({ wrapLines: event.currentTarget.checked })} /> Wrap long code lines</label>
       <label class="fetch-setting"><input type="checkbox" checked={settings.vimNavigation} on:change={(event) => setSettings({ vimNavigation: event.currentTarget.checked })} /> Enable Vim j/k file navigation</label>
+      <fieldset class="comparison-options"><legend>Prompt defaults</legend>
+        <label>Path style<select value={settings.promptPathStyle} on:change={(event) => setSettings({ promptPathStyle: event.currentTarget.value as ReviewSettings['promptPathStyle'] })} aria-label="Default prompt path style"><option value="portable">Portable — file path</option><option value="qualified">Qualified — repository and file</option><option value="absolute">Absolute — working-tree path</option></select></label>
+        <label class="fetch-setting"><input type="checkbox" checked={settings.promptIncludeDiffHunks} on:change={(event) => setSettings({ promptIncludeDiffHunks: event.currentTarget.checked })} /> Include relevant diff hunks</label>
+        <label class="fetch-setting"><input type="checkbox" checked={settings.promptIncludeGitState} on:change={(event) => setSettings({ promptIncludeGitState: event.currentTarget.checked })} /> Include Git revision state</label>
+        <p class="form-hint">The last choices are reused for future exports. GitHub PR prompts never expose app cache or worktree paths.</p>
+      </fieldset>
       <div class="shortcut-settings"><strong>Shortcut defaults</strong>{#each Object.entries(settings.shortcuts) as [action, shortcut]}<label>{action}<input value={shortcut} on:change={(event) => setSettings({ shortcuts: { ...settings.shortcuts, [action]: event.currentTarget.value } })} /></label>{/each}</div>
       <section class="diagnostics-panel" aria-label="LocalReview diagnostics"><div><strong>Persistence diagnostics</strong><p>Database integrity and aggregate backup storage only.</p></div><button class="secondary-button" on:click={() => void loadPersistenceDiagnostics()}>Check health</button>{#if persistenceDiagnostics}<dl><div><dt>Database</dt><dd>{persistenceDiagnostics.databaseHealthy ? 'Healthy' : persistenceDiagnostics.integrityDiagnostic}</dd></div><div><dt>Backups</dt><dd>{persistenceDiagnostics.backupStorage.retainedCount} · {persistenceDiagnostics.backupStorage.retainedBytes.toLocaleString()} bytes</dd></div><div><dt>Recoverable</dt><dd>{persistenceDiagnostics.recoverableBackupCount}</dd></div></dl><button class="secondary-button" on:click={() => void copyPersistenceDiagnostics()}>Copy source-free JSON</button>{/if}</section>
     </div>

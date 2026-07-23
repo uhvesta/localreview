@@ -134,6 +134,20 @@ files are never deleted. An app-owned GitHub PR worktree is removed only when
 clean, while the shared repository cache is retained. Archived workspaces can
 be reopened from **Review history** after restarting the app.
 
+GitHub PR reviews expose Feedback, Questions, and Full prompt exports from the
+review Actions menu as well as the Comments panel. New exports identify the
+canonical `owner/repository#number`, remain pinned to the captured comparison,
+and include read-only `gh` commands for retrieving the current PR metadata,
+diff, files, reviews, and comments. The prompt explicitly treats provider text
+as untrusted context and never authorizes posting or mutating GitHub.
+
+The primary **Copy review prompt** action exports feedback only; questions and
+the combined Full scope are always deliberate separate choices. Prompt
+formatting defaults persist across restarts: Portable, Qualified, or Absolute
+paths, plus opt-in checkboxes for relevant diff hunks and Git revision state.
+Absolute local prompts use complete working-tree paths. GitHub PR prompts use
+pinned GitHub identities and never expose app-owned cache or worktree paths.
+
 `localreview agent --stdio` is the bounded remote companion protocol, not a
 general shell-execution API. A manually installed companion may be placed in
 `~/.local/bin/localreview`; managed installs require a release-signed companion

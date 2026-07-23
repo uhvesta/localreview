@@ -46,7 +46,8 @@ use localreview_service::{
     prompt_title_for_scope, CapturedBlameRequest, CapturedCommitContextRequest,
     ChangedSincePreviousReviewRequest, FinishGitHubReviewRequest, FormattedPrompt,
     OpenGitHubPullRequestRequest, OpenLocalWorkspaceRequest, PersistedReviewDocument, PromptEntry,
-    PromptRequest, ReviewService, StartReviewRequest, MAX_CHANGED_SINCE_PREVIOUS_REVIEW_FILES,
+    PromptFormattingOptions, PromptPathStyle, PromptRequest, ReviewService, StartReviewRequest,
+    MAX_CHANGED_SINCE_PREVIOUS_REVIEW_FILES,
 };
 use localreview_ssh::{
     CompanionBootstrapper, CompanionProbe, ForwardedRemoteOpen, ManagedForwardEnvironment,
@@ -1224,6 +1225,9 @@ pub struct ReviewSettings {
     pub show_whitespace: bool,
     pub wrap_lines: bool,
     pub vim_navigation: bool,
+    pub prompt_path_style: String,
+    pub prompt_include_diff_hunks: bool,
+    pub prompt_include_git_state: bool,
     pub shortcuts: BTreeMap<String, String>,
 }
 
@@ -1244,6 +1248,9 @@ impl Default for ReviewSettings {
             show_whitespace: false,
             wrap_lines: false,
             vim_navigation: false,
+            prompt_path_style: "absolute".into(),
+            prompt_include_diff_hunks: false,
+            prompt_include_git_state: false,
             shortcuts: BTreeMap::from([
                 ("saveAnnotation".into(), "Meta+Enter".into()),
                 ("nextHunk".into(), "Alt+ArrowDown".into()),
@@ -1333,7 +1340,11 @@ pub struct PromptInput {
     pub scope: String,
     #[serde(default)]
     pub annotation_ids: Vec<String>,
+    /// Backward-compatible two-state path selector used by older clients.
     pub portable: Option<bool>,
+    pub path_style: Option<String>,
+    pub include_diff_hunks: Option<bool>,
+    pub include_git_state: Option<bool>,
     pub history_id: Option<String>,
 }
 
@@ -3788,7 +3799,11 @@ impl DesktopController {
                 annotation_set_id: primary_set,
                 annotation_set_ids: source_set_ids,
                 scope,
-                workspace_aware_paths: !input.portable.unwrap_or(true),
+                options: PromptFormattingOptions {
+                    path_style: prompt_path_style(input.path_style.as_deref(), input.portable)?,
+                    include_diff_hunks: input.include_diff_hunks.unwrap_or(false),
+                    include_git_state: input.include_git_state.unwrap_or(false),
+                },
                 entries,
             },
             Utc::now(),
@@ -3859,6 +3874,9 @@ impl DesktopController {
                     scope: "all".into(),
                     annotation_ids: Vec::new(),
                     portable: Some(true),
+                    path_style: None,
+                    include_diff_hunks: None,
+                    include_git_state: None,
                     history_id: Some(format!("export:{}", record.id)),
                 },
             )?;
@@ -4005,6 +4023,14 @@ impl DesktopController {
         if !matches!(settings.tab_width, 2 | 4 | 8) {
             return Err(DispatchError::Invalid(
                 "tab width must be 2, 4, or 8".into(),
+            ));
+        }
+        if !matches!(
+            settings.prompt_path_style.as_str(),
+            "portable" | "qualified" | "absolute"
+        ) {
+            return Err(DispatchError::Invalid(
+                "prompt path style must be portable, qualified, or absolute".into(),
             ));
         }
         if settings.shortcuts.len() > 64
@@ -9209,6 +9235,25 @@ fn prompt_scope(
     }
 }
 
+fn prompt_path_style(
+    path_style: Option<&str>,
+    legacy_portable: Option<bool>,
+) -> Result<PromptPathStyle, DispatchError> {
+    match path_style {
+        Some("portable") => Ok(PromptPathStyle::Portable),
+        Some("qualified") => Ok(PromptPathStyle::Qualified),
+        Some("absolute") => Ok(PromptPathStyle::Absolute),
+        Some(_) => Err(DispatchError::Invalid(
+            "prompt path style must be portable, qualified, or absolute".into(),
+        )),
+        None => Ok(match legacy_portable {
+            Some(true) => PromptPathStyle::Portable,
+            Some(false) => PromptPathStyle::Qualified,
+            None => PromptPathStyle::Absolute,
+        }),
+    }
+}
+
 fn hunk_for_annotation(annotation: &Annotation, document: &ReviewDiffDocument) -> Option<String> {
     let anchor = annotation.anchor.as_ref()?;
     let side = anchor.side?;
@@ -10604,6 +10649,12 @@ mod tests {
                 ..ReviewSettings::default()
             })
             .is_err());
+        assert!(controller
+            .save_settings(ReviewSettings {
+                prompt_path_style: "private-cache".into(),
+                ..ReviewSettings::default()
+            })
+            .is_err());
     }
 
     #[test]
@@ -11385,6 +11436,9 @@ mod tests {
                     scope: "all".into(),
                     annotation_ids: Vec::new(),
                     portable: Some(true),
+                    path_style: None,
+                    include_diff_hunks: None,
+                    include_git_state: None,
                     history_id: None,
                 },
             )
@@ -11464,6 +11518,9 @@ mod tests {
                     scope: "all".into(),
                     annotation_ids: Vec::new(),
                     portable: Some(true),
+                    path_style: None,
+                    include_diff_hunks: None,
+                    include_git_state: None,
                     history_id: None,
                 },
             )
@@ -11564,6 +11621,9 @@ mod tests {
                         scope: "feedback".into(),
                         annotation_ids: Vec::new(),
                         portable: Some(false),
+                        path_style: None,
+                        include_diff_hunks: None,
+                        include_git_state: None,
                         history_id: Some(format!("export:{}", export.export_id)),
                     },
                 )
@@ -11891,7 +11951,10 @@ mod tests {
                     PromptInput {
                         scope: scope.into(),
                         annotation_ids: Vec::new(),
-                        portable: Some(true),
+                        portable: None,
+                        path_style: Some("absolute".into()),
+                        include_diff_hunks: Some(false),
+                        include_git_state: Some(false),
                         history_id: None,
                     },
                 )
@@ -11926,19 +11989,46 @@ mod tests {
         ] {
             assert!(full.content.contains(body));
         }
-        assert_eq!(full.content.matches("Requested base `").count(), 1);
-        assert!(full.content.contains("merge-base `"));
-        assert!(full.content.contains("HEAD `"));
-        assert!(full.content.contains("snapshot `"));
-        assert_eq!(full.content.matches("Relevant diff hunk:").count(), 1);
+        assert!(!full.content.contains("Requested base `"));
+        assert!(!full.content.contains("merge-base `"));
+        assert!(!full.content.contains("HEAD `"));
+        assert!(!full.content.contains("snapshot `"));
+        assert!(!full.content.contains("Relevant diff hunk:"));
+        let repository = fixture
+            .controller
+            .state()
+            .repositories(fixture.workspace_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(full.content.contains(repository.worktree_path.as_str()));
         assert_eq!(full.content.matches("Selected source:").count(), 3);
         assert!(full
             .content
             .contains("Selected source:\n```text\nafter\n```"));
+
+        let verbose = fixture
+            .controller
+            .generate_prompt(
+                fixture.workspace_id,
+                PromptInput {
+                    scope: "all".into(),
+                    annotation_ids: Vec::new(),
+                    portable: None,
+                    path_style: Some("qualified".into()),
+                    include_diff_hunks: Some(true),
+                    include_git_state: Some(true),
+                    history_id: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(verbose.content.matches("Requested base `").count(), 1);
+        assert_eq!(verbose.content.matches("Relevant diff hunk:").count(), 1);
         assert!(!full.content.contains("Surrounding context:"));
-        assert!(full.content.contains("### `review.rs`"));
+        assert!(full.content.contains("/review.rs`"));
         assert!(!full.content.contains("Logical path:"));
-        assert!(!full.content.contains(
+        assert!(full.content.contains(
             fixture
                 ._workspace_directory
                 .path()
@@ -11978,6 +12068,9 @@ mod tests {
             scope: "all".into(),
             annotation_ids: Vec::new(),
             portable: Some(true),
+            path_style: None,
+            include_diff_hunks: None,
+            include_git_state: None,
             history_id: Some(format!("set:{}", set.id)),
         };
         assert!(fixture
@@ -12000,6 +12093,9 @@ mod tests {
                         scope: "all".into(),
                         annotation_ids: Vec::new(),
                         portable: Some(true),
+                        path_style: None,
+                        include_diff_hunks: None,
+                        include_git_state: None,
                         history_id: Some(history_id),
                     },
                 )
@@ -12022,6 +12118,9 @@ mod tests {
                     scope: "all".into(),
                     annotation_ids: Vec::new(),
                     portable: Some(true),
+                    path_style: None,
+                    include_diff_hunks: None,
+                    include_git_state: None,
                     history_id: Some(format!("set:{}", set.id)),
                 },
             )
@@ -12056,6 +12155,9 @@ mod tests {
                     scope: "all".into(),
                     annotation_ids: Vec::new(),
                     portable: Some(true),
+                    path_style: None,
+                    include_diff_hunks: None,
+                    include_git_state: None,
                     history_id: Some(format!("review:{}", session.id)),
                 },
             )
@@ -12138,6 +12240,9 @@ mod tests {
                     scope: "all".into(),
                     annotation_ids: Vec::new(),
                     portable: Some(true),
+                    path_style: None,
+                    include_diff_hunks: None,
+                    include_git_state: None,
                     history_id: None,
                 },
             )
@@ -12155,6 +12260,9 @@ mod tests {
                     scope: "feedback".into(),
                     annotation_ids: Vec::new(),
                     portable: Some(false),
+                    path_style: None,
+                    include_diff_hunks: None,
+                    include_git_state: None,
                     history_id: Some(format!("export:{}", first.export_id)),
                 },
             )
@@ -12204,6 +12312,9 @@ mod tests {
                     scope: "questions".into(),
                     annotation_ids: Vec::new(),
                     portable: Some(true),
+                    path_style: None,
+                    include_diff_hunks: None,
+                    include_git_state: None,
                     history_id: Some(format!("export:{}", legacy.id)),
                 },
             )

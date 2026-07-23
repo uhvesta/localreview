@@ -54,7 +54,9 @@ function deferred<T>() {
 const settings: ReviewSettings = {
   fontScale: 1, leftWidth: 244, rightWidth: 332, leftCollapsed: false, rightCollapsed: false,
   fetchOnReview: false, theme: 'dark', codeFont: 'SF Mono', externalEditor: 'system', tabWidth: 2,
-  showWhitespace: false, wrapLines: false, vimNavigation: false, shortcuts: {}
+  showWhitespace: false, wrapLines: false, vimNavigation: false,
+  promptPathStyle: 'absolute', promptIncludeDiffHunks: false, promptIncludeGitState: false,
+  shortcuts: {}
 };
 
 function workspace(id: string, name: string, reviewReady = true): Workspace {
@@ -1123,6 +1125,131 @@ describe('App review-session persistence boundaries', () => {
       workspaceId: local.id,
       historyId: entry.id
     })));
+  });
+
+  it('exposes feedback, question, and full prompt exports in the GitHub review flow', async () => {
+    const github = {
+      ...workspace('workspace-github-prompts', 'GitHub prompt review'),
+      source: ['github'] as Workspace['source']
+    };
+    installApi([github]);
+    const promptRequests: Array<{ workspaceId: string; scope: string }> = [];
+    harness.state.implementation.generatePrompt = async (
+      workspaceId: string,
+      request: { scope: string }
+    ) => {
+      promptRequests.push({ workspaceId, scope: request.scope });
+      return {
+        exportId: `export-${request.scope}`,
+        title: `${request.scope} prompt`,
+        content: `# ${request.scope} GitHub PR prompt`,
+        annotationCount: 0,
+        estimatedTokens: 8
+      };
+    };
+    components.push(mount(App, { target: target() }));
+    await settle(6);
+
+    const actions = document.querySelector<HTMLDetailsElement>('.actions-menu')!;
+    actions.open = true;
+    const labels = [...actions.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+      .map((button) => button.textContent?.trim());
+    expect(labels).toContain('Finish review');
+    expect(labels).toContain('Copy feedback prompt');
+    expect(labels).toContain('Copy questions prompt');
+    expect(labels).toContain('Copy full review prompt');
+
+    for (const [label, scope] of [
+      ['Copy feedback prompt', 'feedback'],
+      ['Copy questions prompt', 'questions'],
+      ['Copy full review prompt', 'all']
+    ]) {
+      actions.open = true;
+      [...actions.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+        .find((button) => button.textContent?.trim() === label)?.click();
+      await settle(3);
+
+      expect(document.querySelector('.prompt-modal #prompt-title')?.textContent)
+        .toBe(`${scope} prompt`);
+      expect(document.querySelector('.prompt-modal pre')?.textContent)
+        .toBe(`# ${scope} GitHub PR prompt`);
+      document.querySelector<HTMLButtonElement>('[aria-label="Close prompt preview"]')?.click();
+      await settle();
+    }
+
+    expect(promptRequests).toEqual([
+      { workspaceId: github.id, scope: 'feedback' },
+      { workspaceId: github.id, scope: 'questions' },
+      { workspaceId: github.id, scope: 'all' }
+    ]);
+
+    [...document.querySelectorAll<HTMLButtonElement>('.panel-tabs [role="tab"]')]
+      .find((button) => button.textContent?.startsWith('Comments'))?.click();
+    await settle(2);
+    expect([...document.querySelectorAll<HTMLButtonElement>('.comment-actions button')]
+      .some((button) => button.textContent === 'Copy questions prompt')).toBe(true);
+  });
+
+  it('uses feedback for the primary local prompt and persists concise formatting defaults', async () => {
+    const local = workspace('workspace-prompt-defaults', 'Prompt defaults');
+    const calls = installApi([local]);
+    const promptRequests: Array<{
+      scope: string;
+      pathStyle?: string;
+      includeDiffHunks?: boolean;
+      includeGitState?: boolean;
+    }> = [];
+    harness.state.implementation.generatePrompt = async (
+      _workspaceId: string,
+      request: {
+        scope: string;
+        pathStyle?: string;
+        includeDiffHunks?: boolean;
+        includeGitState?: boolean;
+      }
+    ) => {
+      promptRequests.push(structuredClone(request));
+      return {
+        exportId: `export-${promptRequests.length}`,
+        title: request.scope === 'feedback' ? 'Review feedback' : `${request.scope} prompt`,
+        content: '# Prompt preview',
+        annotationCount: 1,
+        estimatedTokens: 4
+      };
+    };
+    components.push(mount(App, { target: target() }));
+    await settle(6);
+
+    document.querySelector<HTMLButtonElement>('.finish-button')?.click();
+    await settle(4);
+    expect(promptRequests[0]).toMatchObject({
+      scope: 'feedback',
+      pathStyle: 'absolute',
+      includeDiffHunks: false,
+      includeGitState: false
+    });
+    expect(document.querySelector('.prompt-modal #prompt-title')?.textContent).toBe('Review feedback');
+
+    [...document.querySelectorAll<HTMLButtonElement>('[aria-label="Prompt path style"] button')]
+      .find((button) => button.textContent === 'Qualified')?.click();
+    await settle(5);
+    const optionLabels = [...document.querySelectorAll<HTMLLabelElement>('.prompt-formatting label')];
+    optionLabels.find((label) => label.textContent?.includes('Diff hunks'))
+      ?.querySelector<HTMLInputElement>('input')?.click();
+    await settle(5);
+    optionLabels.find((label) => label.textContent?.includes('Git state'))
+      ?.querySelector<HTMLInputElement>('input')?.click();
+    await settle(5);
+
+    expect(promptRequests.at(-1)).toMatchObject({
+      scope: 'feedback',
+      pathStyle: 'qualified',
+      includeDiffHunks: true,
+      includeGitState: true
+    });
+    expect(calls.settingsWrites).toContainEqual({ promptPathStyle: 'qualified' });
+    expect(calls.settingsWrites).toContainEqual({ promptIncludeDiffHunks: true });
+    expect(calls.settingsWrites).toContainEqual({ promptIncludeGitState: true });
   });
 
   it('promotes the committed GitHub review round when the provider refresh fails', async () => {
