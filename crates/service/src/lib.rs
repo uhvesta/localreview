@@ -35,7 +35,7 @@ use localreview_git::{
 use localreview_persistence::{PersistenceError, PreparedReviewGeneration, StateStore};
 use thiserror::Error;
 
-pub const PROMPT_TEMPLATE_VERSION: u32 = 2;
+pub const PROMPT_TEMPLATE_VERSION: u32 = 3;
 pub const MAX_CHANGED_SINCE_PREVIOUS_REVIEW_FILES: usize = 5_000;
 pub const MAX_REVIEW_FILE_CLASSIFICATIONS: usize = 10_000;
 
@@ -316,6 +316,7 @@ pub struct PersistedReviewDocument {
 struct PreparedCapturedReview {
     capture: CapturedLocalComparison,
     generation: PreparedReviewGeneration,
+    annotation_updates: Vec<Annotation>,
 }
 
 impl ReviewService {
@@ -357,14 +358,26 @@ impl ReviewService {
         });
         let (workspace, reused_existing_workspace) = match existing {
             Some(mut workspace) => {
+                let mut changed = false;
+                // Opening a canonical local root is also an explicit request
+                // to put that workspace back in the live rail. Reusing an
+                // archived record without clearing this marker returns a
+                // convincing success response whose target remains excluded
+                // from every live-workspace list.
+                if workspace.archived_at.take().is_some() {
+                    changed = true;
+                }
                 // An explicit base on a repeated open is a user correction,
                 // not merely a creation default. Persist it so a failed first
                 // capture cannot pin every later retry to the stale value.
                 if let Some(default_base) = request.workspace_default_base {
                     if workspace.default_base != default_base {
                         workspace.default_base = default_base;
-                        workspace.updated_at = Utc::now();
+                        changed = true;
                     }
+                }
+                if changed {
+                    workspace.updated_at = Utc::now();
                 }
                 (workspace, true)
             }
@@ -514,6 +527,7 @@ impl ReviewService {
                 Ok(PreparedCapturedReview {
                     capture,
                     generation,
+                    annotation_updates: Vec::new(),
                 })
             })();
             match operation {
@@ -579,11 +593,10 @@ impl ReviewService {
             .state
             .active_annotation_set(session.id)?
             .ok_or(ServiceError::NoActiveAnnotationSet(session.id))?;
-        let mut captures = Vec::new();
+        let mut prepared_captures = Vec::new();
         let mut failures = Vec::new();
         let mut refreshed_session = session.clone();
         refreshed_session.refreshed_at = Some(Utc::now());
-        let mut committed_any_generation = false;
         for repository in self
             .state
             .repositories(workspace.id)?
@@ -602,7 +615,7 @@ impl ReviewService {
                 temporary_override: temporary_base_overrides.get(&repository.id).cloned(),
             }
             .effective();
-            let operation: Result<CapturedLocalComparison, ServiceError> = (|| {
+            let operation: Result<PreparedCapturedReview, ServiceError> = (|| {
                 let git = GitRepository::open(repository.worktree_path.as_str());
                 let resolved = git.resolve_comparison(
                     repository.id,
@@ -628,19 +641,14 @@ impl ReviewService {
                     &capture.comparison,
                     &review_generation_rows(documents),
                 )?;
-                self.state
-                    .save_prepared_review_generation_with_annotations(
-                        &refreshed_session,
-                        &generation,
-                        &annotation_updates,
-                    )?;
-                Ok(capture)
+                Ok(PreparedCapturedReview {
+                    capture,
+                    generation,
+                    annotation_updates,
+                })
             })();
             match operation {
-                Ok(capture) => {
-                    committed_any_generation = true;
-                    captures.push(capture);
-                }
+                Ok(capture) => prepared_captures.push(capture),
                 Err(error) => failures.push(RepositoryReviewFailure {
                     repository_id: repository.id,
                     relative_path: repository.relative_path,
@@ -648,11 +656,28 @@ impl ReviewService {
                 }),
             }
         }
-        let result_session = if committed_any_generation {
-            refreshed_session
-        } else {
+        let result_session = if prepared_captures.is_empty() {
             session
+        } else {
+            let generations = prepared_captures
+                .iter()
+                .map(|prepared| prepared.generation.clone())
+                .collect::<Vec<_>>();
+            let annotation_updates = prepared_captures
+                .iter()
+                .flat_map(|prepared| prepared.annotation_updates.iter().cloned())
+                .collect::<Vec<_>>();
+            self.state.save_prepared_review_refresh_with_annotations(
+                &refreshed_session,
+                &generations,
+                &annotation_updates,
+            )?;
+            refreshed_session
         };
+        let captures = prepared_captures
+            .into_iter()
+            .map(|prepared| prepared.capture)
+            .collect();
         Ok(StartReviewResult {
             session: result_session,
             active_annotation_set,
@@ -1632,6 +1657,7 @@ pub fn format_prompt(request: &PromptRequest) -> FormattedPrompt {
     ));
     let mut last_repository = None::<Option<RepositoryId>>;
     let mut last_file = None::<String>;
+    let mut last_emitted_hunk = None::<String>;
     for entry in &entries {
         let repository_id = entry.repository.as_ref().map(|repository| repository.id);
         if last_repository != Some(repository_id) {
@@ -1642,7 +1668,7 @@ pub fn format_prompt(request: &PromptRequest) -> FormattedPrompt {
                 );
                 output.push_str(&format!("\n## Repository `{repository_path}`\n"));
                 output.push_str(&format!(
-                    "Requested base: `{}`\nMerge base: `{}`\nTarget HEAD: `{}`\nSnapshot: `{}`\n",
+                    "Requested base `{}` · merge-base `{}` · HEAD `{}` · snapshot `{}`\n",
                     comparison.requested_base,
                     comparison.merge_base_sha,
                     comparison
@@ -1669,20 +1695,22 @@ pub fn format_prompt(request: &PromptRequest) -> FormattedPrompt {
                     )
                 });
         if last_file.as_deref() != Some(&file_key) {
-            output.push_str(&format!("\n### `{file_key}`\n"));
-            if request.workspace_aware_paths {
+            let display_path = if request.workspace_aware_paths {
                 if let Some(repository) = &entry.repository {
                     let repository_path = prompt_relative_path(
                         &repository.relative_path,
                         format!("repository:{}", repository.id),
                     );
-                    output.push_str(&format!(
-                        "Logical path: `{}`\n",
-                        prompt_logical_path(&repository_path, &file_key)
-                    ));
+                    prompt_logical_path(&repository_path, &file_key)
+                } else {
+                    file_key.clone()
                 }
-            }
+            } else {
+                file_key.clone()
+            };
+            output.push_str(&format!("\n### `{display_path}`\n"));
             last_file = Some(file_key);
+            last_emitted_hunk = None;
         }
         output.push_str(&format!("\n#### {:?}\n", entry.annotation.kind));
         if let Some(anchor) = &entry.annotation.anchor {
@@ -1700,11 +1728,20 @@ pub fn format_prompt(request: &PromptRequest) -> FormattedPrompt {
                 output.push_str("Warning: this anchor is outdated and needs verification.\n");
             }
             fenced(&mut output, "Selected source", &anchor.selected_source);
-            fenced(
-                &mut output,
-                "Surrounding context",
-                &anchor.surrounding_context,
-            );
+            // A captured diff hunk already supplies both sides plus local
+            // context. Emitting the anchor's overlapping context as well can
+            // duplicate the selected lines three times. Retain surrounding
+            // context only when no hunk is available, and never repeat a
+            // context block that is identical to the exact selected source.
+            if entry.relevant_hunk.as_deref().map_or(true, str::is_empty)
+                && distinct_prompt_context(&anchor.selected_source, &anchor.surrounding_context)
+            {
+                fenced(
+                    &mut output,
+                    "Surrounding context",
+                    &anchor.surrounding_context,
+                );
+            }
         }
         output.push_str(match entry.annotation.kind {
             localreview_domain::AnnotationKind::Comment => "Feedback:\n\n",
@@ -1715,8 +1752,14 @@ pub fn format_prompt(request: &PromptRequest) -> FormattedPrompt {
         });
         output.push_str(&entry.annotation.body_markdown);
         output.push('\n');
-        if let Some(hunk) = &entry.relevant_hunk {
-            fenced(&mut output, "Relevant diff hunk", hunk);
+        if let Some(hunk) = entry.relevant_hunk.as_ref().filter(|hunk| !hunk.is_empty()) {
+            // Adjacent annotations in the same sorted file commonly belong to
+            // one immutable hunk. Emit that hunk once; each annotation still
+            // carries its exact selected source and anchor independently.
+            if last_emitted_hunk.as_deref() != Some(hunk) {
+                fenced(&mut output, "Relevant diff hunk", hunk);
+                last_emitted_hunk = Some(hunk.clone());
+            }
         }
     }
     FormattedPrompt {
@@ -1726,6 +1769,11 @@ pub fn format_prompt(request: &PromptRequest) -> FormattedPrompt {
             .map(|entry| entry.annotation.id)
             .collect(),
     }
+}
+
+fn distinct_prompt_context(selected_source: &str, surrounding_context: &str) -> bool {
+    let context = surrounding_context.trim_end_matches(['\r', '\n']);
+    !context.is_empty() && context != selected_source.trim_end_matches(['\r', '\n'])
 }
 
 fn scope_includes(scope: &PromptScope, annotation: &Annotation) -> bool {
@@ -1928,6 +1976,11 @@ mod tests {
         assert!(formatted.markdown.contains("Read-only review question"));
         assert!(!formatted.markdown.contains("Handle errors."));
         assert!(formatted.markdown.contains("Why is this safe?"));
+        assert!(formatted
+            .markdown
+            .contains("Selected source:\n```text\nrun()\n```"));
+        assert!(formatted.markdown.contains("Relevant diff hunk:"));
+        assert!(!formatted.markdown.contains("Surrounding context:"));
         assert!(!formatted.markdown.contains("/tmp/"));
 
         request.workspace_aware_paths = true;
@@ -1940,7 +1993,8 @@ mod tests {
             StoredPath::from("/private/var/folders/cache/localreview/reviews/123/worktree");
         let qualified = format_prompt(&request);
         assert!(qualified.markdown.contains("Workspace: `review-workspace`"));
-        assert!(qualified.markdown.contains("Logical path: `a/src/lib.rs`"));
+        assert!(qualified.markdown.contains("### `a/src/lib.rs`"));
+        assert!(!qualified.markdown.contains("Logical path:"));
         assert!(!qualified.markdown.contains("/private/var"));
         assert!(!qualified.markdown.contains("Local path:"));
 
@@ -1986,6 +2040,157 @@ mod tests {
         assert!(!uri_and_home_sanitized.markdown.contains("file:///"));
         assert!(!uri_and_home_sanitized.markdown.contains("/private/var/tmp"));
         assert!(!uri_and_home_sanitized.markdown.contains("~/Library"));
+    }
+
+    #[test]
+    fn prompt_deduplicates_context_without_dropping_immutable_review_evidence() {
+        let mut workspace = workspace();
+        workspace.display_name = "/private/var/folders/review-workspace".into();
+        let repository = repository(workspace.id);
+        let comparison = comparison(repository.id);
+        let annotation_set_id = AnnotationSetId::new();
+        let now = Utc::now();
+        let annotation = |kind, body: &str, line, selected_source: &str| Annotation {
+            id: AnnotationId::new(),
+            annotation_set_id,
+            kind,
+            state: AnnotationState::Open,
+            publication_state: PublicationState::LocalOnly,
+            labels: vec![],
+            body_markdown: body.into(),
+            anchor: Some(
+                AnnotationAnchor::from_line(LineAnchorInput {
+                    comparison_id: comparison.id,
+                    repository_id: repository.id,
+                    file_path: StoredPath::from("src/lib.rs"),
+                    side: DiffSide::New,
+                    start_line: line,
+                    end_line: line,
+                    selected_source: selected_source.into(),
+                    surrounding_context: format!(
+                        "fn surrounding_context() {{\n    {selected_source}\n}}"
+                    ),
+                })
+                .unwrap(),
+            ),
+            created_at: now,
+            updated_at: now,
+        };
+        let first = annotation(
+            AnnotationKind::Comment,
+            "Handle the first risk.",
+            9,
+            "let first = risky();",
+        );
+        let second = annotation(
+            AnnotationKind::Question,
+            "Why is the second call safe?",
+            10,
+            "let second = risky();",
+        );
+        let shared_hunk =
+            "@@ -8,2 +8,2 @@\n-let first = safe();\n+let first = risky();\n+let second = risky();";
+        let formatted = format_prompt(&PromptRequest {
+            workspace,
+            review_session_id: ReviewSessionId::new(),
+            annotation_set_id,
+            annotation_set_ids: vec![annotation_set_id],
+            scope: PromptScope::CommentsAndQuestions,
+            workspace_aware_paths: true,
+            entries: vec![
+                PromptEntry {
+                    annotation: first,
+                    repository: Some(repository.clone()),
+                    comparison: Some(comparison.clone()),
+                    relevant_hunk: Some(shared_hunk.into()),
+                },
+                PromptEntry {
+                    annotation: second,
+                    repository: Some(repository.clone()),
+                    comparison: Some(comparison.clone()),
+                    relevant_hunk: Some(shared_hunk.into()),
+                },
+            ],
+        });
+
+        assert_eq!(formatted.annotation_ids.len(), 2);
+        assert_eq!(formatted.markdown.matches("Selected source:").count(), 2);
+        assert_eq!(formatted.markdown.matches("Relevant diff hunk:").count(), 1);
+        assert_eq!(formatted.markdown.matches("## Repository `a`").count(), 1);
+        assert_eq!(formatted.markdown.matches("### `a/src/lib.rs`").count(), 1);
+        assert!(!formatted.markdown.contains("Surrounding context:"));
+        assert!(!formatted.markdown.contains("Logical path:"));
+        for selected_source in ["let first = risky();", "let second = risky();"] {
+            assert!(formatted.markdown.contains(&format!(
+                "Selected source:\n```text\n{selected_source}\n```"
+            )));
+        }
+        assert!(formatted.markdown.contains("Handle the first risk."));
+        assert!(formatted.markdown.contains("Why is the second call safe?"));
+        assert!(formatted.markdown.contains(&format!(
+            "Requested base `{}` · merge-base `{}` · HEAD `{}` · snapshot `{}`",
+            comparison.requested_base,
+            comparison.merge_base_sha,
+            comparison.head_sha.as_ref().unwrap(),
+            comparison.working_tree_fingerprint.as_str(),
+        )));
+        assert!(!formatted.markdown.contains("/private/var"));
+        assert!(
+            formatted.markdown.len() < 1_500,
+            "the two-item prompt unexpectedly expanded to {} bytes",
+            formatted.markdown.len()
+        );
+    }
+
+    #[test]
+    fn prompt_retains_distinct_surrounding_context_when_no_hunk_exists() {
+        let workspace = workspace();
+        let repository = repository(workspace.id);
+        let comparison = comparison(repository.id);
+        let annotation_set_id = AnnotationSetId::new();
+        let now = Utc::now();
+        let annotation = Annotation {
+            id: AnnotationId::new(),
+            annotation_set_id,
+            kind: AnnotationKind::Question,
+            state: AnnotationState::Open,
+            publication_state: PublicationState::LocalOnly,
+            labels: vec![],
+            body_markdown: "What calls this function?".into(),
+            anchor: Some(
+                AnnotationAnchor::from_line(LineAnchorInput {
+                    comparison_id: comparison.id,
+                    repository_id: repository.id,
+                    file_path: StoredPath::from("src/lib.rs"),
+                    side: DiffSide::New,
+                    start_line: 2,
+                    end_line: 2,
+                    selected_source: "fn run() {}".into(),
+                    surrounding_context: "mod task {\n    fn run() {}\n}".into(),
+                })
+                .unwrap(),
+            ),
+            created_at: now,
+            updated_at: now,
+        };
+        let formatted = format_prompt(&PromptRequest {
+            workspace,
+            review_session_id: ReviewSessionId::new(),
+            annotation_set_id,
+            annotation_set_ids: vec![annotation_set_id],
+            scope: PromptScope::AllQuestions,
+            workspace_aware_paths: false,
+            entries: vec![PromptEntry {
+                annotation,
+                repository: Some(repository),
+                comparison: Some(comparison),
+                relevant_hunk: None,
+            }],
+        });
+
+        assert!(formatted.markdown.contains("Selected source:"));
+        assert!(formatted.markdown.contains("Surrounding context:"));
+        assert!(!formatted.markdown.contains("Relevant diff hunk:"));
     }
 
     #[test]
@@ -2322,6 +2527,39 @@ mod tests {
     }
 
     #[test]
+    fn opening_archived_local_workspace_reactivates_the_durable_record() {
+        let directory = TempDir::new().unwrap();
+        initialized_repository(directory.path());
+        let state_directory = TempDir::new().unwrap();
+        let service = ReviewService::new(StateStore::open(state_directory.path()).unwrap());
+        let request = OpenLocalWorkspaceRequest {
+            root: directory.path().to_path_buf(),
+            display_name: None,
+            workspace_default_base: None,
+            discovery: DiscoveryConfig::default(),
+        };
+        let first = service.open_local_workspace(request.clone()).unwrap();
+        let mut archived = first.workspace.clone();
+        archived.archived_at = Some(Utc::now());
+        archived.updated_at = Utc::now();
+        service.state().upsert_workspace(&archived).unwrap();
+
+        let reopened = service.open_local_workspace(request).unwrap();
+        assert!(reopened.reused_existing_workspace);
+        assert_eq!(reopened.workspace.id, first.workspace.id);
+        assert_eq!(reopened.workspace.archived_at, None);
+        assert_eq!(
+            service
+                .state()
+                .workspace(first.workspace.id)
+                .unwrap()
+                .unwrap()
+                .archived_at,
+            None
+        );
+    }
+
+    #[test]
     fn repeated_open_updates_an_explicit_base_and_survives_restart() {
         let directory = TempDir::new().unwrap();
         initialized_repository(directory.path());
@@ -2580,6 +2818,103 @@ enabled = false
     }
 
     #[test]
+    fn concurrent_reads_never_observe_a_partially_promoted_multi_repo_refresh() {
+        let workspace_directory = TempDir::new().unwrap();
+        let first_path = workspace_directory.path().join("first");
+        let second_path = workspace_directory.path().join("second");
+        initialized_repository(&first_path);
+        initialized_repository(&second_path);
+        fs::write(first_path.join("tracked.txt"), "first old\n").unwrap();
+        fs::write(second_path.join("tracked.txt"), "second old\n").unwrap();
+
+        let state_directory = TempDir::new().unwrap();
+        let store = StateStore::open(state_directory.path()).unwrap();
+        let service = ReviewService::new(store.clone());
+        let opened = service
+            .open_local_workspace(OpenLocalWorkspaceRequest {
+                root: workspace_directory.path().to_path_buf(),
+                display_name: None,
+                workspace_default_base: Some(BaseReference::new("master").unwrap()),
+                discovery: DiscoveryConfig::default(),
+            })
+            .unwrap();
+        let started = service
+            .start_local_review(StartReviewRequest {
+                workspace_id: opened.workspace.id,
+                application_default_base: BaseReference::new("master").unwrap(),
+                temporary_base_overrides: BTreeMap::new(),
+                options: ComparisonOptions::default(),
+            })
+            .unwrap();
+        let comparison_ids = || {
+            store
+                .current_comparisons_for_session(started.session.id)
+                .unwrap()
+                .into_iter()
+                .map(|comparison| comparison.id.to_string())
+                .collect::<Vec<_>>()
+        };
+        let prior = comparison_ids();
+
+        fs::write(first_path.join("tracked.txt"), "first new\n").unwrap();
+        fs::write(second_path.join("tracked.txt"), "second new\n").unwrap();
+        // Make the second repository's read-only Git capture long enough for
+        // repeated controller-style reads. Before batch promotion, the first
+        // repository was already visible throughout this entire second phase.
+        for index in 0..128 {
+            fs::write(
+                second_path.join(format!("untracked-{index:03}.txt")),
+                format!("{index:03}:{}\n", "captured source".repeat(256)),
+            )
+            .unwrap();
+        }
+
+        let started_refresh = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished_refresh = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_started = Arc::clone(&started_refresh);
+        let worker_finished = Arc::clone(&finished_refresh);
+        let worker_service = service.clone();
+        let session_id = started.session.id;
+        let worker = std::thread::spawn(move || {
+            worker_started.store(true, std::sync::atomic::Ordering::SeqCst);
+            let result = worker_service.refresh_local_review(
+                session_id,
+                BaseReference::new("master").unwrap(),
+                BTreeMap::new(),
+                ComparisonOptions::default(),
+            );
+            worker_finished.store(true, std::sync::atomic::Ordering::SeqCst);
+            result
+        });
+        while !started_refresh.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+
+        let mut observed = BTreeSet::new();
+        let mut read_count = 0_usize;
+        while !finished_refresh.load(std::sync::atomic::Ordering::SeqCst) {
+            observed.insert(comparison_ids());
+            read_count += 1;
+            std::thread::yield_now();
+        }
+        worker.join().unwrap().unwrap();
+        let promoted = comparison_ids();
+        observed.insert(promoted.clone());
+
+        assert!(
+            read_count > 0,
+            "reads should progress while Git capture runs"
+        );
+        assert_ne!(prior, promoted);
+        assert!(
+            observed
+                .iter()
+                .all(|comparison_ids| comparison_ids == &prior || comparison_ids == &promoted),
+            "a reader observed a mixed old/new repository generation: {observed:?}"
+        );
+    }
+
+    #[test]
     fn failed_new_review_promotion_preserves_the_prior_session_annotations_and_history() {
         let workspace_directory = TempDir::new().unwrap();
         let repository_path = workspace_directory.path().join("repo");
@@ -2794,17 +3129,18 @@ enabled = false
         let original_documents = service.review_documents(started.session.id).unwrap();
         fs::write(repository_path.join("tracked.txt"), "prefix\nselected\n").unwrap();
         store.inject_next_atomic_commit_failure_for_test();
-        let refreshed = service
-            .refresh_local_review(
-                started.session.id,
-                BaseReference::new("master").unwrap(),
-                BTreeMap::new(),
-                ComparisonOptions::default(),
-            )
-            .unwrap();
-        assert!(refreshed.captures.is_empty());
-        assert_eq!(refreshed.failures.len(), 1);
-        assert_eq!(refreshed.session, started.session);
+        let refreshed = service.refresh_local_review(
+            started.session.id,
+            BaseReference::new("master").unwrap(),
+            BTreeMap::new(),
+            ComparisonOptions::default(),
+        );
+        assert!(matches!(
+            refreshed,
+            Err(ServiceError::Persistence(
+                PersistenceError::InjectedAtomicCommitFailure
+            ))
+        ));
         assert_eq!(
             store
                 .current_comparisons_for_session(started.session.id)
@@ -2824,6 +3160,71 @@ enabled = false
         assert_eq!(
             reopened.review_documents(started.session.id).unwrap(),
             original_documents
+        );
+    }
+
+    #[test]
+    fn failed_multi_repository_refresh_rolls_back_every_prepared_generation() {
+        let workspace_directory = TempDir::new().unwrap();
+        let first_path = workspace_directory.path().join("first");
+        let second_path = workspace_directory.path().join("second");
+        initialized_repository(&first_path);
+        initialized_repository(&second_path);
+        fs::write(first_path.join("tracked.txt"), "first old\n").unwrap();
+        fs::write(second_path.join("tracked.txt"), "second old\n").unwrap();
+
+        let state_directory = TempDir::new().unwrap();
+        let store = StateStore::open(state_directory.path()).unwrap();
+        let service = ReviewService::new(store.clone());
+        let opened = service
+            .open_local_workspace(OpenLocalWorkspaceRequest {
+                root: workspace_directory.path().to_path_buf(),
+                display_name: None,
+                workspace_default_base: Some(BaseReference::new("master").unwrap()),
+                discovery: DiscoveryConfig::default(),
+            })
+            .unwrap();
+        let started = service
+            .start_local_review(StartReviewRequest {
+                workspace_id: opened.workspace.id,
+                application_default_base: BaseReference::new("master").unwrap(),
+                temporary_base_overrides: BTreeMap::new(),
+                options: ComparisonOptions::default(),
+            })
+            .unwrap();
+        let original_comparisons = store
+            .current_comparisons_for_session(started.session.id)
+            .unwrap();
+        let original_documents = service.review_documents(started.session.id).unwrap();
+
+        fs::write(first_path.join("tracked.txt"), "first new\n").unwrap();
+        fs::write(second_path.join("tracked.txt"), "second new\n").unwrap();
+        store.inject_next_atomic_commit_failure_for_test();
+        let refreshed = service.refresh_local_review(
+            started.session.id,
+            BaseReference::new("master").unwrap(),
+            BTreeMap::new(),
+            ComparisonOptions::default(),
+        );
+        assert!(matches!(
+            refreshed,
+            Err(ServiceError::Persistence(
+                PersistenceError::InjectedAtomicCommitFailure
+            ))
+        ));
+        assert_eq!(
+            store
+                .current_comparisons_for_session(started.session.id)
+                .unwrap(),
+            original_comparisons
+        );
+        assert_eq!(
+            service.review_documents(started.session.id).unwrap(),
+            original_documents
+        );
+        assert_eq!(
+            service.active_review_session(opened.workspace.id).unwrap(),
+            Some(started.session)
         );
     }
 }

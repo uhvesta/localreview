@@ -404,6 +404,71 @@ pub fn full_file_rows(document: &ReviewDiffDocument, side: DiffSide) -> Vec<Full
         .collect()
 }
 
+/// Projects the complete current source while retaining removed Base lines at
+/// their exact insertion anchors. Current-source rows remain a lossless,
+/// ordered projection of `document.new`; the interleaved Old rows are
+/// deletion tombstones and retain their immutable Base line numbers.
+///
+/// This projection is derived from the canonical hunks instead of diffing the
+/// sources again. Besides keeping Full File viewport requests inexpensive,
+/// that guarantees its deletion anchors use the same line alignment as the
+/// Unified and Split presentations.
+#[must_use]
+pub fn full_file_current_rows(document: &ReviewDiffDocument) -> Vec<FullFileRow> {
+    let mut removals_by_anchor = vec![Vec::new(); document.new.lines().count().saturating_add(1)];
+    for hunk in &document.hunks {
+        for (index, row) in hunk.unified_rows.iter().enumerate() {
+            if row.kind != DiffLineKind::Removal {
+                continue;
+            }
+            let Some(cell) = row.old.as_ref() else {
+                continue;
+            };
+            // An anchor is the number of Current lines preceding this
+            // tombstone. Prefer the following aligned Current row so a
+            // replacement renders its removals before its additions. A pure
+            // deletion hunk has no Current cells and uses Git's zero-based
+            // empty-range start directly.
+            let next_new = hunk.unified_rows[index.saturating_add(1)..]
+                .iter()
+                .find_map(|candidate| candidate.new.as_ref().map(|value| value.line_number));
+            let previous_new = hunk.unified_rows[..index]
+                .iter()
+                .rev()
+                .find_map(|candidate| candidate.new.as_ref().map(|value| value.line_number));
+            let anchor = next_new
+                .map(|line| line.saturating_sub(1))
+                .or(previous_new)
+                .unwrap_or(hunk.header.new_start);
+            let anchor = usize::try_from(anchor)
+                .unwrap_or(usize::MAX)
+                .min(removals_by_anchor.len().saturating_sub(1));
+            removals_by_anchor[anchor].push(FullFileRow {
+                side: DiffSide::Old,
+                line_number: cell.line_number,
+                text: cell.text.clone(),
+                changed: true,
+                has_trailing_newline: cell.has_trailing_newline,
+            });
+        }
+    }
+
+    let current = full_file_rows(document, DiffSide::New);
+    let mut rows = Vec::with_capacity(
+        current
+            .len()
+            .saturating_add(removals_by_anchor.iter().map(Vec::len).sum::<usize>()),
+    );
+    for (index, row) in current.into_iter().enumerate() {
+        rows.append(&mut removals_by_anchor[index]);
+        rows.push(row);
+    }
+    if let Some(trailing) = removals_by_anchor.last_mut() {
+        rows.append(trailing);
+    }
+    rows
+}
+
 fn cell(
     side: DiffSide,
     source_index: u32,
@@ -982,6 +1047,74 @@ mod tests {
         let rows = full_file_rows(&document, DiffSide::New);
         assert!(!rows[0].changed);
         assert!(rows[1].changed);
+    }
+
+    #[test]
+    fn full_file_current_interleaves_base_removals_without_losing_current_source() {
+        let document = document_from_sources(
+            ComparisonId::new(),
+            review_file(),
+            "before\nremove one\nremove two\nafter\ntail removed\n",
+            "before\nreplacement\nafter\n",
+        );
+        let rows = full_file_current_rows(&document);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.side, row.line_number, row.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (DiffSide::New, 1, "before"),
+                (DiffSide::Old, 2, "remove one"),
+                (DiffSide::Old, 3, "remove two"),
+                (DiffSide::New, 2, "replacement"),
+                (DiffSide::New, 3, "after"),
+                (DiffSide::Old, 5, "tail removed"),
+            ]
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.side == DiffSide::New)
+                .map(|row| row.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["before", "replacement", "after"]
+        );
+        assert!(rows
+            .iter()
+            .filter(|row| row.side == DiffSide::Old)
+            .all(|row| row.changed));
+    }
+
+    #[test]
+    fn full_file_current_handles_boundary_deletions_and_created_files() {
+        let deleted_at_boundaries = document_from_sources(
+            ComparisonId::new(),
+            review_file(),
+            "first removed\nkept\nlast removed\n",
+            "kept\n",
+        );
+        let rows = full_file_current_rows(&deleted_at_boundaries);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.side, row.line_number, row.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (DiffSide::Old, 1, "first removed"),
+                (DiffSide::New, 1, "kept"),
+                (DiffSide::Old, 3, "last removed"),
+            ]
+        );
+
+        let mut added_file = review_file();
+        added_file.status = ReviewFileStatus::Added;
+        let added = document_from_sources(
+            ComparisonId::new(),
+            added_file,
+            "",
+            "created one\ncreated two\n",
+        );
+        let added_rows = full_file_current_rows(&added);
+        assert_eq!(added_rows.len(), 2);
+        assert!(added_rows.iter().all(|row| row.side == DiffSide::New));
     }
 
     #[test]

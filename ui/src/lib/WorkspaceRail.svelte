@@ -2,6 +2,7 @@
   import type { Workspace, WorkspaceSource } from './types';
 
   export let workspaces: Workspace[] = [];
+  export let refreshStages: Record<string, 'capturing' | 'preparing' | 'updated' | 'failed'> = {};
   export let selectedId = '';
   export let collapsed = false;
   export let onSelect: (id: string) => void = () => {};
@@ -51,9 +52,17 @@
             </div>
             <div class="workspace-location"><span class="source-icon" aria-hidden="true">{sourceIcon[workspace.source[0]]}</span>{workspace.location}</div>
             {#if workspace.detail}<div class="workspace-detail" title={workspace.detail}>{workspace.detail}</div>{/if}
-            <div class="workspace-meta">
+            <div class="workspace-meta" aria-live="polite">
               <span>{workspace.progress.viewed}/{workspace.progress.total} files</span>
-              {#if workspace.refreshAvailable}<span class="refresh-dot">Refresh</span>{/if}
+              {#if refreshStages[workspace.id] === 'capturing'}
+                <span class="refresh-dot refreshing">Capturing…</span>
+              {:else if refreshStages[workspace.id] === 'preparing'}
+                <span class="refresh-dot refreshing">Preparing…</span>
+              {:else if refreshStages[workspace.id] === 'updated'}
+                <span class="refresh-dot updated">Updated</span>
+              {:else if refreshStages[workspace.id] === 'failed'}
+                <span class="refresh-dot failed">Failed</span>
+              {:else if workspace.refreshAvailable}<span class="refresh-dot">Refresh</span>{/if}
               {#if workspace.connection === 'offline'}<span class="offline-dot">Offline</span>{/if}
               {#if workspace.connection === 'connecting'}<span class="refresh-dot">Connecting</span>{/if}
             </div>

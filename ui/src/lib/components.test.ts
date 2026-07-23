@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest';
   import VirtualDiff from './VirtualDiff.svelte';
   import VirtualFileList from './VirtualFileList.svelte';
 import WorkspaceRail from './WorkspaceRail.svelte';
-import type { DiffRow, Workspace } from './types';
+import type { Annotation, DiffRow, Workspace } from './types';
 
 const targets: HTMLElement[] = [];
 
@@ -43,7 +43,7 @@ describe('review components', () => {
     expect(document.querySelector('.review-panel')).not.toBeNull();
     expect(document.querySelector('.theme-root')?.classList.contains('large-text-root')).toBe(true);
     expect(document.querySelector('.actions-menu summary')?.textContent).toBe('Actions');
-    expect([...document.querySelectorAll<HTMLElement>('.actions-menu [role="menuitem"]')].map((button) => button.textContent)).toEqual(['Copy review prompt', 'Baselines', 'New review', 'History', 'Blame selected lines', 'Commit context', 'Changed since previous review', 'Settings']);
+    expect([...document.querySelectorAll<HTMLElement>('.actions-menu [role="menuitem"]')].map((button) => button.textContent)).toEqual(['Copy review prompt', 'Review setup', 'New review', 'History', 'Blame selected lines', 'Commit context', 'Changed since previous review', 'Settings']);
     document.querySelector<HTMLButtonElement>('.actions-menu [role="menuitem"]')?.click();
     await settle();
     expect(document.querySelector('[aria-labelledby="prompt-title"]')).not.toBeNull();
@@ -228,6 +228,103 @@ describe('review components', () => {
     unmount(component);
   });
 
+  it('renders Full File Current removal tombstones as selectable highlighted Base rows', async () => {
+    const rows: DiffRow[] = [
+      { id: 'new-3', kind: 'context', newLine: 3, newText: 'before();', newSourceStartByte: 20 },
+      { id: 'old-4', kind: 'deletion', oldLine: 4, oldText: 'const removed = 1;', oldSourceStartByte: 30 },
+      { id: 'old-5', kind: 'deletion', oldLine: 5, oldText: 'const alsoRemoved = 2;', oldSourceStartByte: 49 },
+      { id: 'new-4', kind: 'context', newLine: 4, newText: 'after();', newSourceStartByte: 30 }
+    ];
+    const selections: Array<{ side: string; startLine: number; endLine: number }> = [];
+    const host = target();
+    const component = mount(VirtualDiff, {
+      target: host,
+      props: {
+        rows,
+        totalRows: rows.length,
+        mode: 'full',
+        fullFileSide: 'new',
+        oldTokens: [{ startByte: 30, endByte: 35, class: 'keyword' }],
+        onAnnotate: (_row: DiffRow, selection: { side: string; startLine: number; endLine: number }) => selections.push(selection)
+      }
+    });
+    await settle();
+
+    const tombstones = [...host.querySelectorAll<HTMLElement>('.diff-row.removed')];
+    expect(tombstones).toHaveLength(2);
+    expect(tombstones[0].getAttribute('aria-label')).toContain('old line 4, removed change');
+    expect(tombstones[0].getAttribute('aria-label')).toContain('Removed Base line shown inline at its Current-file deletion anchor');
+    expect(tombstones[0].querySelector('.line-number.old')?.textContent).toBe('4');
+    expect(tombstones[0].querySelector('.line-number.new')?.textContent).toBe('');
+    expect(tombstones[0].querySelector('.syntax-keyword')?.textContent).toBe('const');
+
+    const gutters = [...host.querySelectorAll<HTMLButtonElement>('[aria-label^="Add annotation at old line"]')];
+    gutters[0].dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    gutters[1].dispatchEvent(new MouseEvent('click', { bubbles: true, shiftKey: true }));
+    await settle();
+    expect(selections.at(-1)).toEqual({ side: 'old', startLine: 4, endLine: 5 });
+    unmount(component);
+  });
+
+  it('renders collapsed Full File deletion gates with annotation state and expands on demand', async () => {
+    const toggles: string[] = [];
+    const host = target();
+    const component = mount(VirtualDiff, {
+      target: host,
+      props: {
+        rows: [{
+          id: 'gate-4-8', kind: 'deletion_gate', oldLine: 4, oldEndLine: 8,
+          deletionBlockId: 'block-4-8', deletionCount: 5, text: '5 deleted lines', hasAnnotation: true
+        }],
+        totalRows: 1,
+        mode: 'full',
+        fullFileSide: 'new',
+        onToggleDeletionBlock: (id: string) => toggles.push(id)
+      }
+    });
+    await settle();
+
+    const gate = host.querySelector<HTMLElement>('.deletion-gate-row')!;
+    expect(gate.getAttribute('aria-label')).toContain('5 deleted Base lines, lines 4–8, collapsed');
+    expect(gate.getAttribute('aria-label')).toContain('Contains annotations');
+    const toggle = gate.querySelector<HTMLButtonElement>('.deletion-gate-toggle')!;
+    expect(toggle.textContent).toContain('› 5 deleted lines · Base 4–8 · annotations hidden');
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    toggle.click();
+    expect(toggles).toEqual(['block-4-8']);
+    unmount(component);
+  });
+
+  it('retains an expanded Full File deletion gate as a per-block collapse control', async () => {
+    const toggles: string[] = [];
+    const host = target();
+    const component = mount(VirtualDiff, {
+      target: host,
+      props: {
+        rows: [{
+          id: 'gate-4-8', kind: 'deletion_gate', oldLine: 4, oldEndLine: 8,
+          deletionBlockId: 'block-4-8', deletionCount: 5, deletionExpanded: true,
+          text: '5 deleted lines'
+        }],
+        totalRows: 1,
+        mode: 'full',
+        fullFileSide: 'new',
+        onToggleDeletionBlock: (id: string) => toggles.push(id)
+      }
+    });
+    await settle();
+
+    const gate = host.querySelector<HTMLElement>('.deletion-gate-row')!;
+    expect(gate.getAttribute('aria-label')).toContain('5 deleted Base lines, lines 4–8, expanded');
+    const toggle = gate.querySelector<HTMLButtonElement>('.deletion-gate-toggle')!;
+    expect(toggle.textContent).toContain('⌄ 5 deleted lines · Base 4–8');
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(toggle.getAttribute('aria-label')).toContain('Hide 5 deleted lines');
+    toggle.click();
+    expect(toggles).toEqual(['block-4-8']);
+    unmount(component);
+  });
+
   it('keeps an active inline draft visibly attached across the virtual diff surface', async () => {
     const host = target();
     const component = mount(VirtualDiff, {
@@ -246,6 +343,109 @@ describe('review components', () => {
     await settle();
     expect(host.textContent).toContain('Draft attached to new lines 40–42 · comment');
     expect(host.querySelectorAll('.diff-row.composer-range')).toHaveLength(3);
+    unmount(component);
+  });
+
+  it('shows stacked inline comment and question indicators without opening the editor', async () => {
+    const rows: DiffRow[] = [10, 11, 12].map((line) => ({
+      id: `new-${line}`, kind: 'context', newLine: line, newText: `const value${line} = true;`
+    }));
+    const annotations: Annotation[] = [
+      { id: 'comment-range', fileId: 'file', repositoryId: 'repo', kind: 'comment', state: 'open', side: 'new', startLine: 10, endLine: 12, body: 'Keep this range cohesive.', selectedSource: 'range', labels: ['important'], localOnly: false, createdAt: '2026-01-01T00:00:00Z' },
+      { id: 'question-range', fileId: 'file', repositoryId: 'repo', kind: 'question', state: 'open', side: 'new', startLine: 11, endLine: 12, body: 'Should this be awaited?', selectedSource: 'range', labels: [], localOnly: true, createdAt: '2026-01-01T00:00:01Z' },
+      { id: 'comment-line', fileId: 'file', repositoryId: 'repo', kind: 'comment', state: 'resolved', side: 'new', startLine: 12, endLine: 12, body: 'Resolved context still belongs here.', selectedSource: 'line', labels: [], localOnly: false, createdAt: '2026-01-01T00:00:02Z' }
+    ];
+    const edits: string[] = [];
+    const additions: Array<{ side: string; startLine: number; endLine: number }> = [];
+    const host = target();
+    const component = mount(VirtualDiff, {
+      target: host,
+      props: {
+        rows, totalRows: rows.length, mode: 'unified',
+        annotationsForRow: (row: DiffRow, side: string) => annotations.filter((annotation) => {
+          const line = side === 'old' ? row.oldLine : row.newLine;
+          return annotation.side === side && line !== undefined && annotation.startLine <= line && annotation.endLine >= line;
+        }),
+        annotationCountAt: (row: DiffRow, side: string) => annotations.filter((annotation) => {
+          const line = side === 'old' ? row.oldLine : row.newLine;
+          return annotation.side === side && line !== undefined && annotation.startLine <= line && annotation.endLine >= line;
+        }).length,
+        onAnnotate: (_row: DiffRow, selection: { side: string; startLine: number; endLine: number }) => additions.push(selection),
+        onEditAnnotation: (annotation: Annotation) => edits.push(annotation.id)
+      }
+    });
+    await settle();
+
+    expect(host.querySelectorAll('.diff-row.annotation-range')).toHaveLength(3);
+    expect(host.querySelectorAll('.annotation-thread-toggle')).toHaveLength(1);
+    const toggle = host.querySelector<HTMLButtonElement>('.annotation-thread-toggle')!;
+    expect(toggle.getAttribute('aria-label')).toContain('3 annotations (2 comments, 1 question)');
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(toggle.classList.contains('question-thread')).toBe(true);
+    expect(host.querySelector('.inline-thread-popover')).toBeNull();
+    expect(additions).toHaveLength(0);
+    expect(edits).toHaveLength(0);
+
+    toggle.focus();
+    expect(document.activeElement).toBe(toggle);
+    toggle.click();
+    await settle();
+    const panel = host.querySelector<HTMLElement>('.inline-thread-popover')!;
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(toggle.getAttribute('aria-controls')).toBe(panel.id);
+    expect(panel.querySelectorAll('.inline-thread-item')).toHaveLength(3);
+    expect(panel.querySelector('.inline-thread-kind.comment')?.textContent).toBe('Comment');
+    expect(panel.querySelector('.inline-thread-kind.question')?.textContent).toBe('Question');
+    expect(panel.textContent).toContain('new lines 10–12');
+    expect(panel.textContent).toContain('Should this be awaited?');
+    expect(host.querySelector<HTMLElement>('.virtual-spacer')?.style.height).toBe('72px');
+    expect(additions).toHaveLength(0);
+    expect(edits).toHaveLength(0);
+
+    panel.querySelector<HTMLButtonElement>('.inline-thread-item button')?.click();
+    expect(edits).toEqual(['comment-range']);
+    expect(additions).toHaveLength(0);
+    await settle();
+    toggle.click();
+    await settle();
+    host.querySelector<HTMLButtonElement>('.inline-thread-actions button')?.click();
+    expect(additions.at(-1)).toEqual({ side: 'new', startLine: 12, endLine: 12 });
+    unmount(component);
+  });
+
+  it('keeps split and full-file annotation threads side-aware and read-only when requested', async () => {
+    const rows: DiffRow[] = [1, 2].map((line) => ({ id: `paired-${line}`, kind: 'context', oldLine: line, newLine: line, oldText: `old ${line}`, newText: `new ${line}` }));
+    const annotations: Annotation[] = [
+      { id: 'old-comment', fileId: 'file', repositoryId: 'repo', kind: 'comment', state: 'open', side: 'old', startLine: 1, endLine: 2, body: 'Old-side feedback.', selectedSource: 'old', labels: [], localOnly: false, createdAt: '2026-01-01T00:00:00Z' },
+      { id: 'new-question', fileId: 'file', repositoryId: 'repo', kind: 'question', state: 'open', side: 'new', startLine: 1, endLine: 2, body: 'New-side question?', selectedSource: 'new', labels: [], localOnly: false, createdAt: '2026-01-01T00:00:01Z' }
+    ];
+    const annotationsForRow = (row: DiffRow, side: string) => annotations.filter((annotation) => {
+      const line = side === 'old' ? row.oldLine : row.newLine;
+      return annotation.side === side && line !== undefined && annotation.startLine <= line && annotation.endLine >= line;
+    });
+    const host = target();
+    let component = mount(VirtualDiff, { target: host, props: { rows, totalRows: rows.length, mode: 'split', annotationsForRow } });
+    await settle();
+    expect(host.querySelectorAll('.annotation-thread-toggle')).toHaveLength(2);
+    expect(host.querySelectorAll('.annotation-range-cell')).toHaveLength(16);
+    const oldToggle = host.querySelector<HTMLButtonElement>('[aria-label*="at old line 2"]')!;
+    const newToggle = host.querySelector<HTMLButtonElement>('[aria-label*="at new line 2"]')!;
+    oldToggle.click();
+    await settle();
+    expect(host.querySelector('.inline-thread-popover.side-old')?.textContent).toContain('Old-side feedback.');
+    newToggle.click();
+    await settle();
+    expect(host.querySelector('.inline-thread-popover.side-old')).toBeNull();
+    expect(host.querySelector('.inline-thread-popover.side-new')?.textContent).toContain('New-side question?');
+    unmount(component);
+
+    component = mount(VirtualDiff, { target: host, props: { rows, totalRows: rows.length, mode: 'full', fullFileSide: 'new', annotationsForRow, annotationsEditable: false } });
+    await settle();
+    host.querySelector<HTMLButtonElement>('.annotation-thread-toggle')?.click();
+    await settle();
+    expect(host.querySelector('.inline-thread-popover.side-new')?.textContent).toContain('New-side question?');
+    expect(host.querySelector<HTMLButtonElement>('.inline-thread-item button')?.disabled).toBe(true);
+    expect(host.querySelector<HTMLButtonElement>('.inline-thread-actions button')?.disabled).toBe(true);
     unmount(component);
   });
 
@@ -336,7 +536,7 @@ describe('review components', () => {
 
     const files = Array.from({ length: 1_000 }, (_, index) => ({
       id: `file-${index}`, repositoryId: 'repo', path: `src/${index}.ts`, status: 'modified' as const,
-      additions: index, deletions: 0, language: 'TypeScript', viewed: false, annotationCount: 0
+      additions: index, deletions: 0, hunkCount: 0, language: 'TypeScript', viewed: false, annotationCount: 0
     }));
     const fileTarget = target();
     component = mount(VirtualFileList, {
@@ -396,7 +596,7 @@ describe('review components', () => {
   it('uses a collapsible repository/folder tree with scaled variable rows', async () => {
     const files = Array.from({ length: 100 }, (_, index) => ({
       id: `tree-${index}`, repositoryId: 'repo', path: `src/features/area-${index % 5}/a-very-long-review-file-name-${index}.ts`, status: 'modified' as const,
-      additions: 1, deletions: 1, language: 'TypeScript', viewed: false, annotationCount: 0
+      additions: 1, deletions: 1, hunkCount: 0, language: 'TypeScript', viewed: false, annotationCount: 0
     }));
     const host = target();
     const component = mount(VirtualFileList, { target: host, props: { files, repositories: [{ id: 'repo', name: 'API', path: '/tmp/api', branch: 'feature', base: 'origin/main', mergeBase: 'a', head: 'b' }], grouping: 'repository', fontScale: 1.8 } });
@@ -414,7 +614,7 @@ describe('review components', () => {
   it('shows immutable capture classifications as file badges', async () => {
     const host = target();
     const component = mount(VirtualFileList, { target: host, props: {
-      files: [{ id: 'generated-lock', repositoryId: 'repo', path: 'generated/Cargo.lock', status: 'modified', additions: 1, deletions: 1, language: 'TOML', viewed: false, annotationCount: 0, classification: { generated: true, vendored: false, lockfile: true, binary: false, lfsPointer: false, submodule: false } }],
+      files: [{ id: 'generated-lock', repositoryId: 'repo', path: 'generated/Cargo.lock', status: 'modified', additions: 1, deletions: 1, hunkCount: 0, language: 'TOML', viewed: false, annotationCount: 0, classification: { generated: true, vendored: false, lockfile: true, binary: false, lfsPointer: false, submodule: false } }],
       repositories: [{ id: 'repo', name: 'API', path: '/tmp/api', branch: 'feature', base: 'origin/main', mergeBase: 'a', head: 'b' }], grouping: 'flat'
     } });
     await settle();
@@ -426,7 +626,7 @@ describe('review components', () => {
 
   it('fails soft when stale persisted data contains duplicate immutable file ids', async () => {
     const host = target();
-    const duplicate = { id: 'file-model', repositoryId: 'repo', path: 'src/model.rs', status: 'modified' as const, additions: 1, deletions: 1, language: 'Rust', viewed: false, annotationCount: 0 };
+    const duplicate = { id: 'file-model', repositoryId: 'repo', path: 'src/model.rs', status: 'modified' as const, additions: 1, deletions: 1, hunkCount: 0, language: 'Rust', viewed: false, annotationCount: 0 };
     const component = mount(VirtualFileList, { target: host, props: {
       files: [duplicate, { ...duplicate, path: 'src/model-stale.rs' }],
       repositories: [{ id: 'repo', name: 'API', path: '/tmp/api', branch: 'feature', base: 'origin/main', mergeBase: 'a', head: 'b' }], grouping: 'flat'
@@ -446,6 +646,9 @@ describe('review components', () => {
       onCanonicalMode: (_mode: string, location?: { side: string; line: number }) => returns.push(location)
     } });
     await settle();
+    const presentation = host.querySelector('.diff-presentation');
+    expect(presentation?.querySelector(':scope > .structural-notice')).not.toBeNull();
+    expect(presentation?.querySelector(':scope > .diff-viewport')).not.toBeNull();
     expect(host.querySelector('[data-structural-display="inline"]')?.textContent).toContain('let old = 1;');
     [...host.querySelectorAll<HTMLButtonElement>('.structural-actions button')].find((button) => button.textContent === 'Show Unified')?.click();
     expect(returns.at(-1)).toEqual({ side: 'new', line: 10 });

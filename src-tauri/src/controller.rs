@@ -11,8 +11,8 @@ use std::{
 
 use chrono::Utc;
 use localreview_diff::{
-    document_from_sources, full_file_rows, DiffLineKind, ReviewDiffDocument, ReviewFile,
-    ReviewFileStatus,
+    document_from_sources, full_file_current_rows, full_file_rows, DiffLineKind, FullFileRow,
+    ReviewDiffDocument, ReviewFile, ReviewFileStatus,
 };
 use localreview_difftastic::{
     DifftasticAdapter, DifftasticBackground, DifftasticCancellation, DifftasticDisplay,
@@ -36,11 +36,11 @@ use localreview_persistence::{
     BackupPolicy, PersistenceDiagnostics, RemoteReviewReplacementPromotion, StateStore,
 };
 use localreview_protocol::{
-    validate_ssh_target, AgentErrorCode, AgentNotification, AgentOperation, AgentResult,
-    DoctorReport, LocalCommand, LocalResponse, RemoteCapturedFile, RemoteComparisonCapture,
-    RemoteComparisonOptions, RemoteFileStatus, RemoteHead, RemoteRepository, RemoteSourceRevision,
-    RemoteSourceWindow, WorkspaceSourceTag, WorkspaceSummary, MAX_REMOTE_SOURCE_WINDOW_LINES,
-    PROTOCOL_VERSION,
+    validate_ssh_target, AgentErrorCode, AgentNotification, AgentOperation, AgentProgressPhase,
+    AgentResult, DoctorReport, LocalCommand, LocalResponse, RemoteCapturedFile,
+    RemoteComparisonCapture, RemoteComparisonOptions, RemoteFileStatus, RemoteHead,
+    RemoteRepository, RemoteSourceRevision, RemoteSourceWindow, WorkspaceSourceTag,
+    WorkspaceSummary, MAX_REMOTE_SOURCE_WINDOW_LINES, PROTOCOL_VERSION,
 };
 use localreview_service::{
     prompt_title_for_scope, CapturedBlameRequest, CapturedCommitContextRequest,
@@ -79,6 +79,21 @@ const MANAGED_REVERSE_FORWARD_POLL: Duration = Duration::from_millis(100);
 #[serde(rename_all = "camelCase")]
 struct RefreshAvailableEvent {
     workspace_id: String,
+    refresh_available: bool,
+    revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RefreshAvailability {
+    available: bool,
+    revision: u64,
+    watcher_epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RefreshCaptureBoundary {
+    revision: u64,
+    watcher_epoch: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -285,7 +300,7 @@ pub struct DesktopController {
     /// newer viewport cooperatively cancels old Tree-sitter/Difftastic jobs;
     /// their result is never returned or inserted into a presentation cache.
     presentation_jobs: Mutex<PresentationJobRegistry>,
-    refresh_available: Arc<Mutex<BTreeSet<WorkspaceId>>>,
+    refresh_available: Arc<Mutex<BTreeMap<WorkspaceId, RefreshAvailability>>>,
     local_watchers: Mutex<BTreeMap<WorkspaceId, RecommendedWatcher>>,
     /// Exactly one serialized companion transport per remote workspace. A
     /// transport is process-local; durable manifest metadata is restored on
@@ -331,6 +346,11 @@ struct ReviewUiState {
     /// reload never silently contracts a reviewer-expanded immutable hunk.
     #[serde(default)]
     hunk_context_lines: BTreeMap<String, u32>,
+    /// Stable deletion-block ids expanded in Full File Current mode. The ids
+    /// include the immutable comparison, so a refreshed capture can safely
+    /// prune stale entries instead of applying them to unrelated source.
+    #[serde(default)]
+    expanded_full_file_deletion_blocks: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -346,6 +366,7 @@ pub struct WorkspaceUiStateView {
     pub right_tab: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected_annotation_ids: Option<Vec<String>>,
+    pub expanded_full_file_deletion_blocks: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -360,6 +381,7 @@ pub struct WorkspaceUiStatePatch {
     pub split_ratio: Option<f64>,
     pub right_tab: Option<String>,
     pub selected_annotation_ids: Option<Vec<String>>,
+    pub expanded_full_file_deletion_blocks: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -388,6 +410,7 @@ pub struct PresentationWindow {
     pub total_rows: u32,
     pub rows: Vec<DiffRowView>,
     pub hunks: Vec<HunkLocationView>,
+    pub deletion_blocks: Vec<FullFileDeletionBlockView>,
     pub old_tokens: Vec<SyntaxTokenView>,
     pub new_tokens: Vec<SyntaxTokenView>,
     pub highlight_status: String,
@@ -747,6 +770,12 @@ struct DifftasticWindowExecution<'a> {
     job: Option<&'a PresentationJobLease>,
 }
 
+struct FullFileWindowExecution<'a> {
+    settings: &'a ReviewSettings,
+    max_window_rows: usize,
+    job: Option<&'a PresentationJobLease>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceView {
@@ -760,6 +789,10 @@ pub struct WorkspaceView {
     pub draft_count: usize,
     pub pinned: bool,
     pub refresh_available: bool,
+    /// Monotonic process-local revision for refresh-availability state. The
+    /// WebView uses it to reject a queued pre-capture event that arrives after
+    /// the authoritative successful-refresh response.
+    pub refresh_available_revision: u64,
     pub connection: String,
     /// False when repository discovery is durable but no review generation
     /// has captured successfully yet. The UI uses this explicit state to open
@@ -809,6 +842,7 @@ pub struct RepositorySetupView {
     pub changed_file_count: Option<usize>,
     pub status_summary: String,
     pub effective_base: String,
+    pub suggested_base: Option<String>,
     pub base_source: String,
     pub base_override: Option<String>,
     pub resolved_base_sha: Option<String>,
@@ -834,6 +868,7 @@ pub struct ReviewFileView {
     pub status: String,
     pub additions: u32,
     pub deletions: u32,
+    pub hunk_count: usize,
     pub language: String,
     pub viewed: bool,
     pub annotation_count: usize,
@@ -1099,11 +1134,33 @@ pub struct ReviewData {
     pub files: Vec<ReviewFileView>,
     pub annotations: Vec<AnnotationView>,
     pub history: Vec<ReviewHistoryItem>,
+    /// Present only on the response to an explicit local refresh. Ordinary
+    /// review loads have no operation outcome to report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_outcome: Option<LocalRefreshOutcomeView>,
     /// A prior review session is a frozen browsing surface.  The frontend
     /// must not accidentally send edits into the currently active session.
     pub historical: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub historical_session_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalRefreshOutcomeView {
+    /// `success`, `partial`, or `failed`.
+    pub status: String,
+    pub captured_repository_count: usize,
+    pub failed_repository_count: usize,
+    pub failures: Vec<LocalRefreshFailureView>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalRefreshFailureView {
+    pub repository_id: String,
+    pub repository_path: String,
+    pub error: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1124,12 +1181,32 @@ pub struct DiffRowView {
     pub old_source_start_byte: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_source_start_byte: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deletion_block_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deletion_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_end_line: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deletion_expanded: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FullFileDeletionBlockView {
+    pub id: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub count: u32,
+    pub expanded: bool,
+    pub row_index: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(default)]
 pub struct ReviewSettings {
+    pub last_workspace_id: Option<String>,
     pub font_scale: f64,
     pub left_width: u32,
     pub right_width: u32,
@@ -1148,6 +1225,7 @@ pub struct ReviewSettings {
 impl Default for ReviewSettings {
     fn default() -> Self {
         Self {
+            last_workspace_id: None,
             font_scale: 1.0,
             left_width: 244,
             right_width: 332,
@@ -1373,7 +1451,7 @@ impl DesktopController {
             language_attribute_cache: Mutex::new(HashMap::new()),
             presentation_work: PresentationWorkPool::new(MAX_PRESENTATION_WORKERS),
             presentation_jobs: Mutex::new(PresentationJobRegistry::default()),
-            refresh_available: Arc::new(Mutex::new(BTreeSet::new())),
+            refresh_available: Arc::new(Mutex::new(BTreeMap::new())),
             local_watchers: Mutex::new(BTreeMap::new()),
             remote_sessions: Mutex::new(BTreeMap::new()),
             remote_watchers: Mutex::new(BTreeMap::new()),
@@ -1770,7 +1848,7 @@ impl DesktopController {
             );
         // Best-effort notification-only watchers use their own managed
         // transports. A failed watcher never rolls back a valid review.
-        let _ = self.start_remote_watchers(workspace.id, &metadata);
+        let _ = self.start_remote_watchers(workspace.id, &metadata, false);
         Ok((self.workspace_view(&workspace)?, true))
     }
 
@@ -1835,7 +1913,7 @@ impl DesktopController {
         // transport too.  Always replace the old watcher (which can be tied
         // to a disconnected transport) with the single bounded workspace
         // watcher; this never captures or refreshes the immutable review.
-        self.start_remote_watchers(workspace_id, &metadata)?;
+        self.start_remote_watchers(workspace_id, &metadata, false)?;
         self.workspace_view(&workspace)
     }
 
@@ -1949,6 +2027,7 @@ impl DesktopController {
                 files: Vec::new(),
                 annotations: Vec::new(),
                 history: self.history(workspace.id)?,
+                refresh_outcome: None,
                 historical: false,
                 historical_session_id: None,
             });
@@ -2041,6 +2120,7 @@ impl DesktopController {
             files,
             annotations: annotation_views,
             history: self.history(workspace.id)?,
+            refresh_outcome: None,
             historical,
             historical_session_id: historical.then(|| session.id.to_string()),
         })
@@ -2318,6 +2398,10 @@ impl DesktopController {
                             }),
                             old_source_start_byte: None,
                             new_source_start_byte: None,
+                            deletion_block_id: None,
+                            deletion_count: None,
+                            old_end_line: None,
+                            deletion_expanded: None,
                         }));
                         rows
                     })
@@ -2357,6 +2441,10 @@ impl DesktopController {
                             }),
                             old_source_start_byte: None,
                             new_source_start_byte: None,
+                            deletion_block_id: None,
+                            deletion_count: None,
+                            old_end_line: None,
+                            deletion_expanded: None,
                         }
                     }));
                     rows
@@ -2368,32 +2456,15 @@ impl DesktopController {
                 } else {
                     DiffSide::New
                 };
-                Ok(full_file_rows(&document, side)
-                    .into_iter()
-                    .map(|row| DiffRowView {
-                        id: format!("full:{}:{}", side_name(row.side), row.line_number),
-                        kind: if row.changed {
-                            if row.side == DiffSide::Old {
-                                "deletion"
-                            } else {
-                                "addition"
-                            }
-                        } else {
-                            "context"
-                        }
-                        .into(),
-                        hunk_id: None,
-                        old_line: (row.side == DiffSide::Old).then_some(row.line_number),
-                        new_line: (row.side == DiffSide::New).then_some(row.line_number),
-                        old_text: (row.side == DiffSide::Old).then_some(row.text.clone()),
-                        new_text: (row.side == DiffSide::New).then_some(row.text.clone()),
-                        text: Some(row.text),
-                        hunk: None,
-                        has_annotation: has_annotation(side, row.line_number),
-                        old_source_start_byte: None,
-                        new_source_start_byte: None,
-                    })
-                    .collect())
+                let (projection, _) = full_file_projection(&document, side, &BTreeSet::new());
+                let old_offsets = source_line_offsets(&document.old.content);
+                let new_offsets = source_line_offsets(&document.new.content);
+                let mut rows = projection
+                    .iter()
+                    .map(|row| full_file_row_view(row, &old_offsets, &new_offsets))
+                    .collect::<Vec<_>>();
+                self.mark_annotation_rows(&document, &mut rows)?;
+                Ok(rows)
             }
             _ => Err(DispatchError::Invalid("unsupported diff mode".into())),
         }
@@ -2467,9 +2538,12 @@ impl DesktopController {
                 request,
                 &document,
                 full_file_side,
-                &settings,
-                MAX_WINDOW_ROWS,
-                Some(&job),
+                &ui_state,
+                FullFileWindowExecution {
+                    settings: &settings,
+                    max_window_rows: MAX_WINDOW_ROWS,
+                    job: Some(&job),
+                },
             );
         }
         let language_attribute = self.highlight_language_attribute(&document, session.id);
@@ -2500,6 +2574,7 @@ impl DesktopController {
             total_rows: u32::try_from(all_rows.len()).unwrap_or(u32::MAX),
             rows,
             hunks,
+            deletion_blocks: Vec::new(),
             old_tokens,
             new_tokens,
             highlight_status,
@@ -2552,10 +2627,23 @@ impl DesktopController {
 
         let row_index = match mode {
             "full" => {
-                // Full File rows are direct 1:1 source projections. A
-                // deleted file only has an old side, so asking for the empty
-                // new side was already rejected by the source-line check.
-                usize::try_from(line.saturating_sub(1)).unwrap_or(usize::MAX)
+                let displayed_side =
+                    if document.file.status == localreview_diff::ReviewFileStatus::Deleted {
+                        DiffSide::Old
+                    } else {
+                        ui_state
+                            .full_file_side
+                            .as_deref()
+                            .map(parse_side)
+                            .transpose()?
+                            .unwrap_or(DiffSide::New)
+                    };
+                let (projection, _) = full_file_projection(
+                    &document,
+                    displayed_side,
+                    &ui_state.expanded_full_file_deletion_blocks,
+                );
+                nearest_full_file_row(&projection, side, line)
             }
             "unified" | "split" => {
                 let (rows, _) = self.cached_canonical_rows(&document, mode, side, &ui_state)?;
@@ -2839,10 +2927,19 @@ impl DesktopController {
             // the setup flow into an apparent load failure.
             return Ok(workspace_ui_state_view(&ReviewUiState::default()));
         };
-        let state = self
+        let mut state = self
             .state()
             .review_session_ui_state::<ReviewUiState>(session.id)?
             .unwrap_or_default();
+        let valid_blocks = valid_full_file_deletion_block_ids(&self.current_documents(session.id)?);
+        let before = state.expanded_full_file_deletion_blocks.len();
+        state
+            .expanded_full_file_deletion_blocks
+            .retain(|id| valid_blocks.contains(id));
+        if state.expanded_full_file_deletion_blocks.len() != before {
+            self.state()
+                .save_review_session_ui_state(session.id, &state)?;
+        }
         Ok(workspace_ui_state_view(&state))
     }
 
@@ -2941,6 +3038,22 @@ impl DesktopController {
                 ));
             }
             state.selected_annotation_ids = Some(selected);
+        }
+        if let Some(values) = patch.expanded_full_file_deletion_blocks {
+            const MAX_EXPANDED_DELETION_BLOCKS: usize = 10_000;
+            if values.len() > MAX_EXPANDED_DELETION_BLOCKS {
+                return Err(DispatchError::Invalid(format!(
+                    "expandedFullFileDeletionBlocks may contain at most {MAX_EXPANDED_DELETION_BLOCKS} values"
+                )));
+            }
+            let expanded = values.into_iter().collect::<BTreeSet<_>>();
+            let valid = valid_full_file_deletion_block_ids(&self.current_documents(session.id)?);
+            if !expanded.is_subset(&valid) {
+                return Err(DispatchError::Invalid(
+                    "expandedFullFileDeletionBlocks contains a stale or foreign block".into(),
+                ));
+            }
+            state.expanded_full_file_deletion_blocks = expanded;
         }
         self.state()
             .save_review_session_ui_state(session.id, &state)?;
@@ -3800,6 +3913,19 @@ impl DesktopController {
         &self,
         mut settings: ReviewSettings,
     ) -> Result<ReviewSettings, DispatchError> {
+        settings.last_workspace_id = settings
+            .last_workspace_id
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        if settings
+            .last_workspace_id
+            .as_ref()
+            .is_some_and(|value| value.len() > 128 || value.contains(['\0', '\n', '\r']))
+        {
+            return Err(DispatchError::Invalid(
+                "last workspace id is invalid".into(),
+            ));
+        }
         settings.font_scale = (settings.font_scale * 10.0).round() / 10.0;
         settings.font_scale = settings.font_scale.clamp(0.75, 2.0);
         settings.left_width = settings.left_width.clamp(180, 420);
@@ -3941,6 +4067,7 @@ impl DesktopController {
                             .get_or_insert_with(|| error.to_string());
                     }
                 }
+                live.suggested_base = git.primary_remote_head().ok().flatten();
                 match git.resolve_comparison(
                     repository.id,
                     localreview_domain::ComparisonId::new(),
@@ -4082,6 +4209,9 @@ impl DesktopController {
         }
         let options = input.comparison_options.clone().unwrap_or_default();
         self.apply_baselines(workspace_id, input.base.as_deref(), &input.repository_bases)?;
+        let refresh_revision = matches!(workspace.source, WorkspaceSource::LocalDirectory { .. })
+            .then(|| self.restart_local_watcher_for_capture(&workspace))
+            .transpose()?;
         // Starting/opening a review is strictly local and never fetches. A
         // remote update is an explicit Refresh-only action.
         let started = self.service.start_local_review(StartReviewRequest {
@@ -4092,7 +4222,11 @@ impl DesktopController {
         })?;
         self.persist_local_capture_outcomes(workspace_id, &started)?;
         if started.failures.is_empty() {
-            self.clear_refresh_available(workspace_id);
+            if let Some(refresh_revision) = refresh_revision {
+                self.clear_refresh_available_at_boundary(workspace_id, refresh_revision);
+            } else {
+                self.clear_refresh_available(workspace_id);
+            }
         }
         self.load_review(workspace_id)
     }
@@ -4133,6 +4267,7 @@ impl DesktopController {
         if input.fetch_before_capture || settings.fetch_on_review {
             self.fetch_workspace_repositories(workspace_id)?;
         }
+        let refresh_revision = self.restart_local_watcher_for_capture(&workspace)?;
         let refreshed = self.service.refresh_local_review(
             session.id,
             self.application_base()?,
@@ -4141,9 +4276,17 @@ impl DesktopController {
         )?;
         self.persist_local_capture_outcomes(workspace_id, &refreshed)?;
         if refreshed.failures.is_empty() {
-            self.clear_refresh_available(workspace_id);
+            self.clear_refresh_available_at_boundary(workspace_id, refresh_revision);
+        } else {
+            // A partial or failed capture leaves at least one repository on
+            // its previous generation. Keep the retry affordance visible even
+            // when the refresh was invoked manually before a watcher signal.
+            self.mark_refresh_available(workspace_id)?;
         }
-        self.load_review(workspace_id)
+        let refresh_outcome = local_refresh_outcome(&refreshed);
+        let mut review = self.load_review(workspace_id)?;
+        review.refresh_outcome = Some(refresh_outcome);
+        Ok(review)
     }
 
     /// Best-effort, per-repository fetch used only by an explicit refresh. A
@@ -4525,6 +4668,7 @@ impl DesktopController {
                 .count(),
             None => 0,
         };
+        let refresh_availability = self.refresh_availability(workspace.id)?;
         let (location, detail, refresh_available, connection) = match &workspace.source {
             WorkspaceSource::PullRequest { url, number, .. } => {
                 let detail = self.service.github_pull_request(workspace.id).map_or_else(
@@ -4537,7 +4681,12 @@ impl DesktopController {
                         )
                     },
                 );
-                (url.clone(), detail, false, "connected".into())
+                (
+                    url.clone(),
+                    detail,
+                    refresh_availability.available,
+                    "connected".into(),
+                )
             }
             WorkspaceSource::RemoteDirectory { host, root } => {
                 let metadata = self.remote_metadata(workspace.id).ok();
@@ -4578,12 +4727,7 @@ impl DesktopController {
                 (
                     format!("{host}:{}", root.as_str()),
                     format!("{detail} · {agent_detail}"),
-                    stale
-                        || self
-                            .refresh_available
-                            .lock()
-                            .map_err(|_| DispatchError::Internal)?
-                            .contains(&workspace.id),
+                    stale || refresh_availability.available,
                     connection,
                 )
             }
@@ -4593,10 +4737,7 @@ impl DesktopController {
                     "{} repositories",
                     self.state().repositories(workspace.id)?.len()
                 ),
-                self.refresh_available
-                    .lock()
-                    .map_err(|_| DispatchError::Internal)?
-                    .contains(&workspace.id),
+                refresh_availability.available,
                 "connected".into(),
             ),
         };
@@ -4623,6 +4764,7 @@ impl DesktopController {
             draft_count,
             pinned: workspace.pinned,
             refresh_available,
+            refresh_available_revision: refresh_availability.revision,
             connection,
             review_ready: session.is_some(),
             archived: workspace.archived_at.is_some(),
@@ -4678,52 +4820,79 @@ impl DesktopController {
             return Ok(());
         }
         let workspace_id = workspace.id;
+        let watcher_epoch = self.advance_refresh_watcher_epoch(workspace_id)?;
+        let repository_roots = self
+            .state()
+            .repositories(workspace.id)?
+            .into_iter()
+            .filter(|repository| repository.enabled)
+            .map(|repository| {
+                let root = PathBuf::from(repository.worktree_path.as_str());
+                // macOS may report /private/var/... for a watcher registered
+                // through /var/.... Registering and matching the canonical
+                // root prevents such aliases from bypassing ignore checks.
+                root.canonicalize().unwrap_or(root)
+            })
+            .collect::<Vec<_>>();
         let flags = Arc::clone(&self.refresh_available);
         let app_handle = Arc::clone(&self.app_handle);
+        // notify callbacks are owned by the platform watcher thread. Git
+        // ignore/index checks run on this workspace worker instead, and a
+        // drain coalesces event storms into at most one Git process per
+        // repository and batch.
+        let (event_sender, event_receiver) = std::sync::mpsc::channel::<notify::Event>();
+        let worker_roots = repository_roots.clone();
+        let worker_flags = Arc::clone(&flags);
+        let worker_app_handle = Arc::clone(&app_handle);
+        std::thread::Builder::new()
+            .name(format!("localreview-watch-{workspace_id}"))
+            .spawn(move || {
+                while let Ok(first) = event_receiver.recv() {
+                    let mut events = vec![first];
+                    events.extend(event_receiver.try_iter());
+                    let semantic = local_events_can_change_source(&worker_roots, &events);
+                    if semantic {
+                        publish_refresh_availability(
+                            &worker_flags,
+                            &worker_app_handle,
+                            workspace_id,
+                            Some(watcher_epoch),
+                            true,
+                        );
+                    }
+                }
+            })
+            .map_err(|error| {
+                DispatchError::Invalid(format!("could not start workspace monitor worker: {error}"))
+            })?;
         let mut watcher =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
                 let Ok(event) = event else {
                     return;
                 };
-                if matches!(
-                    event.kind,
-                    EventKind::Create(_)
-                        | EventKind::Modify(_)
-                        | EventKind::Remove(_)
-                        | EventKind::Any
-                ) {
-                    let newly_available = flags
-                        .lock()
-                        .map(|mut flags| flags.insert(workspace_id))
-                        .unwrap_or(false);
-                    if newly_available {
-                        let handle = app_handle.lock().ok().and_then(|handle| handle.clone());
-                        if let Some(handle) = handle {
-                            let _ = handle.emit(
-                                REFRESH_AVAILABLE_EVENT,
-                                RefreshAvailableEvent {
-                                    workspace_id: workspace_id.to_string(),
-                                },
-                            );
-                        }
-                    }
+                let candidate = event.need_rescan()
+                    || (matches!(
+                        event.kind,
+                        EventKind::Create(_)
+                            | EventKind::Modify(_)
+                            | EventKind::Remove(_)
+                            | EventKind::Any
+                    ) && (event.paths.is_empty()
+                        || event
+                            .paths
+                            .iter()
+                            .any(|path| local_event_can_change_source(path))));
+                if candidate {
+                    let _ = event_sender.send(event);
                 }
             })
             .map_err(|error| {
                 DispatchError::Invalid(format!("could not monitor workspace changes: {error}"))
             })?;
         let mut watched_any = false;
-        for repository in self
-            .state()
-            .repositories(workspace.id)?
-            .into_iter()
-            .filter(|repository| repository.enabled)
-        {
+        for repository_root in repository_roots {
             if watcher
-                .watch(
-                    Path::new(repository.worktree_path.as_str()),
-                    RecursiveMode::Recursive,
-                )
+                .watch(&repository_root, RecursiveMode::Recursive)
                 .is_ok()
             {
                 watched_any = true;
@@ -4735,10 +4904,74 @@ impl DesktopController {
         Ok(())
     }
 
-    fn clear_refresh_available(&self, workspace_id: WorkspaceId) {
-        if let Ok(mut flags) = self.refresh_available.lock() {
-            flags.remove(&workspace_id);
+    /// A capture owns a fresh watcher generation from before its first Git
+    /// read. Any callback already queued by the previous generation is then
+    /// harmless, while a real source event during capture advances the new
+    /// revision and prevents the success acknowledgement from clearing it.
+    fn restart_local_watcher_for_capture(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<RefreshCaptureBoundary, DispatchError> {
+        self.advance_refresh_watcher_epoch(workspace.id)?;
+        if let Ok(mut watchers) = self.local_watchers.lock() {
+            watchers.remove(&workspace.id);
         }
+        self.ensure_local_watcher(workspace)?;
+        let state = self.refresh_availability(workspace.id)?;
+        Ok(RefreshCaptureBoundary {
+            revision: state.revision,
+            watcher_epoch: state.watcher_epoch,
+        })
+    }
+
+    fn refresh_availability(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<RefreshAvailability, DispatchError> {
+        Ok(self
+            .refresh_available
+            .lock()
+            .map_err(|_| DispatchError::Internal)?
+            .get(&workspace_id)
+            .copied()
+            .unwrap_or_default())
+    }
+
+    fn advance_refresh_watcher_epoch(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<u64, DispatchError> {
+        let mut flags = self
+            .refresh_available
+            .lock()
+            .map_err(|_| DispatchError::Internal)?;
+        let state = flags.entry(workspace_id).or_default();
+        state.watcher_epoch = state.watcher_epoch.saturating_add(1).max(1);
+        Ok(state.watcher_epoch)
+    }
+
+    fn clear_refresh_available(&self, workspace_id: WorkspaceId) {
+        publish_refresh_availability(
+            &self.refresh_available,
+            &self.app_handle,
+            workspace_id,
+            None,
+            false,
+        );
+    }
+
+    fn clear_refresh_available_at_boundary(
+        &self,
+        workspace_id: WorkspaceId,
+        boundary: RefreshCaptureBoundary,
+    ) {
+        publish_refresh_availability_at_boundary(
+            &self.refresh_available,
+            &self.app_handle,
+            workspace_id,
+            boundary,
+            false,
+        );
     }
 
     /// Runs remote watcher operations on dedicated SSH transports. A normal
@@ -4749,8 +4982,14 @@ impl DesktopController {
         &self,
         workspace_id: WorkspaceId,
         metadata: &RemoteWorkspaceMetadata,
-    ) -> Result<(), DispatchError> {
+        wait_until_ready: bool,
+    ) -> Result<RefreshCaptureBoundary, DispatchError> {
         self.stop_remote_watchers(workspace_id);
+        let watcher_epoch = self.advance_refresh_watcher_epoch(workspace_id)?;
+        let boundary = RefreshCaptureBoundary {
+            revision: self.refresh_availability(workspace_id)?.revision,
+            watcher_epoch,
+        };
         let flags = Arc::clone(&self.refresh_available);
         let app_handle = Arc::clone(&self.app_handle);
         // One typed watcher tracks every capture over a single dedicated SSH
@@ -4773,7 +5012,13 @@ impl DesktopController {
             repositories.push(reference);
         }
         if repositories.is_empty() {
-            return Ok(());
+            if wait_until_ready {
+                self.mark_refresh_available(workspace_id)?;
+                return Err(DispatchError::Remote(
+                    "SSH change watcher has no captured repositories to monitor".into(),
+                ));
+            }
+            return Ok(boundary);
         }
         let request_id = format!("watch-workspace-{workspace_id}");
         let generation = metadata.generation.max(1);
@@ -4781,9 +5026,13 @@ impl DesktopController {
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancellation = Arc::new(Mutex::new(None::<SshCancellation>));
         let callback_cancelled = Arc::clone(&cancelled);
+        let notification_cancelled = Arc::clone(&cancelled);
         let callback_cancellation = Arc::clone(&cancellation);
         let callback_request_id = request_id.clone();
-        std::thread::Builder::new()
+        let (readiness_sender, readiness_receiver) =
+            std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+        let progress_readiness_sender = readiness_sender.clone();
+        let watcher_thread = std::thread::Builder::new()
             .name("localreview-ssh-workspace-watch".into())
             .spawn(move || {
                 // Connection/bootstrap run off the UI path. The live review
@@ -4791,25 +5040,36 @@ impl DesktopController {
                 // request, and a stop request is honored even if it arrives
                 // before the handshake completes.
                 if callback_cancelled.load(Ordering::Acquire) {
+                    let _ =
+                        readiness_sender.try_send(Err("SSH change watcher was cancelled".into()));
                     return;
                 }
-                let Ok(RemoteSessionConnect { mut session, .. }) =
-                    connect_remote_session(&target, None)
-                else {
-                    return;
+                let mut session = match connect_remote_session(&target, None) {
+                    Ok(RemoteSessionConnect { session, .. }) => session,
+                    Err(error) => {
+                        let _ = readiness_sender.try_send(Err(format!(
+                            "could not connect SSH change watcher: {}",
+                            error.error
+                        )));
+                        return;
+                    }
                 };
                 let remote_cancellation = session.cancellation();
                 {
                     let Ok(mut slot) = callback_cancellation.lock() else {
+                        let _ = readiness_sender
+                            .try_send(Err("SSH change watcher state is unavailable".into()));
                         return;
                     };
                     if callback_cancelled.load(Ordering::Acquire) {
                         let _ = remote_cancellation.cancel(&callback_request_id, generation);
+                        let _ = readiness_sender
+                            .try_send(Err("SSH change watcher was cancelled".into()));
                         return;
                     }
                     *slot = Some(remote_cancellation);
                 }
-                let _ = session.request_with_id_and_notifications(
+                let result = session.request_with_id_and_notifications(
                     callback_request_id.clone(),
                     AgentOperation::WatchWorkspaceChanges {
                         repositories,
@@ -4817,38 +5077,51 @@ impl DesktopController {
                     },
                     generation,
                     Duration::from_secs(24 * 60 * 60),
-                    |_| {},
+                    move |event| {
+                        if event.progress.phase == AgentProgressPhase::Watching {
+                            let _ = progress_readiness_sender.try_send(Ok(()));
+                        }
+                    },
                     move |notification| {
-                        if matches!(
-                            notification,
-                            AgentNotification::FilesystemChangesAvailable {
-                                generation: notification_generation,
-                                ..
-                            } if notification_generation == generation
-                        ) {
-                            let newly_available = flags
-                                .lock()
-                                .map(|mut flags| flags.insert(workspace_id))
-                                .unwrap_or(false);
-                            if newly_available {
-                                let handle =
-                                    app_handle.lock().ok().and_then(|handle| handle.clone());
-                                if let Some(handle) = handle {
-                                    let _ = handle.emit(
-                                        REFRESH_AVAILABLE_EVENT,
-                                        RefreshAvailableEvent {
-                                            workspace_id: workspace_id.to_string(),
-                                        },
-                                    );
-                                }
-                            }
+                        if !notification_cancelled.load(Ordering::Acquire)
+                            && matches!(
+                                notification,
+                                AgentNotification::FilesystemChangesAvailable {
+                                    generation: notification_generation,
+                                    ..
+                                } if notification_generation == generation
+                            )
+                        {
+                            publish_refresh_availability(
+                                &flags,
+                                &app_handle,
+                                workspace_id,
+                                Some(watcher_epoch),
+                                true,
+                            );
                         }
                     },
                 );
-            })
-            .map_err(|error| {
-                DispatchError::Remote(format!("could not start SSH change watcher: {error}"))
-            })?;
+                // A protocol-valid watch stays active until cancellation. If
+                // it returns before announcing Watching, fail readiness
+                // immediately rather than making refresh sit on the full
+                // timeout for an error response or premature cancellation.
+                let stopped = match result {
+                    Ok(result) => {
+                        format!("SSH change watcher stopped before ready with result: {result:?}")
+                    }
+                    Err(error) => format!("SSH change watcher stopped before ready: {error}"),
+                };
+                let _ = readiness_sender.try_send(Err(stopped));
+            });
+        if let Err(error) = watcher_thread {
+            if wait_until_ready {
+                self.mark_refresh_available(workspace_id)?;
+            }
+            return Err(DispatchError::Remote(format!(
+                "could not start SSH change watcher: {error}"
+            )));
+        }
         self.remote_watchers
             .lock()
             .map_err(|_| DispatchError::Internal)?
@@ -4861,7 +5134,24 @@ impl DesktopController {
                     generation,
                 }],
             );
-        Ok(())
+        if wait_until_ready {
+            match readiness_receiver.recv_timeout(Duration::from_secs(15)) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    self.stop_remote_watchers(workspace_id);
+                    self.mark_refresh_available(workspace_id)?;
+                    return Err(DispatchError::Remote(error));
+                }
+                Err(error) => {
+                    self.stop_remote_watchers(workspace_id);
+                    self.mark_refresh_available(workspace_id)?;
+                    return Err(DispatchError::Remote(format!(
+                        "SSH change watcher did not become ready: {error}"
+                    )));
+                }
+            }
+        }
+        Ok(boundary)
     }
 
     fn stop_remote_watchers(&self, workspace_id: WorkspaceId) {
@@ -5423,26 +5713,20 @@ impl DesktopController {
     }
 
     fn mark_refresh_available(&self, workspace_id: WorkspaceId) -> Result<(), DispatchError> {
-        let newly_available = self
-            .refresh_available
-            .lock()
-            .map_err(|_| DispatchError::Internal)?
-            .insert(workspace_id);
-        if newly_available {
-            let handle = self
-                .app_handle
+        // Take the lock once here so callers still receive poisoning as a
+        // controller error rather than silently losing the refresh signal.
+        drop(
+            self.refresh_available
                 .lock()
-                .ok()
-                .and_then(|handle| handle.clone());
-            if let Some(handle) = handle {
-                let _ = handle.emit(
-                    REFRESH_AVAILABLE_EVENT,
-                    RefreshAvailableEvent {
-                        workspace_id: workspace_id.to_string(),
-                    },
-                );
-            }
-        }
+                .map_err(|_| DispatchError::Internal)?,
+        );
+        publish_refresh_availability(
+            &self.refresh_available,
+            &self.app_handle,
+            workspace_id,
+            None,
+            true,
+        );
         Ok(())
     }
 
@@ -5483,6 +5767,11 @@ impl DesktopController {
             .workspace(workspace_id)?
             .ok_or_else(|| DispatchError::NotFound(workspace_id.to_string()))?;
         let mut metadata = self.remote_metadata(workspace_id)?;
+        // Establish a fresh notification generation before capture. Queued
+        // callbacks from the previous transport are invalid, while a remote
+        // source event observed during this capture advances the revision and
+        // prevents the result from clearing amber.
+        let refresh_boundary = self.start_remote_watchers(workspace_id, &metadata, true)?;
         let review_session = self
             .service
             .active_review_session(workspace_id)?
@@ -5701,13 +5990,10 @@ impl DesktopController {
             // exactly as it was and only persist the reconnect/error state.
             self.save_remote_metadata(workspace_id, &metadata)?;
         }
-        if succeeded {
-            let _ = self.start_remote_watchers(workspace_id, &metadata);
-        }
         if metadata.stale {
             self.mark_refresh_available(workspace_id)?;
         } else {
-            self.clear_refresh_available(workspace_id);
+            self.clear_refresh_available_at_boundary(workspace_id, refresh_boundary);
         }
         self.load_review(workspace_id)
     }
@@ -5813,8 +6099,11 @@ impl DesktopController {
         full_file_side: DiffSide,
         state: &ReviewUiState,
     ) -> Result<(Vec<DiffRowView>, Vec<HunkLocationView>), DispatchError> {
-        let expansion_key = serde_json::to_string(&state.hunk_context_lines)
-            .map_err(|_| DispatchError::Internal)?;
+        let expansion_key = serde_json::to_string(&(
+            &state.hunk_context_lines,
+            &state.expanded_full_file_deletion_blocks,
+        ))
+        .map_err(|_| DispatchError::Internal)?;
         let key = format!(
             "{}:{}:{}:{}:{}",
             document.file.id,
@@ -5862,12 +6151,17 @@ impl DesktopController {
     ) -> Result<(), DispatchError> {
         let annotations = self.annotations_for_document(document)?;
         for row in rows {
-            row.has_annotation = row
-                .old_line
-                .is_some_and(|line| annotation_at(&annotations, document, DiffSide::Old, line))
-                || row
-                    .new_line
-                    .is_some_and(|line| annotation_at(&annotations, document, DiffSide::New, line));
+            row.has_annotation = row.old_line.is_some_and(|line| {
+                annotation_overlaps(
+                    &annotations,
+                    document,
+                    DiffSide::Old,
+                    line,
+                    row.old_end_line.unwrap_or(line),
+                )
+            }) || row
+                .new_line
+                .is_some_and(|line| annotation_at(&annotations, document, DiffSide::New, line));
         }
         Ok(())
     }
@@ -5988,73 +6282,39 @@ impl DesktopController {
         request: PresentationRequest,
         document: &ReviewDiffDocument,
         requested_side: DiffSide,
-        settings: &ReviewSettings,
-        max_window_rows: usize,
-        job: Option<&PresentationJobLease>,
+        ui_state: &ReviewUiState,
+        execution: FullFileWindowExecution<'_>,
     ) -> Result<PresentationWindow, DispatchError> {
+        let FullFileWindowExecution {
+            settings,
+            max_window_rows,
+            job,
+        } = execution;
         let side = if document.file.status == localreview_diff::ReviewFileStatus::Deleted {
             DiffSide::Old
         } else {
             requested_side
         };
-        let (source, changed) = match side {
-            DiffSide::Old => (&document.old, &document.changed_old_lines),
-            DiffSide::New => (&document.new, &document.changed_new_lines),
-        };
-        let total = usize::try_from(source.line_count).unwrap_or(usize::MAX);
+        let (projection, deletion_blocks) =
+            full_file_projection(document, side, &ui_state.expanded_full_file_deletion_blocks);
+        let total = projection.len();
         let (start, end) =
             bounded_window(request.start_row, request.end_row, total, max_window_rows);
-        let offsets = source_line_offsets(&source.content);
-        let mut rows = source
-            .lines()
-            .enumerate()
+        let old_offsets = source_line_offsets(&document.old.content);
+        let new_offsets = source_line_offsets(&document.new.content);
+        let mut rows = projection
+            .iter()
             .skip(start)
             .take(end.saturating_sub(start))
-            .map(|(index, text)| {
-                let line = u32::try_from(index.saturating_add(1)).unwrap_or(u32::MAX);
-                DiffRowView {
-                    id: format!("full:{}:{line}", side_name(side)),
-                    kind: if changed.contains(line) {
-                        if side == DiffSide::Old {
-                            "deletion"
-                        } else {
-                            "addition"
-                        }
-                    } else {
-                        "context"
-                    }
-                    .into(),
-                    hunk_id: None,
-                    old_line: (side == DiffSide::Old).then_some(line),
-                    new_line: (side == DiffSide::New).then_some(line),
-                    old_text: (side == DiffSide::Old).then_some(text.to_owned()),
-                    new_text: (side == DiffSide::New).then_some(text.to_owned()),
-                    text: Some(text.to_owned()),
-                    hunk: None,
-                    has_annotation: false,
-                    old_source_start_byte: (side == DiffSide::Old)
-                        .then(|| source_offset(&offsets, line)),
-                    new_source_start_byte: (side == DiffSide::New)
-                        .then(|| source_offset(&offsets, line)),
-                }
-            })
+            .map(|row| full_file_row_view(row, &old_offsets, &new_offsets))
             .collect::<Vec<_>>();
         self.mark_annotation_rows(document, &mut rows)?;
-        let hunks = document
-            .hunks
-            .iter()
-            .map(|hunk| HunkLocationView {
-                id: hunk.id.0.clone(),
-                row_index: match side {
-                    DiffSide::Old => hunk.header.old_start.saturating_sub(1),
-                    DiffSide::New => hunk.header.new_start.saturating_sub(1),
-                },
-                old_line: (side == DiffSide::Old).then_some(hunk.header.old_start),
-                new_line: (side == DiffSide::New).then_some(hunk.header.new_start),
-                header: format_hunk_header(hunk),
-                collapsed_context_lines: None,
-            })
-            .collect();
+        let hunks = full_file_hunk_locations(document, side, &projection);
+        let deletion_blocks = full_file_deletion_block_views(
+            &deletion_blocks,
+            &projection,
+            &ui_state.expanded_full_file_deletion_blocks,
+        );
         let session = self
             .session_for_comparison(document.comparison_id)?
             .ok_or_else(|| {
@@ -6076,9 +6336,10 @@ impl DesktopController {
             mode: "full".into(),
             file_id: request.file_id,
             start_row: u32::try_from(start).unwrap_or(u32::MAX),
-            total_rows: source.line_count,
+            total_rows: u32::try_from(total).unwrap_or(u32::MAX),
             rows,
             hunks,
+            deletion_blocks,
             old_tokens,
             new_tokens,
             highlight_status,
@@ -6245,6 +6506,7 @@ impl DesktopController {
                     total_rows: u32::try_from(total_rows).unwrap_or(u32::MAX),
                     rows: Vec::new(),
                     hunks: Vec::new(),
+                    deletion_blocks: Vec::new(),
                     old_tokens: Vec::new(),
                     new_tokens: Vec::new(),
                     highlight_status: "disabled".into(),
@@ -6297,6 +6559,7 @@ impl DesktopController {
             total_rows: u32::try_from(all_rows.len()).unwrap_or(u32::MAX),
             rows,
             hunks,
+            deletion_blocks: Vec::new(),
             old_tokens: Vec::new(),
             new_tokens: Vec::new(),
             highlight_status: "disabled".into(),
@@ -6487,6 +6750,237 @@ fn nearest_canonical_row(rows: &[DiffRowView], side: DiffSide, line: u32) -> usi
         .unwrap_or(0)
 }
 
+#[derive(Clone, Debug)]
+struct FullFileDeletionBlock {
+    id: String,
+    rows: Vec<FullFileRow>,
+}
+
+impl FullFileDeletionBlock {
+    fn start_line(&self) -> u32 {
+        self.rows.first().map_or(0, |row| row.line_number)
+    }
+
+    fn end_line(&self) -> u32 {
+        self.rows.last().map_or(0, |row| row.line_number)
+    }
+}
+
+#[derive(Clone, Debug)]
+enum FullFileProjectedRow {
+    Line(FullFileRow),
+    DeletionGate(FullFileDeletionBlock, bool),
+}
+
+fn full_file_deletion_blocks(document: &ReviewDiffDocument) -> Vec<FullFileDeletionBlock> {
+    let rows = full_file_current_rows(document);
+    let mut blocks = Vec::new();
+    let mut index = 0;
+    while index < rows.len() {
+        if rows[index].side != DiffSide::Old {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < rows.len() && rows[index].side == DiffSide::Old {
+            index += 1;
+        }
+        let block_rows = rows[start..index].to_vec();
+        let start_line = block_rows.first().map_or(0, |row| row.line_number);
+        let end_line = block_rows.last().map_or(0, |row| row.line_number);
+        blocks.push(FullFileDeletionBlock {
+            id: format!(
+                "{}:{}:{start_line}-{end_line}",
+                document.comparison_id, document.file.id
+            ),
+            rows: block_rows,
+        });
+    }
+    blocks
+}
+
+fn valid_full_file_deletion_block_ids(documents: &[PersistedReviewDocument]) -> BTreeSet<String> {
+    documents
+        .iter()
+        .flat_map(|document| full_file_deletion_blocks(&document.document))
+        .map(|block| block.id)
+        .collect()
+}
+
+fn full_file_projection(
+    document: &ReviewDiffDocument,
+    side: DiffSide,
+    expanded_blocks: &BTreeSet<String>,
+) -> (Vec<FullFileProjectedRow>, Vec<FullFileDeletionBlock>) {
+    if side == DiffSide::Old {
+        return (
+            full_file_rows(document, DiffSide::Old)
+                .into_iter()
+                .map(FullFileProjectedRow::Line)
+                .collect(),
+            Vec::new(),
+        );
+    }
+    let rows = full_file_current_rows(document);
+    let blocks = full_file_deletion_blocks(document);
+    let mut blocks_by_start = blocks
+        .iter()
+        .cloned()
+        .map(|block| (block.start_line(), block))
+        .collect::<BTreeMap<_, _>>();
+    let mut projection = Vec::with_capacity(rows.len());
+    let mut index = 0;
+    while index < rows.len() {
+        let row = &rows[index];
+        if row.side == DiffSide::New {
+            projection.push(FullFileProjectedRow::Line(row.clone()));
+            index += 1;
+            continue;
+        }
+        let Some(block) = blocks_by_start.remove(&row.line_number) else {
+            projection.push(FullFileProjectedRow::Line(row.clone()));
+            index += 1;
+            continue;
+        };
+        index = index.saturating_add(block.rows.len());
+        let expanded = expanded_blocks.contains(&block.id);
+        projection.push(FullFileProjectedRow::DeletionGate(block.clone(), expanded));
+        if expanded {
+            projection.extend(block.rows.iter().cloned().map(FullFileProjectedRow::Line));
+        }
+    }
+    (projection, blocks)
+}
+
+fn nearest_full_file_row(rows: &[FullFileProjectedRow], side: DiffSide, line: u32) -> usize {
+    // When a deletion block is expanded, exact source locations must land on
+    // the selectable Base row rather than on the preceding range gate.
+    rows.iter()
+        .enumerate()
+        .find_map(|(index, row)| match row {
+            FullFileProjectedRow::Line(row) => {
+                (row.side == side && row.line_number == line).then_some(index)
+            }
+            FullFileProjectedRow::DeletionGate(_, _) => None,
+        })
+        .or_else(|| {
+            rows.iter().enumerate().find_map(|(index, row)| match row {
+                FullFileProjectedRow::DeletionGate(block, _) => (side == DiffSide::Old
+                    && line >= block.start_line()
+                    && line <= block.end_line())
+                .then_some(index),
+                FullFileProjectedRow::Line(_) => None,
+            })
+        })
+        .or_else(|| {
+            rows.iter()
+                .enumerate()
+                .filter_map(|(index, row)| match row {
+                    FullFileProjectedRow::Line(row) if row.side == side => {
+                        Some((index, row.line_number.abs_diff(line)))
+                    }
+                    FullFileProjectedRow::DeletionGate(block, _) if side == DiffSide::Old => {
+                        Some((
+                            index,
+                            block
+                                .start_line()
+                                .abs_diff(line)
+                                .min(block.end_line().abs_diff(line)),
+                        ))
+                    }
+                    _ => None,
+                })
+                .min_by_key(|(index, distance)| (*distance, *index))
+                .map(|(index, _)| index)
+        })
+        .unwrap_or(0)
+}
+
+fn full_file_row_view(
+    row: &FullFileProjectedRow,
+    old_offsets: &[u32],
+    new_offsets: &[u32],
+) -> DiffRowView {
+    match row {
+        FullFileProjectedRow::Line(row) => DiffRowView {
+            id: format!("full:{}:{}", side_name(row.side), row.line_number),
+            kind: if row.changed {
+                if row.side == DiffSide::Old {
+                    "deletion"
+                } else {
+                    "addition"
+                }
+            } else {
+                "context"
+            }
+            .into(),
+            hunk_id: None,
+            old_line: (row.side == DiffSide::Old).then_some(row.line_number),
+            new_line: (row.side == DiffSide::New).then_some(row.line_number),
+            old_text: (row.side == DiffSide::Old).then_some(row.text.clone()),
+            new_text: (row.side == DiffSide::New).then_some(row.text.clone()),
+            text: Some(row.text.clone()),
+            hunk: None,
+            has_annotation: false,
+            old_source_start_byte: (row.side == DiffSide::Old)
+                .then(|| source_offset(old_offsets, row.line_number)),
+            new_source_start_byte: (row.side == DiffSide::New)
+                .then(|| source_offset(new_offsets, row.line_number)),
+            deletion_block_id: None,
+            deletion_count: None,
+            old_end_line: None,
+            deletion_expanded: None,
+        },
+        FullFileProjectedRow::DeletionGate(block, expanded) => {
+            let count = u32::try_from(block.rows.len()).unwrap_or(u32::MAX);
+            DiffRowView {
+                id: format!("full:deletion-gate:{}", block.id),
+                kind: "deletion_gate".into(),
+                hunk_id: None,
+                old_line: Some(block.start_line()),
+                new_line: None,
+                old_text: None,
+                new_text: None,
+                text: Some(format!(
+                    "{count} deleted {}",
+                    if count == 1 { "line" } else { "lines" }
+                )),
+                hunk: None,
+                has_annotation: false,
+                old_source_start_byte: None,
+                new_source_start_byte: None,
+                deletion_block_id: Some(block.id.clone()),
+                deletion_count: Some(count),
+                old_end_line: Some(block.end_line()),
+                deletion_expanded: Some(*expanded),
+            }
+        }
+    }
+}
+
+fn full_file_deletion_block_views(
+    blocks: &[FullFileDeletionBlock],
+    projection: &[FullFileProjectedRow],
+    expanded_blocks: &BTreeSet<String>,
+) -> Vec<FullFileDeletionBlockView> {
+    blocks
+        .iter()
+        .map(|block| FullFileDeletionBlockView {
+            id: block.id.clone(),
+            start_line: block.start_line(),
+            end_line: block.end_line(),
+            count: u32::try_from(block.rows.len()).unwrap_or(u32::MAX),
+            expanded: expanded_blocks.contains(&block.id),
+            row_index: u32::try_from(nearest_full_file_row(
+                projection,
+                DiffSide::Old,
+                block.start_line(),
+            ))
+            .unwrap_or(u32::MAX),
+        })
+        .collect()
+}
+
 fn nearest_difftastic_row(
     presentation: &NativeDifftasticPresentation,
     side: DiffSide,
@@ -6546,6 +7040,11 @@ fn workspace_ui_state_view(state: &ReviewUiState) -> WorkspaceUiStateView {
             .selected_annotation_ids
             .as_ref()
             .map(|values| values.iter().cloned().collect()),
+        expanded_full_file_deletion_blocks: state
+            .expanded_full_file_deletion_blocks
+            .iter()
+            .cloned()
+            .collect(),
     }
 }
 
@@ -6596,6 +7095,10 @@ fn build_canonical_presentation(
                     has_annotation: false,
                     old_source_start_byte: None,
                     new_source_start_byte: None,
+                    deletion_block_id: None,
+                    deletion_count: None,
+                    old_end_line: None,
+                    deletion_expanded: None,
                 });
                 let extra = context.saturating_sub(3);
                 rows.extend(expanded_context_rows(
@@ -6661,57 +7164,15 @@ fn build_canonical_presentation(
             } else {
                 full_file_side
             };
-            let source = match side {
-                DiffSide::Old => &document.old.content,
-                DiffSide::New => &document.new.content,
-            };
-            let offsets = source_line_offsets(source);
-            let rows = full_file_rows(document, side)
-                .into_iter()
-                .map(|row| DiffRowView {
-                    id: format!("full:{}:{}", side_name(side), row.line_number),
-                    kind: if row.changed {
-                        if side == DiffSide::Old {
-                            "deletion"
-                        } else {
-                            "addition"
-                        }
-                    } else {
-                        "context"
-                    }
-                    .into(),
-                    hunk_id: None,
-                    old_line: (side == DiffSide::Old).then_some(row.line_number),
-                    new_line: (side == DiffSide::New).then_some(row.line_number),
-                    old_text: (side == DiffSide::Old).then_some(row.text.clone()),
-                    new_text: (side == DiffSide::New).then_some(row.text.clone()),
-                    text: Some(row.text),
-                    hunk: None,
-                    has_annotation: false,
-                    old_source_start_byte: (side == DiffSide::Old)
-                        .then(|| source_offset(&offsets, row.line_number)),
-                    new_source_start_byte: (side == DiffSide::New)
-                        .then(|| source_offset(&offsets, row.line_number)),
-                })
-                .collect::<Vec<_>>();
-            let hunks = document
-                .hunks
+            let old_offsets = source_line_offsets(&document.old.content);
+            let new_offsets = source_line_offsets(&document.new.content);
+            let (projection, _) =
+                full_file_projection(document, side, &state.expanded_full_file_deletion_blocks);
+            let rows = projection
                 .iter()
-                .map(|hunk| HunkLocationView {
-                    id: hunk.id.0.clone(),
-                    row_index: usize::try_from(match side {
-                        DiffSide::Old => hunk.header.old_start.saturating_sub(1),
-                        DiffSide::New => hunk.header.new_start.saturating_sub(1),
-                    })
-                    .ok()
-                    .and_then(|index| u32::try_from(index).ok())
-                    .unwrap_or_default(),
-                    old_line: (side == DiffSide::Old).then_some(hunk.header.old_start),
-                    new_line: (side == DiffSide::New).then_some(hunk.header.new_start),
-                    header: format_hunk_header(hunk),
-                    collapsed_context_lines: None,
-                })
-                .collect();
+                .map(|row| full_file_row_view(row, &old_offsets, &new_offsets))
+                .collect::<Vec<_>>();
+            let hunks = full_file_hunk_locations(document, side, &projection);
             Ok(CachedCanonicalPresentation { rows, hunks })
         }
         _ => Err(DispatchError::Invalid(
@@ -6796,6 +7257,10 @@ fn expanded_context_rows(
             has_annotation: false,
             old_source_start_byte: old_line.map(|line| source_offset(old_offsets, line)),
             new_source_start_byte: new_line.map(|line| source_offset(new_offsets, line)),
+            deletion_block_id: None,
+            deletion_count: None,
+            old_end_line: None,
+            deletion_expanded: None,
         });
     }
     if before {
@@ -6826,6 +7291,10 @@ fn diff_row_from_cells(
         has_annotation: false,
         old_source_start_byte: old.map(|cell| source_offset(old_offsets, cell.line_number)),
         new_source_start_byte: new.map(|cell| source_offset(new_offsets, cell.line_number)),
+        deletion_block_id: None,
+        deletion_count: None,
+        old_end_line: None,
+        deletion_expanded: None,
     }
 }
 
@@ -6861,6 +7330,67 @@ fn format_hunk_header(hunk: &localreview_diff::ReviewHunk) -> String {
     )
 }
 
+fn full_file_hunk_locations(
+    document: &ReviewDiffDocument,
+    side: DiffSide,
+    rows: &[FullFileProjectedRow],
+) -> Vec<HunkLocationView> {
+    document
+        .hunks
+        .iter()
+        .map(|hunk| {
+            let first_old_change = hunk
+                .unified_rows
+                .iter()
+                .filter(|row| row.kind != DiffLineKind::Context)
+                .find_map(|row| row.old.as_ref().map(|cell| cell.line_number));
+            let first_new_change = hunk
+                .unified_rows
+                .iter()
+                .filter(|row| row.kind != DiffLineKind::Context)
+                .find_map(|row| row.new.as_ref().map(|cell| cell.line_number));
+            let displayed_change = hunk
+                .unified_rows
+                .iter()
+                .filter(|row| row.kind != DiffLineKind::Context)
+                .find_map(|row| match side {
+                    DiffSide::Old => row
+                        .old
+                        .as_ref()
+                        .map(|cell| (DiffSide::Old, cell.line_number)),
+                    DiffSide::New => row
+                        .old
+                        .as_ref()
+                        .map(|cell| (DiffSide::Old, cell.line_number))
+                        .or_else(|| {
+                            row.new
+                                .as_ref()
+                                .map(|cell| (DiffSide::New, cell.line_number))
+                        }),
+                });
+            let row_index = displayed_change
+                .map(|(change_side, line)| nearest_full_file_row(rows, change_side, line))
+                .unwrap_or_else(|| {
+                    let fallback_line = match side {
+                        DiffSide::Old => hunk.header.old_start.max(1),
+                        DiffSide::New => hunk.header.new_start.max(1),
+                    };
+                    nearest_full_file_row(rows, side, fallback_line)
+                });
+            HunkLocationView {
+                id: hunk.id.0.clone(),
+                row_index: u32::try_from(row_index).unwrap_or(u32::MAX),
+                old_line: first_old_change
+                    .or_else(|| (hunk.header.old_count > 0).then_some(hunk.header.old_start)),
+                new_line: first_new_change
+                    .or_else(|| (hunk.header.new_count > 0).then_some(hunk.header.new_start)),
+                header: format_hunk_header(hunk),
+                collapsed_context_lines: None,
+            }
+        })
+        .collect()
+}
+
 fn annotation_at(
     annotations: &[Annotation],
     document: &ReviewDiffDocument,
@@ -6875,6 +7405,25 @@ fn annotation_at(
                     && anchor.side == Some(side)
                     && anchor.start_line.unwrap_or_default() <= line
                     && anchor.end_line.unwrap_or_default() >= line
+            })
+    })
+}
+
+fn annotation_overlaps(
+    annotations: &[Annotation],
+    document: &ReviewDiffDocument,
+    side: DiffSide,
+    start_line: u32,
+    end_line: u32,
+) -> bool {
+    annotations.iter().any(|annotation| {
+        !is_soft_deleted(annotation)
+            && annotation.anchor.as_ref().is_some_and(|anchor| {
+                anchor.comparison_id == document.comparison_id
+                    && anchor.file_path == document.file.path
+                    && anchor.side == Some(side)
+                    && anchor.start_line.unwrap_or_default() <= end_line
+                    && anchor.end_line.unwrap_or_default() >= start_line
             })
     })
 }
@@ -7262,6 +7811,210 @@ fn protocol_summary(workspace: &WorkspaceView) -> WorkspaceSummary {
     }
 }
 
+fn local_event_can_change_source(path: &Path) -> bool {
+    let components = path.components().collect::<Vec<_>>();
+    let Some(git_index) = components
+        .iter()
+        .position(|component| component.as_os_str() == ".git")
+    else {
+        return true;
+    };
+    let git_path = components[(git_index + 1)..]
+        .iter()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>();
+    match git_path.as_slice() {
+        // A linked-worktree `.git` file is stable configuration, not source.
+        [] => false,
+        [name] if matches!(name.as_ref(), "HEAD" | "index" | "packed-refs") => true,
+        [directory, name] if directory == "info" && name == "exclude" => true,
+        [directory, ..] if directory == "refs" => {
+            !git_path.last().is_some_and(|name| name.ends_with(".lock"))
+        }
+        // Git's status/diff plumbing can update logs, object caches and lock
+        // files without changing the captured source generation.
+        _ => false,
+    }
+}
+
+/// Resolves worktree events through Git's own index and ignore configuration.
+/// `check-ignore` deliberately runs without `--no-index`: a tracked file must
+/// remain relevant even when a later ignore rule matches it, including after
+/// that tracked file has been deleted from the worktree.
+fn local_events_can_change_source(repository_roots: &[PathBuf], events: &[notify::Event]) -> bool {
+    let mut worktree_paths = BTreeMap::<PathBuf, BTreeSet<String>>::new();
+    for event in events.iter().filter(|event| {
+        matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) | EventKind::Any
+        )
+    }) {
+        if event.need_rescan() || (matches!(event.kind, EventKind::Any) && event.paths.is_empty()) {
+            return true;
+        }
+        for path in &event.paths {
+            if !local_event_can_change_source(path) {
+                continue;
+            }
+            if path
+                .components()
+                .any(|component| component.as_os_str() == ".git")
+            {
+                return true;
+            }
+            let Some((root, relative)) = repository_roots
+                .iter()
+                .filter_map(|root| {
+                    path.strip_prefix(root)
+                        .ok()
+                        .map(|relative| (root, relative))
+                })
+                // A nested registered repository owns its events rather than
+                // inheriting the parent repository's ignore rules.
+                .max_by_key(|(root, _)| root.components().count())
+            else {
+                // Watch transports should return paths below registered roots;
+                // an unexpected path is conservatively treated as relevant.
+                return true;
+            };
+            if relative.as_os_str().is_empty() {
+                return true;
+            }
+            let Some(relative) = relative.to_str() else {
+                return true;
+            };
+            worktree_paths
+                .entry(root.clone())
+                .or_default()
+                .insert(relative.replace('\\', "/"));
+        }
+    }
+
+    worktree_paths.into_iter().any(|(root, paths)| {
+        git_reports_all_paths_ignored(&root, &paths).map_or(true, |all_ignored| !all_ignored)
+    })
+}
+
+/// Uses one NUL-delimited Git query for a coalesced event batch. The output is
+/// the subset Git considers ignored; command or decoding failures are handled
+/// conservatively by the caller.
+fn git_reports_all_paths_ignored(
+    repository_root: &Path,
+    paths: &BTreeSet<String>,
+) -> Result<bool, ()> {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    if paths.is_empty() {
+        return Ok(true);
+    }
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repository_root)
+        .args(["check-ignore", "--stdin", "-z"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| ())?;
+    let write_result = child.stdin.take().ok_or(()).and_then(|mut stdin| {
+        for path in paths {
+            stdin.write_all(path.as_bytes()).map_err(|_| ())?;
+            stdin.write_all(&[0]).map_err(|_| ())?;
+        }
+        Ok(())
+    });
+    if write_result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(());
+    }
+    let output = child.wait_with_output().map_err(|_| ())?;
+    if !matches!(output.status.code(), Some(0 | 1)) {
+        return Err(());
+    }
+    let ignored = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .collect::<BTreeSet<_>>();
+    Ok(paths.iter().all(|path| ignored.contains(path.as_bytes())))
+}
+
+fn publish_refresh_availability(
+    flags: &Arc<Mutex<BTreeMap<WorkspaceId, RefreshAvailability>>>,
+    app_handle: &Arc<Mutex<Option<tauri::AppHandle>>>,
+    workspace_id: WorkspaceId,
+    expected_watcher_epoch: Option<u64>,
+    available: bool,
+) {
+    let event = flags.lock().ok().and_then(|mut flags| {
+        let state = flags.entry(workspace_id).or_default();
+        if expected_watcher_epoch.is_some_and(|epoch| epoch != state.watcher_epoch) {
+            return None;
+        }
+        if available {
+            // Every source notification advances the revision, even while the
+            // indicator is already amber. A later event racing an in-flight
+            // capture must prevent that capture from acknowledging it away.
+            state.revision = state.revision.saturating_add(1).max(1);
+            state.available = true;
+        } else {
+            if !state.available {
+                return None;
+            }
+            state.revision = state.revision.saturating_add(1).max(1);
+            state.available = false;
+        }
+        Some(RefreshAvailableEvent {
+            workspace_id: workspace_id.to_string(),
+            refresh_available: state.available,
+            revision: state.revision,
+        })
+    });
+    let Some(event) = event else {
+        return;
+    };
+    let handle = app_handle.lock().ok().and_then(|handle| handle.clone());
+    if let Some(handle) = handle {
+        let _ = handle.emit(REFRESH_AVAILABLE_EVENT, event);
+    }
+}
+
+fn publish_refresh_availability_at_boundary(
+    flags: &Arc<Mutex<BTreeMap<WorkspaceId, RefreshAvailability>>>,
+    app_handle: &Arc<Mutex<Option<tauri::AppHandle>>>,
+    workspace_id: WorkspaceId,
+    boundary: RefreshCaptureBoundary,
+    available: bool,
+) {
+    let event = flags.lock().ok().and_then(|mut flags| {
+        let state = flags.entry(workspace_id).or_default();
+        if state.revision != boundary.revision
+            || state.watcher_epoch != boundary.watcher_epoch
+            || state.available == available
+        {
+            return None;
+        }
+        state.revision = state.revision.saturating_add(1).max(1);
+        state.available = available;
+        Some(RefreshAvailableEvent {
+            workspace_id: workspace_id.to_string(),
+            refresh_available: state.available,
+            revision: state.revision,
+        })
+    });
+    let Some(event) = event else {
+        return;
+    };
+    let handle = app_handle.lock().ok().and_then(|handle| handle.clone());
+    if let Some(handle) = handle {
+        let _ = handle.emit(REFRESH_AVAILABLE_EVENT, event);
+    }
+}
+
 fn source_name(source: localreview_domain::WorkspaceSourceTag) -> &'static str {
     match source {
         localreview_domain::WorkspaceSourceTag::GitHub => "github",
@@ -7381,6 +8134,7 @@ struct RepositorySetupLive {
     clean: Option<bool>,
     changed_file_count: Option<usize>,
     status_summary: String,
+    suggested_base: Option<String>,
     resolved_base_sha: Option<String>,
     merge_base_sha: Option<String>,
     head_sha: Option<String>,
@@ -7428,6 +8182,7 @@ fn repository_setup_view(
             live.status_summary
         },
         effective_base: baseline.reference.as_str().into(),
+        suggested_base: live.suggested_base,
         base_source: baseline_source_label(baseline.source).into(),
         base_override: repository
             .base_override
@@ -7485,6 +8240,34 @@ fn status_summary(changes: &[localreview_git::WorkingTreeChange]) -> String {
         format!("Dirty: {} changed", changes.len())
     } else {
         format!("Dirty: {}", segments.join(", "))
+    }
+}
+
+fn local_refresh_outcome(
+    result: &localreview_service::StartReviewResult,
+) -> LocalRefreshOutcomeView {
+    let captured_repository_count = result.captures.len();
+    let failed_repository_count = result.failures.len();
+    let status = if failed_repository_count == 0 {
+        "success"
+    } else if captured_repository_count == 0 {
+        "failed"
+    } else {
+        "partial"
+    };
+    LocalRefreshOutcomeView {
+        status: status.into(),
+        captured_repository_count,
+        failed_repository_count,
+        failures: result
+            .failures
+            .iter()
+            .map(|failure| LocalRefreshFailureView {
+                repository_id: failure.repository_id.to_string(),
+                repository_path: failure.relative_path.to_string(),
+                error: failure.error.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -7571,6 +8354,7 @@ fn file_view(
         .into(),
         additions,
         deletions,
+        hunk_count: document.hunks.len(),
         language: language_name(document.file.path.as_str()).into(),
         viewed,
         annotation_count,
@@ -7648,6 +8432,10 @@ fn header_row(hunk: &localreview_diff::ReviewHunk) -> DiffRowView {
         has_annotation: false,
         old_source_start_byte: None,
         new_source_start_byte: None,
+        deletion_block_id: None,
+        deletion_count: None,
+        old_end_line: None,
+        deletion_expanded: None,
     }
 }
 
@@ -8487,6 +9275,51 @@ mod tests {
         repository_id: RepositoryId,
     }
 
+    #[test]
+    fn start_review_input_accepts_the_camel_case_desktop_contract() {
+        let input: StartOrRefreshInput = serde_json::from_value(serde_json::json!({
+            "fetchBeforeCapture": false,
+            "comparisonOptions": {
+                "ignoreAllWhitespace": true,
+                "ignoreSpaceAtEol": false,
+                "ignoreCrAtEol": true
+            }
+        }))
+        .unwrap();
+
+        let options = input.comparison_options.unwrap();
+        assert!(options.ignore_all_whitespace);
+        assert!(!options.ignore_space_at_eol);
+        assert!(options.ignore_cr_at_eol);
+        assert!(options.path_filters.is_empty());
+    }
+
+    #[test]
+    fn local_refresh_reports_all_repository_failures_and_keeps_retry_available() {
+        let fixture = review_fixture("before\n", "captured\n");
+
+        let refreshed = fixture
+            .controller
+            .refresh_review(fixture.workspace_id, StartOrRefreshInput::default())
+            .unwrap();
+
+        let outcome = refreshed
+            .refresh_outcome
+            .expect("explicit local refresh outcome");
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(outcome.captured_repository_count, 0);
+        assert_eq!(outcome.failed_repository_count, 1);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(
+            outcome.failures[0].repository_id,
+            fixture.repository_id.to_string()
+        );
+        assert_eq!(outcome.failures[0].repository_path, ".");
+        assert!(!outcome.failures[0].error.is_empty());
+        assert!(refreshed.workspace.refresh_available);
+        assert!(refreshed.workspace.refresh_available_revision > 0);
+    }
+
     fn review_fixture(old_source: &str, new_source: &str) -> ReviewFixture {
         let state_directory = TempDir::new().unwrap();
         let workspace_directory = TempDir::new().unwrap();
@@ -9162,6 +9995,90 @@ mod tests {
             })
             .unwrap();
         let workspace_id = parse_workspace_id(&workspace.id).unwrap();
+        // The initial review transport already owns the capture transcript
+        // above. Future SSH invocations are notification-only watcher
+        // transports. Model the companion contract instead of replaying the
+        // capture responses: handshake, establish the initial fingerprint,
+        // announce Watching, then stay alive until the desktop cancels the
+        // original watch request.
+        let watcher_request_id = format!("watch-workspace-{workspace_id}");
+        let watcher_generation = 1;
+        let watcher_transcript = fixture.path().join("watcher.frames");
+        let mut watcher_frames = Vec::new();
+        for message in [
+            localreview_protocol::AgentMessage::Response(localreview_protocol::AgentResponse {
+                id: response_id(1),
+                generation: 0,
+                result: AgentResult::Handshake {
+                    selected_version: PROTOCOL_VERSION,
+                    hello: localreview_protocol::AgentHello::current(
+                        "fixture-agent",
+                        "linux",
+                        "x86_64",
+                    ),
+                },
+            }),
+            localreview_protocol::AgentMessage::Progress(localreview_protocol::AgentProgress {
+                id: watcher_request_id.clone(),
+                generation: watcher_generation,
+                phase: AgentProgressPhase::Watching,
+                completed: 0,
+                total: None,
+            }),
+        ] {
+            localreview_protocol::write_frame(&mut watcher_frames, &message).unwrap();
+        }
+        std::fs::write(&watcher_transcript, watcher_frames).unwrap();
+
+        let mut initial_watcher_requests = Vec::new();
+        for request in [
+            localreview_protocol::AgentRequest {
+                id: response_id(1),
+                generation: 0,
+                operation: AgentOperation::Handshake {
+                    desktop_versions: vec![PROTOCOL_VERSION],
+                },
+            },
+            localreview_protocol::AgentRequest {
+                id: watcher_request_id.clone(),
+                generation: watcher_generation,
+                operation: AgentOperation::WatchWorkspaceChanges {
+                    repositories: vec![reference.clone()],
+                    poll_interval_millis: 1_000,
+                },
+            },
+        ] {
+            localreview_protocol::write_frame(
+                &mut initial_watcher_requests,
+                &localreview_protocol::AgentMessage::Request(request),
+            )
+            .unwrap();
+        }
+        let watcher_cancelled = fixture.path().join("watcher-cancelled.frames");
+        let mut watcher_cancelled_frames = Vec::new();
+        localreview_protocol::write_frame(
+            &mut watcher_cancelled_frames,
+            &localreview_protocol::AgentMessage::Response(localreview_protocol::AgentResponse {
+                id: watcher_request_id,
+                generation: watcher_generation,
+                result: AgentResult::Cancelled,
+            }),
+        )
+        .unwrap();
+        std::fs::write(&watcher_cancelled, watcher_cancelled_frames).unwrap();
+        let escaped_watcher_transcript = watcher_transcript
+            .to_string_lossy()
+            .replace('\'', "'\"'\"'");
+        let escaped_watcher_cancelled =
+            watcher_cancelled.to_string_lossy().replace('\'', "'\"'\"'");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *\"uname -s\"*) printf 'Linux\\n'; exit 0;;\n  *\"uname -m\"*) printf 'x86_64\\n'; exit 0;;\n  *\"--stdio\"*)\n    cat '{escaped_watcher_transcript}'\n    dd if=/dev/stdin of=/dev/null bs=1 count={} 2>/dev/null\n    dd if=/dev/stdin of=/dev/null bs=1 count=1 2>/dev/null\n    cat '{escaped_watcher_cancelled}'\n    exit 0;;\n  *) exit 1;;\nesac\n",
+                initial_watcher_requests.len()
+            ),
+        )
+        .unwrap();
         let first = controller.load_review(workspace_id).unwrap();
         let reused_file_id = first.files[0].id.clone();
         let first_session_id = controller
@@ -9200,6 +10117,7 @@ mod tests {
                 resources.path(),
             )
             .unwrap();
+        controller.stop_remote_watchers(workspace_id);
         drop(controller);
         std::env::remove_var("LOCALREVIEW_TEST_SSH_PROGRAM");
 
@@ -9249,11 +10167,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            archived_window.rows[0].new_text.as_deref(),
+            archived_window
+                .rows
+                .iter()
+                .find_map(|row| row.new_text.as_deref()),
             Some("review one")
         );
         assert_eq!(
-            current_window.rows[0].new_text.as_deref(),
+            current_window
+                .rows
+                .iter()
+                .find_map(|row| row.new_text.as_deref()),
             Some("review two")
         );
     }
@@ -9426,7 +10350,7 @@ mod tests {
         };
         let started = Instant::now();
         controller
-            .start_remote_watchers(workspace_id, &metadata)
+            .start_remote_watchers(workspace_id, &metadata, false)
             .unwrap();
         assert!(
             started.elapsed() < Duration::from_millis(100),
@@ -9657,6 +10581,85 @@ mod tests {
     }
 
     #[test]
+    fn opening_archived_local_path_reactivates_and_focuses_its_captured_review() {
+        let fixture = review_fixture("before\n", "after\n");
+        let git = std::process::Command::new("git")
+            .current_dir(fixture._workspace_directory.path())
+            .args(["init", "-b", "main"])
+            .output()
+            .unwrap();
+        assert!(
+            git.status.success(),
+            "git init: {}",
+            String::from_utf8_lossy(&git.stderr)
+        );
+        // `open_local_workspace` deliberately keys local workspaces by their
+        // canonical root. The synthetic review fixture predates discovery, so
+        // normalize its temporary macOS `/var` alias the same way a real first
+        // open does before exercising repeated-open behavior.
+        let mut stored_workspace = fixture
+            .controller
+            .state()
+            .workspace(fixture.workspace_id)
+            .unwrap()
+            .unwrap();
+        stored_workspace.source = WorkspaceSource::LocalDirectory {
+            root: StoredPath::new(
+                std::fs::canonicalize(fixture._workspace_directory.path()).unwrap(),
+            ),
+        };
+        fixture
+            .controller
+            .state()
+            .upsert_workspace(&stored_workspace)
+            .unwrap();
+        let before = fixture
+            .controller
+            .load_review(fixture.workspace_id)
+            .unwrap();
+        fixture
+            .controller
+            .delete_workspace(fixture.workspace_id)
+            .unwrap();
+        assert!(fixture.controller.list_workspaces().unwrap().is_empty());
+
+        let (reopened, created) = fixture
+            .controller
+            .open_local_workspace(OpenWorkspaceInput {
+                path: fixture
+                    ._workspace_directory
+                    .path()
+                    .to_string_lossy()
+                    .into_owned(),
+                base: None,
+                repository_bases: Vec::new(),
+            })
+            .unwrap();
+
+        assert!(!created);
+        assert_eq!(reopened.id, fixture.workspace_id.to_string());
+        assert!(!reopened.archived);
+        assert_eq!(fixture.controller.list_workspaces().unwrap().len(), 1);
+        assert!(fixture
+            .controller
+            .list_archived_workspaces()
+            .unwrap()
+            .is_empty());
+        let after = fixture
+            .controller
+            .load_review(fixture.workspace_id)
+            .unwrap();
+        assert_eq!(after.files.len(), before.files.len());
+        assert_eq!(after.files[0].id, before.files[0].id);
+        assert!(fixture
+            .controller
+            .local_watchers
+            .lock()
+            .unwrap()
+            .contains_key(&fixture.workspace_id));
+    }
+
+    #[test]
     fn older_saved_settings_gain_all_new_presentation_defaults() {
         let directory = TempDir::new().unwrap();
         let controller = DesktopController::new(StateStore::open(directory.path()).unwrap());
@@ -9668,6 +10671,7 @@ mod tests {
             )
             .unwrap();
         let restored = controller.get_settings().unwrap();
+        assert_eq!(restored.last_workspace_id, None);
         assert_eq!(restored.theme, "dark");
         assert_eq!(restored.code_font, "SF Mono");
         assert_eq!(restored.tab_width, 2);
@@ -9787,6 +10791,7 @@ mod tests {
         // The feature rejects a non-local attribution request before it can
         // ever read a remote path; the local fixture itself remains unchanged.
         assert_eq!(loaded.files[0].path, "review.rs");
+        assert_eq!(loaded.files[0].hunk_count, 1);
     }
 
     #[test]
@@ -9865,17 +10870,225 @@ mod tests {
             )
             .unwrap();
         assert_eq!(full.start_row, 20);
-        assert_eq!(full.total_rows, 80);
-        assert_eq!(full.rows.len(), 60);
+        assert_eq!(full.total_rows, 81);
+        assert_eq!(full.rows.len(), 61);
         assert!(full
             .rows
             .iter()
+            .filter(|row| row.new_line.is_some())
             .all(|row| row.new_source_start_byte.is_some()));
+        assert!(full.rows.iter().any(|row| {
+            row.kind == "deletion_gate"
+                && row.old_line == Some(40)
+                && row.old_end_line == Some(40)
+                && row.old_source_start_byte.is_none()
+        }));
+        assert!(full.old_tokens.is_empty());
         let outline = fixture
             .controller
             .outline(fixture.file_id, None, DiffSide::New)
             .unwrap();
         assert!(outline.iter().any(|symbol| symbol.name == "value_40"));
+    }
+
+    #[test]
+    fn full_file_current_windows_interleave_removals_and_resolve_old_side_anchors() {
+        let old = (1..=30)
+            .map(|line| format!("const VALUE_{line}: usize = {line};\n"))
+            .collect::<String>();
+        let new = old
+            .lines()
+            .enumerate()
+            .filter(|(index, _)| !matches!(index + 1, 5..=7 | 20..=21))
+            .map(|(_, line)| format!("{line}\n"))
+            .collect::<String>();
+        let fixture = review_fixture(&old, &new);
+        fixture
+            .controller
+            .save_annotation(AnnotationView {
+                id: Uuid::new_v4().to_string(),
+                file_id: fixture.file_id.to_string(),
+                repository_id: fixture.repository_id.to_string(),
+                kind: "comment".into(),
+                state: "open".into(),
+                side: "old".into(),
+                start_line: 6,
+                end_line: 6,
+                body: "Hidden deletion annotation".into(),
+                selected_source: "const VALUE_6: usize = 6;".into(),
+                labels: Vec::new(),
+                local_only: true,
+                created_at: Utc::now().to_rfc3339(),
+                published_id: None,
+            })
+            .unwrap();
+        let resources = TempDir::new().unwrap();
+        let full = fixture
+            .controller
+            .presentation_window(
+                PresentationRequest {
+                    file_id: fixture.file_id.to_string(),
+                    comparison_id: None,
+                    mode: "full".into(),
+                    start_row: 0,
+                    end_row: u32::MAX,
+                    generation: 10,
+                    full_file_side: Some("new".into()),
+                    split_ratio: None,
+                },
+                resources.path(),
+            )
+            .unwrap();
+
+        assert_eq!(full.total_rows, 27);
+        assert_eq!(full.hunks.len(), 2);
+        let gates = full
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.kind == "deletion_gate")
+            .map(|(index, row)| (index, row.old_line, row.old_end_line, row.deletion_count))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            gates,
+            vec![
+                (4, Some(5), Some(7), Some(3)),
+                (17, Some(20), Some(21), Some(2)),
+            ]
+        );
+        assert_eq!(full.deletion_blocks.len(), 2);
+        assert!(full.deletion_blocks.iter().all(|block| !block.expanded));
+        assert!(full.rows[4].has_annotation);
+        assert!(!full.rows[17].has_annotation);
+        assert_eq!(
+            full.hunks
+                .iter()
+                .map(|hunk| hunk.row_index)
+                .collect::<Vec<_>>(),
+            vec![4, 17]
+        );
+        assert!(full
+            .rows
+            .iter()
+            .filter(|row| row.new_line.is_some())
+            .all(|row| {
+                row.new_source_start_byte.is_some() && row.old_source_start_byte.is_none()
+            }));
+        assert!(!full.new_tokens.is_empty());
+
+        let location = fixture
+            .controller
+            .resolve_presentation_location(
+                fixture.file_id,
+                None,
+                "full",
+                DiffSide::Old,
+                20,
+                resources.path(),
+            )
+            .unwrap();
+        assert_eq!(location.row_index, 17);
+
+        let mut expanded_ids = full
+            .deletion_blocks
+            .iter()
+            .map(|block| block.id.clone())
+            .collect::<Vec<_>>();
+        expanded_ids.sort();
+        assert!(fixture
+            .controller
+            .save_workspace_ui_state(
+                fixture.workspace_id,
+                serde_json::from_value(serde_json::json!({
+                    "expandedFullFileDeletionBlocks": ["foreign:block"]
+                }))
+                .unwrap(),
+            )
+            .is_err());
+        fixture
+            .controller
+            .save_workspace_ui_state(
+                fixture.workspace_id,
+                serde_json::from_value(serde_json::json!({
+                    "expandedFullFileDeletionBlocks": expanded_ids.clone()
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let reopened =
+            DesktopController::new(StateStore::open(fixture._state_directory.path()).unwrap());
+        assert_eq!(
+            reopened
+                .workspace_ui_state(fixture.workspace_id)
+                .unwrap()
+                .expanded_full_file_deletion_blocks,
+            expanded_ids
+        );
+        let expanded = reopened
+            .presentation_window(
+                PresentationRequest {
+                    file_id: fixture.file_id.to_string(),
+                    comparison_id: None,
+                    mode: "full".into(),
+                    start_row: 0,
+                    end_row: u32::MAX,
+                    generation: 11,
+                    full_file_side: Some("new".into()),
+                    split_ratio: None,
+                },
+                resources.path(),
+            )
+            .unwrap();
+        // Each expanded block retains its one-row inline collapse gate.
+        assert_eq!(expanded.total_rows, 32);
+        assert!(expanded.deletion_blocks.iter().all(|block| block.expanded));
+        assert_eq!(
+            expanded
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.kind == "deletion")
+                .map(|(index, row)| (index, row.old_line))
+                .collect::<Vec<_>>(),
+            vec![
+                (5, Some(5)),
+                (6, Some(6)),
+                (7, Some(7)),
+                (21, Some(20)),
+                (22, Some(21)),
+            ]
+        );
+        assert_eq!(
+            expanded
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.kind == "deletion_gate")
+                .map(|(index, row)| (index, row.deletion_expanded))
+                .collect::<Vec<_>>(),
+            vec![(4, Some(true)), (20, Some(true))]
+        );
+        assert_eq!(
+            expanded
+                .hunks
+                .iter()
+                .map(|hunk| hunk.row_index)
+                .collect::<Vec<_>>(),
+            vec![5, 21]
+        );
+        let expanded_location = fixture
+            .controller
+            .resolve_presentation_location(
+                fixture.file_id,
+                None,
+                "full",
+                DiffSide::Old,
+                20,
+                resources.path(),
+            )
+            .unwrap();
+        assert_eq!(expanded_location.row_index, 21);
+        assert!(!expanded.old_tokens.is_empty());
     }
 
     #[test]
@@ -9915,7 +11128,10 @@ mod tests {
 
         assert_eq!((unified.side.as_str(), unified.line), ("new", 180));
         assert!(unified.row_index > 0);
-        assert_eq!(full.row_index, 239);
+        // The replacement at line 180 contributes one old-side tombstone to
+        // Current Full File, so every later Current source line is shifted by
+        // one presentation row while retaining its source coordinate.
+        assert_eq!(full.row_index, 240);
         assert!(fixture
             .controller
             .resolve_presentation_location(
@@ -10594,6 +11810,25 @@ mod tests {
         ] {
             assert!(full.content.contains(body));
         }
+        assert_eq!(full.content.matches("Requested base `").count(), 1);
+        assert!(full.content.contains("merge-base `"));
+        assert!(full.content.contains("HEAD `"));
+        assert!(full.content.contains("snapshot `"));
+        assert_eq!(full.content.matches("Relevant diff hunk:").count(), 1);
+        assert_eq!(full.content.matches("Selected source:").count(), 3);
+        assert!(full
+            .content
+            .contains("Selected source:\n```text\nafter\n```"));
+        assert!(!full.content.contains("Surrounding context:"));
+        assert!(full.content.contains("### `review.rs`"));
+        assert!(!full.content.contains("Logical path:"));
+        assert!(!full.content.contains(
+            fixture
+                ._workspace_directory
+                .path()
+                .to_string_lossy()
+                .as_ref()
+        ));
 
         let history = fixture.controller.history(fixture.workspace_id).unwrap();
         for expected in [
@@ -10875,6 +12110,25 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let fixture = review_fixture("fn old() {}\n", "fn captured() {}\n");
+        let root = fixture._workspace_directory.path();
+        let git = |arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(root)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "review@example.invalid"]);
+        git(&["config", "user.name", "Review Test"]);
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        git(&["add", ".gitignore", "review.rs"]);
+        git(&["commit", "-m", "base"]);
         let before = fixture
             .controller
             .state()
@@ -10885,11 +12139,25 @@ mod tests {
             .controller
             .load_review(fixture.workspace_id)
             .unwrap();
+        // Ignore setup-time notifications and start this assertion at a
+        // stable watcher boundary, as an explicit refresh does in production.
+        std::thread::sleep(Duration::from_millis(300));
+        fixture
+            .controller
+            .clear_refresh_available(fixture.workspace_id);
+        let ignored_bundle = root.join("target/release/bundle/macos/LocalReview.app");
+        std::fs::create_dir_all(&ignored_bundle).unwrap();
         std::fs::write(
-            fixture._workspace_directory.path().join("review.rs"),
-            "fn changed_after_capture() {}\n",
+            ignored_bundle.join("Contents.cache"),
+            "ignored build output\n",
         )
         .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !fixture.controller.list_workspaces().unwrap()[0].refresh_available,
+            "ignored build output must not enable explicit Refresh"
+        );
+        std::fs::write(root.join("review.rs"), "fn changed_after_capture() {}\n").unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         let available = loop {
             let available = fixture
@@ -10920,6 +12188,313 @@ mod tests {
             .controller
             .clear_refresh_available(fixture.workspace_id);
         assert!(!fixture.controller.list_workspaces().unwrap()[0].refresh_available);
+    }
+
+    #[test]
+    fn capture_watcher_epoch_ignores_queued_events_and_preserves_later_events() {
+        let fixture = review_fixture("fn old() {}\n", "fn captured() {}\n");
+        let workspace = fixture
+            .controller
+            .state()
+            .workspace(fixture.workspace_id)
+            .unwrap()
+            .unwrap();
+        fixture.controller.ensure_local_watcher(&workspace).unwrap();
+        fixture
+            .controller
+            .mark_refresh_available(fixture.workspace_id)
+            .unwrap();
+        let old_epoch = fixture
+            .controller
+            .refresh_availability(fixture.workspace_id)
+            .unwrap()
+            .watcher_epoch;
+
+        let boundary = fixture
+            .controller
+            .restart_local_watcher_for_capture(&workspace)
+            .unwrap();
+        publish_refresh_availability(
+            &fixture.controller.refresh_available,
+            &fixture.controller.app_handle,
+            fixture.workspace_id,
+            Some(old_epoch),
+            true,
+        );
+        assert_eq!(
+            fixture
+                .controller
+                .refresh_availability(fixture.workspace_id)
+                .unwrap()
+                .revision,
+            boundary.revision,
+            "a callback queued by the pre-capture watcher must be ignored"
+        );
+        fixture
+            .controller
+            .clear_refresh_available_at_boundary(fixture.workspace_id, boundary);
+        assert!(!fixture.controller.list_workspaces().unwrap()[0].refresh_available);
+
+        let later_boundary = fixture
+            .controller
+            .restart_local_watcher_for_capture(&workspace)
+            .unwrap();
+        let current_epoch = fixture
+            .controller
+            .refresh_availability(fixture.workspace_id)
+            .unwrap()
+            .watcher_epoch;
+        publish_refresh_availability(
+            &fixture.controller.refresh_available,
+            &fixture.controller.app_handle,
+            fixture.workspace_id,
+            Some(current_epoch),
+            true,
+        );
+        fixture
+            .controller
+            .clear_refresh_available_at_boundary(fixture.workspace_id, later_boundary);
+        let summary = fixture.controller.list_workspaces().unwrap().remove(0);
+        assert!(summary.refresh_available);
+        assert!(summary.refresh_available_revision > later_boundary.revision);
+    }
+
+    #[test]
+    fn github_workspace_summary_preserves_revisioned_refresh_availability() {
+        let fixture = review_fixture("fn old() {}\n", "fn captured() {}\n");
+        let mut workspace = fixture
+            .controller
+            .state()
+            .workspace(fixture.workspace_id)
+            .unwrap()
+            .unwrap();
+        workspace.source = WorkspaceSource::PullRequest {
+            url: "https://github.com/acme/project/pull/42".into(),
+            owner: "acme".into(),
+            repository: "project".into(),
+            number: 42,
+            worktree: StoredPath::new(fixture._workspace_directory.path()),
+        };
+        fixture
+            .controller
+            .state()
+            .upsert_workspace(&workspace)
+            .unwrap();
+
+        fixture
+            .controller
+            .mark_refresh_available(fixture.workspace_id)
+            .unwrap();
+        let summary = fixture
+            .controller
+            .list_workspaces()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == fixture.workspace_id.to_string())
+            .unwrap();
+
+        assert!(summary.refresh_available);
+        assert!(summary.refresh_available_revision > 0);
+    }
+
+    #[test]
+    fn local_watcher_ignores_git_plumbing_but_keeps_source_generations() {
+        assert!(!local_event_can_change_source(Path::new(
+            "/repo/.git/index.lock"
+        )));
+        assert!(!local_event_can_change_source(Path::new(
+            "/repo/.git/objects/ab/cdef"
+        )));
+        assert!(!local_event_can_change_source(Path::new(
+            "/repo/.git/logs/HEAD"
+        )));
+        assert!(local_event_can_change_source(Path::new("/repo/.git/index")));
+        assert!(local_event_can_change_source(Path::new(
+            "/repo/.git/refs/heads/main"
+        )));
+        assert!(local_event_can_change_source(Path::new(
+            "/repo/.git/info/exclude"
+        )));
+        assert!(local_event_can_change_source(Path::new(
+            "/repo/src/main.rs"
+        )));
+    }
+
+    #[test]
+    fn local_watcher_uses_git_ignore_and_index_semantics_across_event_shapes() {
+        use notify::event::{AccessKind, MetadataKind, ModifyKind, RenameMode};
+
+        let repository = TempDir::new().unwrap();
+        let root = repository.path();
+        let git = |root: &Path, arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(root)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(root, &["init", "-b", "main"]);
+        git(root, &["config", "user.email", "review@example.invalid"]);
+        git(root, &["config", "user.name", "Review Test"]);
+        std::fs::write(root.join(".gitignore"), "target/\n*.cache\n*.log\n").unwrap();
+        std::fs::write(root.join("tracked.txt"), "base\n").unwrap();
+        std::fs::write(root.join("tracked.log"), "tracked despite ignore\n").unwrap();
+        git(root, &["add", ".gitignore", "tracked.txt"]);
+        git(root, &["add", "-f", "tracked.log"]);
+        git(root, &["commit", "-m", "base"]);
+
+        let metadata_event = |path: PathBuf| {
+            notify::Event::new(EventKind::Modify(ModifyKind::Metadata(
+                MetadataKind::Extended,
+            )))
+            .add_path(path)
+        };
+        let roots = vec![root.to_path_buf()];
+        let ignored_bundle = root.join("target/release/bundle/macos/LocalReview.app");
+        std::fs::create_dir_all(&ignored_bundle).unwrap();
+        assert!(
+            !local_events_can_change_source(&roots, &[metadata_event(ignored_bundle)]),
+            "an ignored build product must not relight Refresh"
+        );
+
+        let untracked = root.join("src/new.rs");
+        std::fs::create_dir_all(untracked.parent().unwrap()).unwrap();
+        std::fs::write(&untracked, "fn new() {}\n").unwrap();
+        assert!(local_events_can_change_source(
+            &roots,
+            &[metadata_event(untracked)]
+        ));
+
+        std::fs::write(root.join("tracked.log"), "modified\n").unwrap();
+        assert!(
+            local_events_can_change_source(&roots, &[metadata_event(root.join("tracked.log"))]),
+            "tracked files stay relevant even when an ignore rule matches"
+        );
+        std::fs::remove_file(root.join("tracked.txt")).unwrap();
+        assert!(
+            local_events_can_change_source(
+                &roots,
+                &[
+                    notify::Event::new(EventKind::Remove(notify::event::RemoveKind::File))
+                        .add_path(root.join("tracked.txt"))
+                ]
+            ),
+            "tracked deletions must relight Refresh"
+        );
+
+        let ignored_rename =
+            notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                .add_path(root.join("before.cache"))
+                .add_path(root.join("after.cache"));
+        assert!(!local_events_can_change_source(&roots, &[ignored_rename]));
+        let relevant_rename =
+            notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                .add_path(root.join("before.cache"))
+                .add_path(root.join("after.rs"));
+        assert!(local_events_can_change_source(&roots, &[relevant_rename]));
+        assert!(!local_events_can_change_source(
+            &roots,
+            &[notify::Event::new(EventKind::Access(AccessKind::Any))
+                .add_path(root.join("tracked.log"))]
+        ));
+
+        let nested = TempDir::new_in(root).unwrap();
+        let nested_root = nested.path();
+        git(nested_root, &["init", "-b", "main"]);
+        std::fs::write(nested_root.join(".gitignore"), "generated/\n").unwrap();
+        let nested_generated = nested_root.join("generated/output.rs");
+        std::fs::create_dir_all(nested_generated.parent().unwrap()).unwrap();
+        assert!(
+            !local_events_can_change_source(
+                &[root.to_path_buf(), nested_root.to_path_buf()],
+                &[metadata_event(nested_generated)]
+            ),
+            "the deepest registered repository must own ignore evaluation"
+        );
+    }
+
+    #[test]
+    fn read_only_local_capture_emits_no_semantic_filesystem_events() {
+        use std::time::{Duration, Instant};
+
+        let repository = TempDir::new().unwrap();
+        let root = repository.path();
+        let git = |arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(root)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "review@example.invalid"]);
+        git(&["config", "user.name", "Review Test"]);
+        std::fs::write(root.join("tracked.txt"), "base\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-m", "base"]);
+        git(&["switch", "-c", "feature"]);
+        std::fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+        std::fs::write(root.join("untracked.txt"), "untracked\n").unwrap();
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |event| {
+            let _ = sender.send(event);
+        })
+        .unwrap();
+        watcher.watch(root, RecursiveMode::Recursive).unwrap();
+        std::thread::sleep(Duration::from_millis(250));
+        while receiver.try_recv().is_ok() {}
+
+        let git = localreview_git::GitRepository::open(root);
+        let resolved = git
+            .resolve_comparison(
+                RepositoryId::new(),
+                ComparisonId::new(),
+                BaseReference::new("main").unwrap(),
+                ComparisonOptions::default(),
+            )
+            .unwrap();
+        git.capture_local_comparison(resolved).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut observed = Vec::new();
+        while Instant::now() < deadline {
+            match receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(Ok(event)) => observed.push(event),
+                Ok(Err(error)) => panic!("filesystem watcher failed: {error}"),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let semantic = observed
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    EventKind::Create(_)
+                        | EventKind::Modify(_)
+                        | EventKind::Remove(_)
+                        | EventKind::Any
+                ) && event
+                    .paths
+                    .iter()
+                    .any(|path| local_event_can_change_source(path))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            semantic.is_empty(),
+            "read-only capture emitted semantic filesystem events: {semantic:#?}; all events: {observed:#?}"
+        );
     }
 
     #[test]

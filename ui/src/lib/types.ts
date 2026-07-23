@@ -1,6 +1,6 @@
 export type WorkspaceSource = 'local' | 'github' | 'ssh';
 export type DiffMode = 'unified' | 'split' | 'full' | 'difftastic';
-export type DiffKind = 'context' | 'addition' | 'deletion' | 'modification' | 'header';
+export type DiffKind = 'context' | 'addition' | 'deletion' | 'deletion_gate' | 'modification' | 'header';
 export type DiffSide = 'old' | 'new';
 export type FullFileSide = DiffSide;
 export type SyntaxClass =
@@ -29,6 +29,9 @@ export interface Workspace {
   draftCount: number;
   pinned?: boolean;
   refreshAvailable?: boolean;
+  /** Monotonic native revision used to order watcher events and capture
+   * acknowledgements that may cross on the WebView event queue. */
+  refreshAvailableRevision?: number;
   connection?: 'connected' | 'connecting' | 'offline' | 'error';
   /** Native sends false when discovery is durable but baseline setup has not
    * produced an initial review generation yet. */
@@ -61,6 +64,7 @@ export interface RepositorySetup {
   changedFileCount?: number;
   statusSummary: string;
   effectiveBase: string;
+  suggestedBase?: string;
   baseSource: 'temporary' | 'override' | 'inherited' | 'application default' | string;
   baseOverride?: string;
   resolvedBaseSha?: string;
@@ -85,6 +89,8 @@ export interface ReviewFile {
   status: 'modified' | 'added' | 'deleted' | 'renamed' | 'untracked';
   additions: number;
   deletions: number;
+  /** Exact immutable hunk count captured by native review metadata. */
+  hunkCount: number;
   language: string;
   viewed: boolean;
   annotationCount: number;
@@ -123,6 +129,11 @@ export interface DiffRow {
   /** UTF-8 source byte offsets for safe complete-document Tree-sitter spans. */
   oldSourceStartByte?: number;
   newSourceStartByte?: number;
+  /** Present only on a collapsed Full File Current deletion gate. */
+  deletionBlockId?: string;
+  deletionCount?: number;
+  oldEndLine?: number;
+  deletionExpanded?: boolean;
 }
 
 /** A Rust Tree-sitter span. It is rendered as text nodes, never injected HTML. */
@@ -151,12 +162,22 @@ export interface DiffPresentationWindow {
   totalRows: number;
   rows: DiffRow[];
   hunks: HunkLocation[];
+  deletionBlocks?: FullFileDeletionBlock[];
   oldTokens?: SyntaxTokenSpan[];
   newTokens?: SyntaxTokenSpan[];
   highlightStatus?: 'highlighted' | 'plain_text' | 'disabled';
   highlightReason?: string;
   /** Only populated for read-only Difftastic responses. */
   difftastic?: DifftasticPresentation;
+}
+
+export interface FullFileDeletionBlock {
+  id: string;
+  startLine: number;
+  endLine: number;
+  count: number;
+  expanded: boolean;
+  rowIndex: number;
 }
 
 export interface ViewportRequest {
@@ -279,12 +300,28 @@ export interface ReviewData {
   files: ReviewFile[];
   annotations: Annotation[];
   history: ReviewHistoryItem[];
+  /** Outcome of the explicit local refresh that returned this snapshot. It is
+   * absent on ordinary review loads and on providers that fail atomically. */
+  refreshOutcome?: LocalRefreshOutcome;
   /** A frozen prior review session; its annotation/diff records are browsed read-only. */
   historical?: boolean;
   historicalSessionId?: string;
 }
 
+export interface LocalRefreshOutcome {
+  status: 'success' | 'partial' | 'failed';
+  capturedRepositoryCount: number;
+  failedRepositoryCount: number;
+  failures: Array<{
+    repositoryId: string;
+    repositoryPath: string;
+    error: string;
+  }>;
+}
+
 export interface ReviewSettings {
+  /** Last rail selection, restored only when that workspace is still open. */
+  lastWorkspaceId?: string;
   fontScale: number;
   leftWidth: number;
   rightWidth: number;
@@ -311,6 +348,7 @@ export interface WorkspaceUiState {
   rightTab: 'files' | 'comments' | 'outline';
   /** Undefined means a legacy/default selection; an empty array is an explicit durable choice. */
   selectedAnnotationIds?: string[];
+  expandedFullFileDeletionBlocks?: string[];
 }
 
 export interface PromptRequest {

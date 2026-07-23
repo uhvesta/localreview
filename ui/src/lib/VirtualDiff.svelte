@@ -2,7 +2,7 @@
   import { onDestroy, tick } from 'svelte';
   import { safeSyntaxSegments } from './syntax';
   import { getVirtualRange } from './virtual';
-  import type { DiffMode, DiffRow, DiffSelection, DiffSide, DifftasticPresentation, FullFileSide, HunkLocation, SyntaxTokenSpan, ViewportRequest } from './types';
+  import type { Annotation, AnnotationKind, DiffMode, DiffRow, DiffSelection, DiffSide, DifftasticPresentation, FullFileSide, HunkLocation, SyntaxTokenSpan, ViewportRequest } from './types';
 
   /** `rows` is only the currently cached native window, never necessarily a whole file. */
   export let rows: DiffRow[] = [];
@@ -15,6 +15,9 @@
   export let mode: DiffMode = 'unified';
   export let fontScale = 1;
   export let activeLine: number | undefined = undefined;
+  /** Immutable source side associated with `activeLine`. Full Current can
+   * deliberately target an Old-side deletion gate. */
+  export let activeSide: DiffSide | undefined = undefined;
   /** The active composer remains tied to immutable source coordinates even
    * while this component swaps bounded virtual windows. */
   export let composerSelection: DiffSelection | undefined = undefined;
@@ -23,6 +26,8 @@
   export let fullFileSide: FullFileSide = 'new';
   /** Row index requested by next/previous hunk or restored UI state. */
   export let jumpToRow: number | undefined = undefined;
+  /** Distinguishes repeated jumps to the same row after wrapping or manual scrolling. */
+  export let jumpGeneration = 0;
   /** Persisted pixel position for this workspace/file/mode. Applied once per
    * restoration key after the viewport exists. */
   export let initialScrollTop = 0;
@@ -32,9 +37,16 @@
   export let repositoryName = 'repository';
   export let filePath = 'file';
   export let annotationCountAt: (row: DiffRow, side: DiffSide) => number = () => 0;
+  /** Complete local annotations whose durable range covers this source row.
+   * Thread controls are rendered only on each range's end line so a multi-line
+   * annotation highlights every covered row without duplicating its content. */
+  export let annotationsForRow: (row: DiffRow, side: DiffSide) => Annotation[] = () => [];
+  export let annotationsEditable = true;
   export let onAnnotate: (row: DiffRow, selection: DiffSelection) => void = () => {};
+  export let onEditAnnotation: (annotation: Annotation) => void = () => {};
   export let onViewportRequest: (request: Pick<ViewportRequest, 'startRow' | 'endRow'>) => void = () => {};
   export let onExpandHunk: (hunk: HunkLocation) => void = () => {};
+  export let onToggleDeletionBlock: (blockId: string) => void = () => {};
   export let onSplitRatio: (ratio: number) => void = () => {};
   export let onCanonicalMode: (mode: Exclude<DiffMode, 'difftastic'>, location?: { side: DiffSide; line: number }) => void = () => {};
   export let onLocationChange: (location: { line?: number; side?: DiffSide; scrollTop: number }) => void = () => {};
@@ -47,12 +59,14 @@
   let selectionMode = mode;
   let draggingSplit = false;
   let lastRequested = '';
-  let handledJump: number | undefined;
+  let handledJumpGeneration = -1;
   let handledRestorationKey: string | undefined;
   let previousRowHeight = Math.round(24 * fontScale);
   let rangeDrag: { side: DiffSide; anchor: number; current: number; row: DiffRow } | undefined;
   let suppressSyntheticClick = false;
   let focusedLocation: { side: DiffSide; line: number } | undefined;
+  let expandedThreadKey: string | undefined;
+  let expansionContext = '';
 
   $: displayedSelection = rangeDrag
     ? {
@@ -81,10 +95,15 @@
   }
   $: windowCoversVisible = globalRange.start >= effectiveWindowStart && globalRange.end <= effectiveWindowStart + displayRows.length;
   $: if (viewport && !windowCoversVisible) requestWindow(globalRange.start, globalRange.end);
-  $: if (viewport && jumpToRow !== undefined && jumpToRow !== handledJump) {
-    handledJump = jumpToRow;
+  $: if (viewport && jumpToRow !== undefined && jumpGeneration !== handledJumpGeneration) {
+    handledJumpGeneration = jumpGeneration;
     viewport.scrollTop = Math.max(0, jumpToRow * rowHeight - Math.floor(height / 3));
     scrollTop = viewport.scrollTop;
+    onLocationChange({
+      line: activeLine,
+      side: mode === 'full' && activeLine ? (activeSide ?? fullFileSide) : undefined,
+      scrollTop
+    });
     requestWindow(Math.max(0, jumpToRow - 20), jumpToRow + 20);
   }
   $: if (viewport && restorationKey && restorationKey !== handledRestorationKey) {
@@ -107,6 +126,13 @@
   // A range is meaningful only inside one presentation. Changing modes must
   // never carry a stale virtual-row selection into Full File or Split.
   $: if (selectionMode !== mode) { selectionMode = mode; rangeAnchor = undefined; }
+  $: {
+    const nextExpansionContext = `${restorationKey}:${filePath}:${mode}`;
+    if (nextExpansionContext !== expansionContext) {
+      expansionContext = nextExpansionContext;
+      expandedThreadKey = undefined;
+    }
+  }
 
   function observe(node: HTMLDivElement) {
     viewport = node;
@@ -161,7 +187,10 @@
     return `${side} line ${line}, ${changeLabel(row)}, ${annotations} ${annotations === 1 ? 'annotation' : 'annotations'}`;
   }
   function rowLabel(row: DiffRow, sides: DiffSide[]) {
-    return `Repository ${repositoryName}, file ${filePath}, ${mode} diff. ${sides.map((side) => sideLabel(row, side)).join('; ')}.`;
+    const inlineRemoval = mode === 'full' && fullFileSide === 'new' && row.kind === 'deletion' && row.oldLine
+      ? ' Removed Base line shown inline at its Current-file deletion anchor.'
+      : '';
+    return `Repository ${repositoryName}, file ${filePath}, ${mode} diff. ${sides.map((side) => sideLabel(row, side)).join('; ')}.${inlineRemoval}`;
   }
   function code(row: DiffRow, side: DiffSide) { return side === 'old' ? (row.oldText ?? row.text ?? '') : (row.newText ?? row.text ?? ''); }
   function sourceStart(row: DiffRow, side: DiffSide) { return side === 'old' ? row.oldSourceStartByte : row.newSourceStartByte; }
@@ -182,6 +211,58 @@
     const index = structuralRows.findIndex((entry) => entry.id === row.id);
     const original = (difftastic?.chunks ?? []).flatMap((chunk) => chunk.rows)[index];
     return side === 'old' ? original?.old : original?.new;
+  }
+  function sourceLine(row: DiffRow, side: DiffSide) { return side === 'old' ? row.oldLine : row.newLine; }
+  function threadKey(row: DiffRow, side: DiffSide) { return `${row.id}:${side}`; }
+  function threadId(row: DiffRow, side: DiffSide) { return `inline-thread-${threadKey(row, side).replace(/[^a-zA-Z0-9_-]/g, '-')}`; }
+  function anchoredAnnotations(row: DiffRow, side: DiffSide, covered: Annotation[]) {
+    const line = sourceLine(row, side);
+    return line ? covered.filter((annotation) => annotation.endLine === line) : [];
+  }
+  function includesKind(annotations: Annotation[], kind: AnnotationKind) { return annotations.some((annotation) => annotation.kind === kind); }
+  function annotationGlyph(annotations: Annotation[]) {
+    if (includesKind(annotations, 'question')) return '?';
+    if (includesKind(annotations, 'suggestion')) return '↗';
+    return '●';
+  }
+  function kindLabel(kind: AnnotationKind) {
+    if (kind === 'file_note') return 'File note';
+    if (kind === 'review_note') return 'Review note';
+    return `${kind.slice(0, 1).toUpperCase()}${kind.slice(1)}`;
+  }
+  function kindSummary(annotations: Annotation[]) {
+    const counts = new Map<AnnotationKind, number>();
+    for (const annotation of annotations) counts.set(annotation.kind, (counts.get(annotation.kind) ?? 0) + 1);
+    return [...counts.entries()].map(([kind, count]) => `${count} ${kindLabel(kind).toLowerCase()}${count === 1 ? '' : 's'}`).join(', ');
+  }
+  function threadToggleLabel(row: DiffRow, side: DiffSide, annotations: Annotation[]) {
+    const line = sourceLine(row, side);
+    const action = expandedThreadKey === threadKey(row, side) ? 'Hide' : 'Show';
+    return `${action} ${annotations.length} ${annotations.length === 1 ? 'annotation' : 'annotations'} (${kindSummary(annotations)}) at ${side} line ${line ?? ''}`;
+  }
+  function annotationRangeLabel(annotation: Annotation) {
+    return `${annotation.side} line${annotation.startLine === annotation.endLine ? '' : 's'} ${annotation.startLine}${annotation.endLine === annotation.startLine ? '' : `–${annotation.endLine}`}`;
+  }
+  function toggleThread(row: DiffRow, side: DiffSide) {
+    const key = threadKey(row, side);
+    expandedThreadKey = expandedThreadKey === key ? undefined : key;
+  }
+  function threadNavigationKey(row: DiffRow, side: DiffSide, event: KeyboardEvent) {
+    const line = sourceLine(row, side);
+    if (!line || (event.key !== 'ArrowDown' && event.key !== 'ArrowUp')) return;
+    event.preventDefault();
+    void focusAdjacent(side, line, event.key === 'ArrowDown' ? 1 : -1);
+  }
+  function addInlineAnnotation(row: DiffRow, side: DiffSide) {
+    const selection = selectionAt(row, side, false);
+    if (!selection) return;
+    rangeAnchor = { side, line: selection.startLine };
+    expandedThreadKey = undefined;
+    onAnnotate(row, selection);
+  }
+  function editInlineAnnotation(annotation: Annotation) {
+    expandedThreadKey = undefined;
+    onEditAnnotation(annotation);
   }
   function anchorLineFor(side: DiffSide) {
     if (rangeAnchor?.side === side) return rangeAnchor.line;
@@ -298,33 +379,81 @@
 
 <svelte:window on:pointerup={finishRange} on:pointercancel={() => rangeDrag = undefined} />
 
-{#if mode === 'difftastic'}
-  <div class="structural-notice" role="status">
-    <span class="spark">✦</span>
-    <span><strong>Structural diff</strong> · Backend Difftastic adapter · {difftastic?.display === 'inline' ? 'inline' : 'side-by-side'} · {difftastic?.status ?? 'loading'} · Read-only</span>
-    {#if difftastic?.fallback}
-      <span class="difftastic-fallback">Fallback: {difftastic.fallback.reason}</span>
-    {:else}
-      <span class="muted">Pinned normalized output. Canonical anchors stay authoritative.</span>
-    {/if}
-    <span class="structural-actions"><button on:click={() => returnCanonical('unified')}>Show Unified</button><button on:click={() => returnCanonical('split')}>Split</button><button on:click={() => returnCanonical('full')}>Full file</button></span>
-  </div>
-{/if}
+{#snippet threadToggle(row: DiffRow, side: DiffSide, annotations: Annotation[], covered: Annotation[])}
+  <button
+    class="annotation-gutter annotation-thread-toggle"
+    class:annotation-range-cell={covered.length > 0}
+    class:question-annotation-range-cell={includesKind(covered, 'question')}
+    class:question-thread={includesKind(annotations, 'question')}
+    class:suggestion-thread={includesKind(annotations, 'suggestion') && !includesKind(annotations, 'question')}
+    data-side={side}
+    data-line={sourceLine(row, side)}
+    aria-label={threadToggleLabel(row, side, annotations)}
+    aria-expanded={expandedThreadKey === threadKey(row, side)}
+    aria-controls={threadId(row, side)}
+    on:focus={() => { const line = sourceLine(row, side); if (line) focusedLocation = { side, line }; }}
+    on:click|stopPropagation={() => toggleThread(row, side)}
+    on:keydown={(event) => threadNavigationKey(row, side, event)}
+  >
+    <span class="thread-kind-glyph" aria-hidden="true">{annotationGlyph(annotations)}</span>
+    {#if annotations.length > 1}<span class="thread-count" aria-hidden="true">{annotations.length}</span>{/if}
+  </button>
+{/snippet}
 
-<!-- svelte-ignore a11y_no_noninteractive_tabindex -- the scroll region is intentionally keyboard-focusable. -->
-<div
-  bind:this={viewport}
-  class:structural={mode === 'difftastic'}
-  class="diff-viewport"
-  use:observe
-  on:scroll={onScroll}
-  on:pointermove={updateSplit}
-  on:pointerup={stopSplit}
-  on:pointercancel={stopSplit}
-  aria-label={mode === 'difftastic' ? 'Read-only structural code diff' : 'Code diff'}
-  role="region"
-  tabindex="0"
->
+{#snippet threadPanel(row: DiffRow, side: DiffSide, annotations: Annotation[])}
+  <aside id={threadId(row, side)} class="inline-thread-popover side-{side}" aria-label={`${annotations.length} inline ${annotations.length === 1 ? 'annotation' : 'annotations'} at ${side} line ${sourceLine(row, side) ?? ''}`}>
+    <header>
+      <strong>{annotations.length} {annotations.length === 1 ? 'annotation' : 'annotations'}</strong>
+      <span>{side} line {sourceLine(row, side)}</span>
+      <button class="inline-thread-close" aria-label="Collapse inline annotations" on:click={() => expandedThreadKey = undefined}>×</button>
+    </header>
+    <div class="inline-thread-items">
+      {#each annotations as annotation (annotation.id)}
+        <article class="inline-thread-item kind-{annotation.kind}" class:resolved={annotation.state === 'resolved'} class:outdated={annotation.state === 'outdated'}>
+          <div class="inline-thread-meta">
+            <span class="inline-thread-kind {annotation.kind}">{kindLabel(annotation.kind)}</span>
+            <span>{annotationRangeLabel(annotation)}</span>
+            {#if annotation.state !== 'open'}<span class="inline-thread-state">{annotation.state}</span>{/if}
+            {#if annotation.publishedId}<span class="inline-thread-state published">published</span>{:else if annotation.localOnly}<span class="inline-thread-state">local only</span>{/if}
+          </div>
+          <p>{annotation.body}</p>
+          {#if annotation.labels.length}<div class="inline-thread-labels">{#each annotation.labels as label}<span>{label}</span>{/each}</div>{/if}
+          <footer><button disabled={!annotationsEditable} on:click={() => editInlineAnnotation(annotation)}>Edit</button></footer>
+        </article>
+      {/each}
+    </div>
+    <footer class="inline-thread-actions"><button disabled={!annotationsEditable} on:click={() => addInlineAnnotation(row, side)}>Add another annotation</button></footer>
+  </aside>
+{/snippet}
+
+<div class="diff-presentation" class:structural-presentation={mode === 'difftastic'}>
+  {#if mode === 'difftastic'}
+    <div class="structural-notice" role="status">
+      <span class="spark">✦</span>
+      <span><strong>Structural diff</strong> · Backend Difftastic adapter · {difftastic?.display === 'inline' ? 'inline' : 'side-by-side'} · {difftastic?.status ?? 'loading'} · Read-only</span>
+      {#if difftastic?.fallback}
+        <span class="difftastic-fallback">Fallback: {difftastic.fallback.reason}</span>
+      {:else}
+        <span class="muted">Pinned normalized output. Canonical anchors stay authoritative.</span>
+      {/if}
+      <span class="structural-actions"><button on:click={() => returnCanonical('unified')}>Show Unified</button><button on:click={() => returnCanonical('split')}>Split</button><button on:click={() => returnCanonical('full')}>Full file</button></span>
+    </div>
+  {/if}
+
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex -- the scroll region is intentionally keyboard-focusable. -->
+  <div
+    bind:this={viewport}
+    class:structural={mode === 'difftastic'}
+    class="diff-viewport"
+    use:observe
+    on:scroll={onScroll}
+    on:pointermove={updateSplit}
+    on:pointerup={stopSplit}
+    on:pointercancel={stopSplit}
+    aria-label={mode === 'difftastic' ? 'Read-only structural code diff' : 'Code diff'}
+    role="region"
+    tabindex="0"
+  >
   {#if displayedSelection && mode !== 'difftastic'}
     <div class="inline-composer-anchor" role="status" aria-live="polite">
       <span>{rangeDrag ? 'Selecting' : 'Draft attached to'} {displayedSelection.side} lines {displayedSelection.startLine}{displayedSelection.endLine === displayedSelection.startLine ? '' : `–${displayedSelection.endLine}`} · {composerKind}</span>
@@ -342,16 +471,35 @@
         {#if row.kind === 'header'}
           {@const hunk = hunks.find((entry) => entry.id === row.hunkId || entry.id === row.id)}
           <div class="hunk-row" role="group" aria-label={`Repository ${repositoryName}, file ${filePath}, collapsed hunk ${row.hunk ?? ''}`} style:height={`${rowHeight}px`}><span>{row.hunk}</span><button aria-label={`Expand context for ${row.hunk ?? 'hunk'}`} on:click={() => hunk && onExpandHunk(hunk)}>⋯ <span class="visually-hidden">Expand context</span></button></div>
+        {:else if mode === 'full' && row.kind === 'deletion_gate' && row.deletionBlockId}
+          <div class="diff-row deletion-gate-row" class:has-annotation={row.hasAnnotation} class:expanded={row.deletionExpanded} role="group" aria-label={`Repository ${repositoryName}, file ${filePath}, Full File Current diff. ${row.deletionCount ?? 0} deleted Base ${(row.deletionCount ?? 0) === 1 ? 'line' : 'lines'}, lines ${row.oldLine ?? ''}${row.oldEndLine && row.oldEndLine !== row.oldLine ? `–${row.oldEndLine}` : ''}, ${row.deletionExpanded ? 'expanded' : 'collapsed'}.${row.hasAnnotation ? ' Contains annotations.' : ''}`} style:height={`${rowHeight}px`}>
+            <span class="annotation-gutter deletion-gate-annotation" aria-hidden="true">{row.hasAnnotation ? '●' : ''}</span>
+            <button class="deletion-gate-toggle" aria-expanded={row.deletionExpanded ?? false} aria-label={`${row.deletionExpanded ? 'Hide' : 'Show'} ${row.deletionCount ?? 0} deleted ${(row.deletionCount ?? 0) === 1 ? 'line' : 'lines'}, Base lines ${row.oldLine ?? ''}${row.oldEndLine && row.oldEndLine !== row.oldLine ? `–${row.oldEndLine}` : ''}${row.hasAnnotation ? (row.deletionExpanded ? ', contains annotations' : ', annotations hidden in this collapsed range') : ''}`} disabled={!annotationsEditable} on:click={() => onToggleDeletionBlock(row.deletionBlockId!)}>{row.deletionExpanded ? '⌄' : '›'} {row.deletionCount ?? 0} deleted {(row.deletionCount ?? 0) === 1 ? 'line' : 'lines'} · Base {row.oldLine ?? ''}{row.oldEndLine && row.oldEndLine !== row.oldLine ? `–${row.oldEndLine}` : ''}{row.hasAnnotation ? (row.deletionExpanded ? ' · contains annotations' : ' · annotations hidden') : ''}</button>
+          </div>
         {:else if mode === 'split'}
-          <div class:active={lineFor(row) === activeLine} class:added={row.kind === 'addition'} class:removed={row.kind === 'deletion'} class="diff-row split-row" role="group" aria-label={rowLabel(row, ['old', 'new'])} style:height={`${rowHeight}px;--split-ratio:${splitRatio}`}>
-            <button class:composer-range-cell-old={isComposerRange(row, 'old', displayedSelection)} class="annotation-gutter" data-side="old" data-line={row.oldLine} aria-label={`Add annotation at old line ${row.oldLine ?? ''}`} aria-pressed={isComposerRange(row, 'old', displayedSelection)} disabled={!row.oldLine} on:focus={() => row.oldLine && (focusedLocation = { side: 'old', line: row.oldLine })} on:pointerdown={(event) => beginRange(row, 'old', event)} on:pointerenter={() => extendRange(row, 'old')} on:click={(event) => clickRange(row, 'old', event)} on:keydown={(event) => annotationKey(row, 'old', event)}>+</button>
-            <span class:composer-range-cell-old={isComposerRange(row, 'old', displayedSelection)} class="line-number">{row.oldLine ?? ''}</span><span class:composer-range-cell-old={isComposerRange(row, 'old', displayedSelection)} class="marker">{row.kind === 'deletion' ? '−' : ''}</span>
-            <code class:composer-range-cell-old={isComposerRange(row, 'old', displayedSelection)}>{#each safeSyntaxSegments(code(row, 'old'), sourceStart(row, 'old'), tokensFor('old')) as segment}<span class:syntax-token={segment.class} class={`syntax-${segment.class ?? 'plain'}`}>{segment.text}</span>{/each}</code>
+          {@const oldCovered = annotationsForRow(row, 'old')}
+          {@const newCovered = annotationsForRow(row, 'new')}
+          {@const oldThreads = anchoredAnnotations(row, 'old', oldCovered)}
+          {@const newThreads = anchoredAnnotations(row, 'new', newCovered)}
+          <div class:active={lineFor(row) === activeLine} class:added={row.kind === 'addition'} class:removed={row.kind === 'deletion'} class:thread-expanded={expandedThreadKey === threadKey(row, 'old') || expandedThreadKey === threadKey(row, 'new')} class="diff-row split-row" role="group" aria-label={rowLabel(row, ['old', 'new'])} style:height={`${rowHeight}px;--split-ratio:${splitRatio}`}>
+            {#if oldThreads.length}
+              {@render threadToggle(row, 'old', oldThreads, oldCovered)}
+            {:else}
+              <button class:composer-range-cell-old={isComposerRange(row, 'old', displayedSelection)} class:annotation-range-cell={oldCovered.length > 0} class:question-annotation-range-cell={includesKind(oldCovered, 'question')} class="annotation-gutter" data-side="old" data-line={row.oldLine} aria-label={`Add annotation at old line ${row.oldLine ?? ''}`} aria-pressed={isComposerRange(row, 'old', displayedSelection)} disabled={!row.oldLine} on:focus={() => row.oldLine && (focusedLocation = { side: 'old', line: row.oldLine })} on:pointerdown={(event) => beginRange(row, 'old', event)} on:pointerenter={() => extendRange(row, 'old')} on:click={(event) => clickRange(row, 'old', event)} on:keydown={(event) => annotationKey(row, 'old', event)}>+</button>
+            {/if}
+            <span class:composer-range-cell-old={isComposerRange(row, 'old', displayedSelection)} class:annotation-range-cell={oldCovered.length > 0} class:question-annotation-range-cell={includesKind(oldCovered, 'question')} class="line-number">{row.oldLine ?? ''}</span><span class:composer-range-cell-old={isComposerRange(row, 'old', displayedSelection)} class:annotation-range-cell={oldCovered.length > 0} class:question-annotation-range-cell={includesKind(oldCovered, 'question')} class="marker">{row.kind === 'deletion' ? '−' : ''}</span>
+            <code class:composer-range-cell-old={isComposerRange(row, 'old', displayedSelection)} class:annotation-range-cell={oldCovered.length > 0} class:question-annotation-range-cell={includesKind(oldCovered, 'question')}>{#each safeSyntaxSegments(code(row, 'old'), sourceStart(row, 'old'), tokensFor('old')) as segment}<span class:syntax-token={segment.class} class={`syntax-${segment.class ?? 'plain'}`}>{segment.text}</span>{/each}</code>
             <!-- svelte-ignore a11y_no_interactive_element_to_noninteractive_role -- separator is deliberately keyboard-operable -->
             <button class="split-divider" role="separator" aria-orientation="vertical" aria-label="Resize split diff" aria-valuemin="25" aria-valuemax="75" aria-valuenow={Math.round(splitRatio * 100)} on:pointerdown={startSplit} on:keydown={resizeSplitKey}></button>
-            <button class:composer-range-cell-new={isComposerRange(row, 'new', displayedSelection)} class="annotation-gutter" data-side="new" data-line={row.newLine} aria-label={`Add annotation at new line ${row.newLine ?? ''}`} aria-pressed={isComposerRange(row, 'new', displayedSelection)} disabled={!row.newLine} on:focus={() => row.newLine && (focusedLocation = { side: 'new', line: row.newLine })} on:pointerdown={(event) => beginRange(row, 'new', event)} on:pointerenter={() => extendRange(row, 'new')} on:click={(event) => clickRange(row, 'new', event)} on:keydown={(event) => annotationKey(row, 'new', event)}>+</button>
-            <span class:composer-range-cell-new={isComposerRange(row, 'new', displayedSelection)} class="line-number">{row.newLine ?? ''}</span><span class:composer-range-cell-new={isComposerRange(row, 'new', displayedSelection)} class="marker">{row.kind === 'addition' ? '+' : ''}</span>
-            <code class:composer-range-cell-new={isComposerRange(row, 'new', displayedSelection)}>{#each safeSyntaxSegments(code(row, 'new'), sourceStart(row, 'new'), tokensFor('new')) as segment}<span class:syntax-token={segment.class} class={`syntax-${segment.class ?? 'plain'}`}>{segment.text}</span>{/each}</code>
+            {#if newThreads.length}
+              {@render threadToggle(row, 'new', newThreads, newCovered)}
+            {:else}
+              <button class:composer-range-cell-new={isComposerRange(row, 'new', displayedSelection)} class:annotation-range-cell={newCovered.length > 0} class:question-annotation-range-cell={includesKind(newCovered, 'question')} class="annotation-gutter" data-side="new" data-line={row.newLine} aria-label={`Add annotation at new line ${row.newLine ?? ''}`} aria-pressed={isComposerRange(row, 'new', displayedSelection)} disabled={!row.newLine} on:focus={() => row.newLine && (focusedLocation = { side: 'new', line: row.newLine })} on:pointerdown={(event) => beginRange(row, 'new', event)} on:pointerenter={() => extendRange(row, 'new')} on:click={(event) => clickRange(row, 'new', event)} on:keydown={(event) => annotationKey(row, 'new', event)}>+</button>
+            {/if}
+            <span class:composer-range-cell-new={isComposerRange(row, 'new', displayedSelection)} class:annotation-range-cell={newCovered.length > 0} class:question-annotation-range-cell={includesKind(newCovered, 'question')} class="line-number">{row.newLine ?? ''}</span><span class:composer-range-cell-new={isComposerRange(row, 'new', displayedSelection)} class:annotation-range-cell={newCovered.length > 0} class:question-annotation-range-cell={includesKind(newCovered, 'question')} class="marker">{row.kind === 'addition' ? '+' : ''}</span>
+            <code class:composer-range-cell-new={isComposerRange(row, 'new', displayedSelection)} class:annotation-range-cell={newCovered.length > 0} class:question-annotation-range-cell={includesKind(newCovered, 'question')}>{#each safeSyntaxSegments(code(row, 'new'), sourceStart(row, 'new'), tokensFor('new')) as segment}<span class:syntax-token={segment.class} class={`syntax-${segment.class ?? 'plain'}`}>{segment.text}</span>{/each}</code>
+            {#if expandedThreadKey === threadKey(row, 'old')}{@render threadPanel(row, 'old', oldThreads)}{/if}
+            {#if expandedThreadKey === threadKey(row, 'new')}{@render threadPanel(row, 'new', newThreads)}{/if}
           </div>
         {:else if mode === 'difftastic' && difftastic?.display === 'inline'}
           {@const oldCell = structuralCell(row, 'old')}
@@ -367,15 +515,23 @@
           </div>
         {:else}
           {@const displaySide = mode === 'full' ? (fullFileSide === 'new' && !row.newLine ? 'old' : fullFileSide === 'old' && !row.oldLine ? 'new' : fullFileSide) : (row.kind === 'deletion' ? 'old' : 'new')}
-          <div class:active={lineFor(row) === activeLine} class:composer-range={isComposerRange(row, displaySide, displayedSelection)} class:added={row.kind === 'addition'} class:removed={row.kind === 'deletion'} class="diff-row" role="group" aria-label={rowLabel(row, [displaySide])} style:height={`${rowHeight}px`}>
-            <button class="annotation-gutter" data-side={displaySide} data-line={displaySide === 'old' ? row.oldLine : row.newLine} aria-label={`Add annotation at ${displaySide} line ${displaySide === 'old' ? row.oldLine ?? '' : row.newLine ?? ''}`} aria-pressed={isComposerRange(row, displaySide, displayedSelection)} disabled={displaySide === 'old' ? !row.oldLine : !row.newLine} on:focus={() => { const line = displaySide === 'old' ? row.oldLine : row.newLine; if (line) focusedLocation = { side: displaySide, line }; }} on:pointerdown={(event) => beginRange(row, displaySide, event)} on:pointerenter={() => extendRange(row, displaySide)} on:click={(event) => clickRange(row, displaySide, event)} on:keydown={(event) => annotationKey(row, displaySide, event)}>+</button>
+          {@const covered = annotationsForRow(row, displaySide)}
+          {@const threads = anchoredAnnotations(row, displaySide, covered)}
+          <div class:active={lineFor(row) === activeLine} class:composer-range={isComposerRange(row, displaySide, displayedSelection)} class:annotation-range={covered.length > 0} class:question-annotation-range={includesKind(covered, 'question')} class:thread-expanded={expandedThreadKey === threadKey(row, displaySide)} class:added={row.kind === 'addition'} class:removed={row.kind === 'deletion'} class="diff-row" role="group" aria-label={rowLabel(row, [displaySide])} style:height={`${rowHeight}px`}>
+            {#if threads.length}
+              {@render threadToggle(row, displaySide, threads, covered)}
+            {:else}
+              <button class="annotation-gutter" data-side={displaySide} data-line={displaySide === 'old' ? row.oldLine : row.newLine} aria-label={`Add annotation at ${displaySide} line ${displaySide === 'old' ? row.oldLine ?? '' : row.newLine ?? ''}`} aria-pressed={isComposerRange(row, displaySide, displayedSelection)} disabled={displaySide === 'old' ? !row.oldLine : !row.newLine} on:focus={() => { const line = displaySide === 'old' ? row.oldLine : row.newLine; if (line) focusedLocation = { side: displaySide, line }; }} on:pointerdown={(event) => beginRange(row, displaySide, event)} on:pointerenter={() => extendRange(row, displaySide)} on:click={(event) => clickRange(row, displaySide, event)} on:keydown={(event) => annotationKey(row, displaySide, event)}>+</button>
+            {/if}
             <span class="line-number old">{mode === 'full' && displaySide === 'old' ? row.oldLine ?? '' : (mode === 'full' ? '' : row.oldLine ?? '')}</span>
             <span class="line-number new">{mode === 'full' && displaySide === 'old' ? '' : row.newLine ?? ''}</span>
             <span class="marker">{row.kind === 'addition' ? '+' : row.kind === 'deletion' ? '−' : ' '}</span>
             <code>{#each safeSyntaxSegments(code(row, displaySide), sourceStart(row, displaySide), tokensFor(displaySide)) as segment}<span class:syntax-token={segment.class} class={`syntax-${segment.class ?? 'plain'}`}>{segment.text}</span>{/each}</code>
+            {#if expandedThreadKey === threadKey(row, displaySide)}{@render threadPanel(row, displaySide, threads)}{/if}
           </div>
         {/if}
       {/each}
     </div>
+  </div>
   </div>
 </div>

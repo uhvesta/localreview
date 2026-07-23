@@ -105,6 +105,7 @@ pub struct FocusWorkspaceRequest {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PartialReviewSettings {
+    pub last_workspace_id: Option<String>,
     pub font_scale: Option<f64>,
     pub left_width: Option<u32>,
     pub right_width: Option<u32>,
@@ -812,14 +813,21 @@ pub fn start_new_review(
 }
 
 #[tauri::command]
-pub fn refresh_review(
+pub async fn refresh_review(
     workspace_id: String,
     request: Option<StartOrRefreshInput>,
     state: State<'_, AppState>,
 ) -> Result<ReviewData, ApiError> {
-    state
-        .controller
-        .refresh_review(parse_workspace(&workspace_id)?, request.unwrap_or_default())
+    let workspace_id = parse_workspace(&workspace_id)?;
+    let request = request.unwrap_or_default();
+    let controller = std::sync::Arc::clone(&state.controller);
+    tauri::async_runtime::spawn_blocking(move || controller.refresh_review(workspace_id, request))
+        .await
+        .map_err(|error| ApiError {
+            code: "refresh_worker_failed",
+            message: format!("refresh worker stopped unexpectedly: {error}"),
+            recovery_preview_token: None,
+        })?
         .map_err(ApiError::from)
 }
 
@@ -916,6 +924,9 @@ pub fn save_ui_settings(
     state: State<'_, AppState>,
 ) -> Result<ReviewSettings, ApiError> {
     let mut merged = state.controller.get_settings().map_err(ApiError::from)?;
+    if let Some(value) = settings.last_workspace_id {
+        merged.last_workspace_id = Some(value);
+    }
     if let Some(value) = settings.font_scale {
         merged.font_scale = value;
     }
@@ -1413,7 +1424,11 @@ mod tests {
             ("workspace".into(), "file".into(), Some(19))
         );
         let settings: PartialReviewSettings =
-            serde_json::from_str(r#"{"fontScale":1.2,"leftCollapsed":true,"theme":"light","codeFont":"JetBrains Mono","tabWidth":4,"showWhitespace":true,"vimNavigation":true,"shortcuts":{"nextHunk":"Alt+J"}}"#).unwrap();
+            serde_json::from_str(r#"{"lastWorkspaceId":"workspace-last","fontScale":1.2,"leftCollapsed":true,"theme":"light","codeFont":"JetBrains Mono","tabWidth":4,"showWhitespace":true,"vimNavigation":true,"shortcuts":{"nextHunk":"Alt+J"}}"#).unwrap();
+        assert_eq!(
+            settings.last_workspace_id.as_deref(),
+            Some("workspace-last")
+        );
         assert_eq!(settings.font_scale, Some(1.2));
         assert_eq!(settings.left_collapsed, Some(true));
         assert_eq!(settings.theme.as_deref(), Some("light"));
@@ -1454,5 +1469,25 @@ mod tests {
         ));
         assert_eq!(pending.code, "github_publication_reconciliation_pending");
         assert_eq!(pending.recovery_preview_token.as_deref(), Some("preview-1"));
+    }
+
+    #[test]
+    fn refresh_command_stays_async_and_offloads_blocking_controller_work() {
+        // Tauri executes a synchronous command body inline in invoke dispatch.
+        // Keep this small source-level contract beside the invoke-name contract
+        // so a future signature cleanup cannot silently put Git capture back on
+        // the WebView/event-loop path.
+        let source = include_str!("api.rs");
+        let start = source
+            .find("pub async fn refresh_review(")
+            .expect("refresh_review must remain an async Tauri command");
+        let tail = &source[start..];
+        let end = tail
+            .find("\n#[tauri::command]")
+            .expect("refresh_review should be followed by another command");
+        let body = &tail[..end];
+        assert!(body.contains("Arc::clone(&state.controller)"));
+        assert!(body.contains("spawn_blocking(move ||"));
+        assert!(body.contains("refresh_worker_failed"));
     }
 }

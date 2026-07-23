@@ -277,10 +277,15 @@ impl fmt::Display for GitSha {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ComparisonOptions {
+    #[serde(alias = "ignoreAllWhitespace")]
     pub ignore_all_whitespace: bool,
+    #[serde(alias = "ignoreSpaceAtEol")]
     pub ignore_space_at_eol: bool,
+    #[serde(alias = "ignoreCrAtEol")]
     pub ignore_cr_at_eol: bool,
+    #[serde(alias = "pathFilters")]
     pub path_filters: Vec<StoredPath>,
 }
 

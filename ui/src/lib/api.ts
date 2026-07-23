@@ -96,14 +96,14 @@ const repositories: Repository[] = [
 ];
 
 const files: ReviewFile[] = [
-  { id: 'file-app', repositoryId: 'repo-desktop', path: 'ui/src/App.svelte', status: 'modified', additions: 76, deletions: 12, language: 'Svelte', viewed: true, annotationCount: 2, classification: emptyClassification() },
-  { id: 'file-api', repositoryId: 'repo-desktop', path: 'ui/src/lib/api.ts', status: 'added', additions: 214, deletions: 0, language: 'TypeScript', viewed: true, annotationCount: 1, classification: emptyClassification() },
-  { id: 'file-types', repositoryId: 'repo-desktop', path: 'ui/src/lib/types.ts', status: 'modified', additions: 18, deletions: 5, language: 'TypeScript', viewed: false, annotationCount: 0, classification: emptyClassification() },
-  { id: 'file-core', repositoryId: 'repo-core', path: 'src/review/session.rs', status: 'modified', additions: 41, deletions: 9, language: 'Rust', viewed: false, annotationCount: 0, classification: emptyClassification() },
-  { id: 'file-model', repositoryId: 'repo-core', path: 'src/diff/model.rs', status: 'renamed', previousPath: 'src/diff/rows.rs', additions: 104, deletions: 42, language: 'Rust', viewed: false, annotationCount: 0, classification: emptyClassification() },
-  { id: 'file-protocol', repositoryId: 'repo-protocol', path: 'src/messages.rs', status: 'untracked', additions: 58, deletions: 0, language: 'Rust', viewed: false, annotationCount: 0, classification: { ...emptyClassification(), generated: true } },
-  { id: 'file-test', repositoryId: 'repo-desktop', path: 'ui/src/lib/virtual.test.ts', status: 'added', additions: 36, deletions: 0, language: 'TypeScript', viewed: true, annotationCount: 0, classification: emptyClassification() },
-  { id: 'file-spec', repositoryId: 'repo-desktop', path: 'PRODUCT_SPEC.md', status: 'modified', additions: 9, deletions: 2, language: 'Markdown', viewed: false, annotationCount: 0, classification: { ...emptyClassification(), lockfile: true } }
+  { id: 'file-app', repositoryId: 'repo-desktop', path: 'ui/src/App.svelte', status: 'modified', additions: 76, deletions: 12, hunkCount: 2, language: 'Svelte', viewed: true, annotationCount: 2, classification: emptyClassification() },
+  { id: 'file-api', repositoryId: 'repo-desktop', path: 'ui/src/lib/api.ts', status: 'added', additions: 214, deletions: 0, hunkCount: 1, language: 'TypeScript', viewed: true, annotationCount: 1, classification: emptyClassification() },
+  { id: 'file-types', repositoryId: 'repo-desktop', path: 'ui/src/lib/types.ts', status: 'modified', additions: 18, deletions: 5, hunkCount: 1, language: 'TypeScript', viewed: false, annotationCount: 0, classification: emptyClassification() },
+  { id: 'file-core', repositoryId: 'repo-core', path: 'src/review/session.rs', status: 'modified', additions: 41, deletions: 9, hunkCount: 1, language: 'Rust', viewed: false, annotationCount: 0, classification: emptyClassification() },
+  { id: 'file-model', repositoryId: 'repo-core', path: 'src/diff/model.rs', status: 'renamed', previousPath: 'src/diff/rows.rs', additions: 104, deletions: 42, hunkCount: 1, language: 'Rust', viewed: false, annotationCount: 0, classification: emptyClassification() },
+  { id: 'file-protocol', repositoryId: 'repo-protocol', path: 'src/messages.rs', status: 'untracked', additions: 58, deletions: 0, hunkCount: 1, language: 'Rust', viewed: false, annotationCount: 0, classification: { ...emptyClassification(), generated: true } },
+  { id: 'file-test', repositoryId: 'repo-desktop', path: 'ui/src/lib/virtual.test.ts', status: 'added', additions: 36, deletions: 0, hunkCount: 1, language: 'TypeScript', viewed: true, annotationCount: 0, classification: emptyClassification() },
+  { id: 'file-spec', repositoryId: 'repo-desktop', path: 'PRODUCT_SPEC.md', status: 'modified', additions: 9, deletions: 2, hunkCount: 1, language: 'Markdown', viewed: false, annotationCount: 0, classification: { ...emptyClassification(), lockfile: true } }
 ];
 
 function emptyClassification() {

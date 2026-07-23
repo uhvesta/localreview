@@ -236,3 +236,17 @@ fn present_startup_error(title: &str, message: &str) {
         .set_buttons(rfd::MessageButtons::Ok)
         .show();
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn packaged_main_window_is_visible_on_direct_launch() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(
+            config["app"]["windows"][0]["visible"],
+            serde_json::Value::Bool(true),
+            "the packaged app must not depend on a later activation event to reveal its main window"
+        );
+    }
+}

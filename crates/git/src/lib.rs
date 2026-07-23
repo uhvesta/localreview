@@ -200,6 +200,12 @@ impl GitExecutor for ProcessGitExecutor {
     fn execute(&self, command: &GitCommand) -> Result<GitOutput, GitError> {
         let output = Command::new("git")
             .current_dir(&command.working_directory)
+            // Read-only status/diff commands otherwise may refresh the index
+            // stat cache. A recursive worktree watcher can mistake that
+            // administrative write for source newer than the capture it just
+            // produced. Mutating commands such as explicit fetch still take
+            // their required locks; this disables only optional lock-taking.
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .args(&command.arguments)
             .output()
             .map_err(|source| GitError::Spawn {
@@ -325,6 +331,33 @@ impl<E: GitExecutor> GitRepository<E> {
             primary_remote: origin_url,
             head: branch,
         })
+    }
+
+    /// Returns the locally recorded default branch for `origin` without
+    /// fetching or changing any ref. A missing `origin/HEAD` is normal and is
+    /// represented as `None` so setup can offer guidance only when Git has an
+    /// authoritative suggestion.
+    pub fn primary_remote_head(&self) -> Result<Option<String>, GitError> {
+        let output = self.execute(self.command([
+            "symbolic-ref",
+            "-q",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ]))?;
+        if !output.success() {
+            return Ok(None);
+        }
+        let reference = output.stdout_trimmed();
+        if reference.starts_with("origin/")
+            && reference.len() <= 512
+            && !reference.chars().any(char::is_control)
+        {
+            Ok(Some(reference))
+        } else {
+            Err(GitError::Parse(
+                "origin/HEAD did not resolve to a safe remote branch".into(),
+            ))
+        }
     }
 
     /// Resolves GitHub Linguist's per-path language override using Git's own

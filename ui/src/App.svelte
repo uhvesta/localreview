@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { flushSync, onMount } from 'svelte';
   import { isTauri } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import WorkspaceRail from './lib/WorkspaceRail.svelte';
@@ -50,6 +50,7 @@
   let presentation: DiffPresentationWindow | undefined;
   let viewportGeneration = 0;
   let jumpToRow: number | undefined;
+  let jumpGeneration = 0;
   let fullFileSide: FullFileSide = 'new';
   let splitRatio = .5;
   let nearestSourceLine: number | undefined;
@@ -79,6 +80,19 @@
   let settings: ReviewSettings = { fontScale: 1, leftWidth: 244, rightWidth: 332, leftCollapsed: false, rightCollapsed: false, fetchOnReview: false, theme: 'dark', codeFont: 'SF Mono', externalEditor: 'system', tabWidth: 2, showWhitespace: false, vimNavigation: false, shortcuts: {} };
   let zoomToast = '';
   let busy = false;
+  type RefreshStage = 'capturing' | 'preparing' | 'updated' | 'failed';
+  type WorkspaceRefreshState = {
+    operationId: number;
+    stage: RefreshStage;
+    fetchBeforeCapture: boolean;
+    fileCount?: number;
+    partial?: boolean;
+  };
+  let refreshStates: Record<string, WorkspaceRefreshState> = {};
+  let refreshOperationId = 0;
+  const refreshOutcomeTimers = new Map<string, number>();
+  let workspaceSelectionGeneration = 0;
+  const refreshAvailabilityVersions = new Map<string, { revision: number; available: boolean }>();
   let statusMessage = 'Snapshot captured · local refs only';
   let composer: AnnotationComposer | undefined;
   let prompt: PromptPreview | undefined;
@@ -117,12 +131,15 @@
   let showBaselines = false;
   let workspaceBase = 'origin/master';
   let repositoryBases: Record<string, string> = {};
+  let repositoryEnabled: Record<string, boolean> = {};
   let repositorySetup: RepositorySetup[] = [];
+  let includedRepositoryCount = 0;
   let selectedSetupRepositoryIds = new Set<string>();
   let setupOverrideBase = '';
   let setupLoading = false;
   let setupMutating = false;
   let setupError = '';
+  let setupAutoBaseNotice = '';
   let comparisonOptions: ComparisonOptions = { ignoreAllWhitespace: false, ignoreSpaceAtEol: false, ignoreCrAtEol: false };
   let showBlame = false;
   let blameResult: CapturedBlameResult | undefined;
@@ -142,6 +159,7 @@
   let resizeSide: 'left' | 'right' | undefined;
   let undoCheckpoint: { annotations: Annotation[]; files: ReviewData['files'] } | undefined;
   let selectedAnnotationIds = new Set<string>();
+  let expandedFullFileDeletionBlocks = new Set<string>();
   let activeAnnotationId: string | undefined;
   let editingAnnotationId: string | undefined;
   let showCommandPalette = false;
@@ -164,6 +182,10 @@
   let settingsSaveChain: Promise<void> = Promise.resolve();
   let uiStateSaveChain: Promise<void> = Promise.resolve();
   let composerDraftSaveChain: Promise<void> = Promise.resolve();
+  // Hunk moves can cross files and therefore perform several awaited native
+  // reads/writes. Serialize explicit presses so a rapid double press advances
+  // twice from the first result instead of racing two stale file snapshots.
+  let hunkNavigationChain: Promise<void> = Promise.resolve();
   let settingsRevision = 0;
   let finishPreviewGeneration = 0;
   const commandItems: Array<{ label: string; shortcut: string; run: () => void }> = [
@@ -181,6 +203,18 @@
 
   $: activeFile = review?.files.find((file) => file.id === activeFileId);
   $: activeRepo = review?.repositories.find((repository) => repository.id === activeFile?.repositoryId);
+  $: displayRepo = activeRepo ?? (review?.files.length === 0 && review.repositories.length === 1 ? review.repositories[0] : undefined);
+  // A deleted file has no current-side source. Keep the user's persisted side
+  // preference for the next file, but never ask the renderer to label the
+  // controller's old-side fallback as "Current".
+  $: fullFileDisplaySide = activeFile?.status === 'deleted' ? 'old' : fullFileSide;
+  $: fullFileExtent = formatFullFileExtent(
+    fullFileDisplaySide,
+    presentation?.mode === 'full' ? presentation.totalRows : undefined,
+    activeFile?.status,
+    activeFile?.deletions ?? 0,
+    presentation?.deletionBlocks ?? []
+  );
   $: shownFiles = sortFiles((review?.files ?? []).filter((file) =>
     (repositoryFilter === 'all' || file.repositoryId === repositoryFilter) &&
     (viewedFilter === 'all' || (viewedFilter === 'viewed' ? file.viewed : !file.viewed)) &&
@@ -190,6 +224,12 @@
     (!changedSincePreviousOnly || changedFileIds.has(file.id)) &&
     fuzzyMatch(`${file.path} ${file.previousPath ?? ''}`, fileSearch)
   ));
+  // A sole filtered result remains navigable when the currently displayed
+  // file is outside the filter; once that result is active there is nowhere
+  // else for previous/next file to go.
+  $: canNavigateShownFiles = shownFiles.length > 1
+    || (shownFiles.length === 1 && shownFiles[0]?.id !== activeFileId);
+  $: canNavigateShownHunks = shownFiles.some((file) => file.hunkCount > 0);
   $: fileLanguages = [...new Set((review?.files ?? []).map((file) => file.language).filter(Boolean))].sort((left, right) => left.localeCompare(right));
   $: changedFileIds = new Set((changedSincePrevious?.files ?? []).filter((file) => file.kind !== 'unchanged').flatMap((file) => file.currentFileId ? [file.currentFileId] : []));
   $: shownAnnotations = (review?.annotations ?? []).filter((annotation) =>
@@ -205,23 +245,49 @@
   $: githubReview = Boolean(review?.workspace.source.includes('github'));
   $: historicalReview = Boolean(review?.historical);
   $: reviewCaptureReady = Boolean(review && review.workspace.reviewReady !== false);
-  $: canMutateReview = Boolean(reviewCaptureReady && !historicalReview);
+  $: activeRefreshState = review ? refreshStates[review.workspace.id] : undefined;
+  $: refreshLocksReview = activeRefreshState?.stage === 'capturing' || activeRefreshState?.stage === 'preparing';
+  $: canMutateReview = Boolean(reviewCaptureReady && !historicalReview && !refreshLocksReview);
   $: canExportReview = Boolean(reviewCaptureReady);
+  $: refreshStageLabel = activeRefreshState?.stage === 'preparing'
+    ? 'Preparing the captured diff'
+    : activeRefreshState?.fetchBeforeCapture
+      ? 'Fetching configured remotes and capturing a snapshot'
+      : 'Capturing a snapshot from local refs';
+  $: refreshButtonLabel = review?.historical
+    ? 'Archived snapshot'
+    : activeRefreshState?.stage === 'capturing'
+      ? 'Capturing…'
+      : activeRefreshState?.stage === 'preparing'
+        ? 'Preparing view…'
+        : activeRefreshState?.stage === 'updated'
+          ? 'Updated'
+          : activeRefreshState?.stage === 'failed'
+            ? activeRefreshState.partial ? 'Refresh incomplete' : 'Refresh failed'
+            : review?.workspace.refreshAvailable
+              ? 'Changes available · Refresh'
+              : 'Refresh';
+  $: refreshButtonAriaLabel = activeRefreshState?.stage === 'updated'
+    ? `Review updated${activeRefreshState.fileCount === undefined ? '' : `, ${activeRefreshState.fileCount} ${activeRefreshState.fileCount === 1 ? 'file' : 'files'}`}`
+    : activeRefreshState?.stage === 'failed'
+      ? activeRefreshState.partial ? 'Refresh incomplete. Review failed repositories and retry refresh' : 'Refresh failed. Retry refresh after reviewing the repository error'
+      : refreshButtonLabel;
+  $: workspaceRefreshStages = Object.fromEntries(Object.entries(refreshStates).map(([workspaceId, state]) => [workspaceId, state.stage]));
   $: selectableFinishAnnotations = (review?.annotations ?? []).filter((annotation) => annotation.state === 'open' && !annotation.publishedId && selectedAnnotationIds.has(annotation.id));
   $: comparisonOptionsSupported = Boolean(review && !review.workspace.source.includes('github'));
-  // Initial setup is the workspace's only valid surface until a capture has
-  // created the first review session. Escape/close attempts therefore return
-  // to setup instead of exposing an inert empty diff.
-  $: if (review?.workspace.reviewReady === false && !showBaselines) showBaselines = true;
   $: layoutStyle = `grid-template-columns:${settings.leftCollapsed ? 0 : settings.leftWidth}px minmax(360px,1fr) ${settings.rightCollapsed ? 0 : settings.rightWidth}px;--font-scale:${settings.fontScale};--left-width:${settings.leftCollapsed ? 0 : settings.leftWidth}px;--right-width:${settings.rightCollapsed ? 0 : settings.rightWidth}px`;
   $: codeFontPercent = Math.round(settings.fontScale * 100);
   $: appTheme = settings.theme;
   $: codeStyle = `font-family:${JSON.stringify(settings.codeFont)}, ui-monospace, SFMono-Regular, Menlo, monospace;tab-size:${settings.tabWidth};--split-ratio:${splitRatio}`;
 
-  function annotationsAt(row: DiffRow, side: DiffSide) {
+  function inlineAnnotationsAt(row: DiffRow, side: DiffSide) {
     const line = side === 'old' ? row.oldLine : row.newLine;
-    if (!review || !activeFile || !line) return 0;
-    return review.annotations.filter((annotation) => annotation.fileId === activeFile.id && annotation.side === side && annotation.startLine <= line && annotation.endLine >= line).length;
+    if (!review || !activeFile || !line) return [];
+    return review.annotations.filter((annotation) => annotation.fileId === activeFile.id && annotation.side === side && annotation.startLine <= line && annotation.endLine >= line);
+  }
+
+  function annotationsAt(row: DiffRow, side: DiffSide) {
+    return inlineAnnotationsAt(row, side).length;
   }
 
   function hasLineAnchor(annotation: Annotation) {
@@ -239,6 +305,18 @@
       cursor += 1;
     }
     return true;
+  }
+
+  function formatFullFileExtent(side: FullFileSide, total: number | undefined, status: ReviewData['files'][number]['status'] | undefined, removed: number, blocks: NonNullable<DiffPresentationWindow['deletionBlocks']>) {
+    // Every deletion block retains one inline gate at its Current-file
+    // anchor; expanded blocks additionally contribute their Base rows.
+    const visibleDeletionRows = blocks.reduce((sum, block) => sum + 1 + (block.expanded ? block.count : 0), 0);
+    const sourceTotal = side === 'new' && total !== undefined ? Math.max(0, total - visibleDeletionRows) : total;
+    const extent = `Entire ${side === 'old' ? 'base' : 'current'} file · ${sourceTotal === undefined ? '…' : sourceTotal.toLocaleString()} ${sourceTotal === 1 ? 'line' : 'lines'}`;
+    if (status === 'deleted') return `${extent} · file deleted; Current has no content`;
+    if (!removed) return extent;
+    const lines = `${removed.toLocaleString()} removed ${removed === 1 ? 'line' : 'lines'}`;
+    return `${extent} · ${side === 'old' ? `${lines} highlighted` : `${lines} in ${blocks.length.toLocaleString()} ${blocks.length === 1 ? 'block' : 'blocks'}`}`;
   }
 
   function classificationMatches(file: ReviewData['files'][number], filter: Exclude<FileClassificationFilter, 'all'>) {
@@ -274,6 +352,31 @@
     return { ...data, files: dedupeFiles(data.files) };
   }
 
+  function mergeRefreshAvailability(incoming: Workspace, existing?: Workspace): Workspace {
+    const incomingRevision = incoming.refreshAvailableRevision ?? 0;
+    const known = refreshAvailabilityVersions.get(incoming.id);
+    const knownRevision = known?.revision
+      ?? existing?.refreshAvailableRevision
+      ?? 0;
+    if (incomingRevision < knownRevision) {
+      return {
+        ...incoming,
+        refreshAvailable: existing?.refreshAvailable ?? known?.available,
+        refreshAvailableRevision: knownRevision
+      };
+    }
+    refreshAvailabilityVersions.set(incoming.id, {
+      revision: incomingRevision,
+      available: Boolean(incoming.refreshAvailable)
+    });
+    return incoming;
+  }
+
+  function mergeWorkspaceList(incoming: Workspace[]) {
+    const existing = new Map(workspaces.map((workspace) => [workspace.id, workspace]));
+    return incoming.map((workspace) => mergeRefreshAvailability(workspace, existing.get(workspace.id)));
+  }
+
   function matchesShortcut(event: KeyboardEvent, configured: string | undefined) {
     if (!configured) return false;
     const parts = configured.toLowerCase().split('+').filter(Boolean);
@@ -294,6 +397,13 @@
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') { closeTopOverlay(); return; }
       if (composer && matchesShortcut(event, settings.shortcuts.saveAnnotation ?? 'Meta+Enter')) { event.preventDefault(); void saveComposer(); return; }
+      const primaryModifier = event.metaKey || event.ctrlKey;
+      // These advertised navigation mappings are stable even if a custom
+      // shortcut is configured with the same chord.
+      if (primaryModifier && !event.altKey && !event.shiftKey && event.key === ']') { event.preventDefault(); nextFile(); return; }
+      if (primaryModifier && !event.altKey && !event.shiftKey && event.key === '[') { event.preventDefault(); previousFile(); return; }
+      if (!primaryModifier && event.altKey && !event.shiftKey && event.key === 'ArrowDown') { event.preventDefault(); nextHunk(); return; }
+      if (!primaryModifier && event.altKey && !event.shiftKey && event.key === 'ArrowUp') { event.preventDefault(); previousHunk(); return; }
       if (matchesShortcut(event, settings.shortcuts.nextHunk ?? 'Alt+ArrowDown')) { event.preventDefault(); nextHunk(); return; }
       if (matchesShortcut(event, settings.shortcuts.previousHunk ?? 'Alt+ArrowUp')) { event.preventDefault(); previousHunk(); return; }
       if (event.altKey && event.key === 'PageDown') { event.preventDefault(); void navigateAnnotation(1); return; }
@@ -314,8 +424,6 @@
       if (event.shiftKey && event.key.toLowerCase() === 'd') { event.preventDefault(); focusDiff(); }
       if (event.shiftKey && event.key.toLowerCase() === 'f') { event.preventDefault(); togglePanel('right'); }
       if (event.shiftKey && event.key.toLowerCase() === 'w') { event.preventDefault(); togglePanel('left'); }
-      if (event.key === ']') { event.preventDefault(); nextFile(); }
-      if (event.key === '[') { event.preventDefault(); previousFile(); }
     };
     const onMove = (event: PointerEvent) => {
       if (!resizeSide) return;
@@ -341,7 +449,7 @@
         void (async () => {
           const loaded = await api.listWorkspaces();
           if (disposed || !loaded.some((workspace) => workspace.id === event.payload.workspaceId)) return;
-          workspaces = loaded;
+          workspaces = mergeWorkspaceList(loaded);
           await selectWorkspace(event.payload.workspaceId!);
           statusMessage = 'Focused workspace opened by LocalReview CLI.';
         })();
@@ -349,10 +457,16 @@
         if (disposed) unlisten();
         else unlistenDesktopOperation = unlisten;
       }).catch((error) => { statusMessage = `Desktop event listener unavailable: ${error instanceof Error ? error.message : 'unknown error'}`; });
-      void listen<{ workspaceId: string }>('localreview://refresh-available', (event) => {
-        const workspaceId = event.payload.workspaceId;
-        workspaces = workspaces.map((workspace) => workspace.id === workspaceId ? { ...workspace, refreshAvailable: true } : workspace);
-        if (review?.workspace.id === workspaceId) review = { ...review, workspace: { ...review.workspace, refreshAvailable: true } };
+      void listen<{ workspaceId: string; refreshAvailable: boolean; revision: number }>('localreview://refresh-available', (event) => {
+        const { workspaceId, refreshAvailable, revision } = event.payload;
+        if (!workspaceId || !Number.isSafeInteger(revision) || revision < (refreshAvailabilityVersions.get(workspaceId)?.revision ?? 0)) return;
+        refreshAvailabilityVersions.set(workspaceId, { revision, available: refreshAvailable });
+        workspaces = workspaces.map((workspace) => workspace.id === workspaceId
+          ? { ...workspace, refreshAvailable, refreshAvailableRevision: revision }
+          : workspace);
+        if (review?.workspace.id === workspaceId) {
+          review = { ...review, workspace: { ...review.workspace, refreshAvailable, refreshAvailableRevision: revision } };
+        }
       }).then((unlisten) => {
         if (disposed) unlisten();
         else unlistenRefreshAvailable = unlisten;
@@ -372,32 +486,48 @@
       window.removeEventListener('pointerup', onUp);
       window.removeEventListener('pagehide', onPageHide);
       document.removeEventListener('visibilitychange', onVisibilityChange);
+      for (const timer of refreshOutcomeTimers.values()) window.clearTimeout(timer);
+      refreshOutcomeTimers.clear();
     };
   });
 
   async function initialize() {
     const [loadedWorkspaces, loadedSettings] = await Promise.all([api.listWorkspaces(), api.getSettings()]);
-    workspaces = loadedWorkspaces;
+    workspaces = mergeWorkspaceList(loadedWorkspaces);
     settings = loadedSettings;
-    const initial = loadedWorkspaces.find((workspace) => workspace.id === activeWorkspaceId) ?? loadedWorkspaces[0];
+    const initial = loadedWorkspaces.find((workspace) => workspace.id === loadedSettings.lastWorkspaceId)
+      ?? loadedWorkspaces.find((workspace) => workspace.id === activeWorkspaceId)
+      ?? loadedWorkspaces[0];
     if (initial) await selectWorkspace(initial.id);
     else statusMessage = 'Open a local folder to start a review.';
   }
 
   async function selectWorkspace(id: string) {
+    const selectionGeneration = ++workspaceSelectionGeneration;
     busy = true;
     try {
       if (review && review.workspace.id !== id) await flushReviewPersistence();
+      if (selectionGeneration !== workspaceSelectionGeneration) return;
       composer = undefined;
       editingAnnotationId = undefined;
       activeSelection = undefined;
       selectedAnnotationIds = new Set();
+      expandedFullFileDeletionBlocks = new Set();
       prompt = undefined;
       promptHistoryId = undefined;
       showCopyMenu = false;
       showBaselines = false;
       activeWorkspaceId = id;
-      review = normalizeReview(await api.loadReview(id));
+      if (settings.lastWorkspaceId !== id) void setSettings({ lastWorkspaceId: id });
+      const loadedReview = normalizeReview(await api.loadReview(id));
+      if (selectionGeneration !== workspaceSelectionGeneration) return;
+      review = {
+        ...loadedReview,
+        workspace: mergeRefreshAvailability(
+          loadedReview.workspace,
+          workspaces.find((workspace) => workspace.id === loadedReview.workspace.id)
+        )
+      };
       comparisonOptions = review?.repositories[0]?.comparisonOptions ?? { ignoreAllWhitespace: false, ignoreSpaceAtEol: false, ignoreCrAtEol: false };
       if (review.workspace.reviewReady === false) {
         // An uncaptured workspace has no active review session yet. Do not
@@ -416,16 +546,19 @@
         githubThreads = [];
         githubConversation = [];
         await openBaselineSetup();
-        statusMessage = `Resume setup for ${review.workspace.name}. Choose a local base to capture the initial review; fetching remains explicit.`;
+        if (selectionGeneration !== workspaceSelectionGeneration) return;
+        statusMessage = `Resume setup for ${review.workspace.name}. Review the detected repositories, then start the review.`;
         return;
       }
       await hydrateClassifications(id);
+      if (selectionGeneration !== workspaceSelectionGeneration || review?.workspace.id !== id) return;
       // A one-shot, read-only provider check on selection. This does not poll,
       // mutate pins, fetch a worktree, or refresh the review generation.
       if (review?.workspace.source.includes('github')) void checkGitHubFreshness(id);
       if (review?.workspace.source.includes('github')) void loadGitHubContext(id);
       else { githubContext = undefined; githubThreads = []; githubConversation = []; }
       const state = await api.getWorkspaceUiState(id);
+      if (selectionGeneration !== workspaceSelectionGeneration || review?.workspace.id !== id) return;
       mode = state.mode ?? 'unified';
       fullFileSide = state.fullFileSide ?? 'new';
       splitRatio = state.splitRatio ?? .5;
@@ -438,10 +571,12 @@
       selectedAnnotationIds = state.selectedAnnotationIds === undefined
         ? selectableAnnotationIds
         : new Set(state.selectedAnnotationIds.filter((id) => selectableAnnotationIds.has(id)));
+      expandedFullFileDeletionBlocks = new Set(state.expandedFullFileDeletionBlocks ?? []);
       repositoryFilter = 'all';
       fileSearch = '';
       try {
         const draft = await api.getAnnotationDraft(id);
+        if (selectionGeneration !== workspaceSelectionGeneration || review?.workspace.id !== id) return;
         const draftFile = draft && review.files.find((file) => file.id === draft.fileId);
         if (draft && draftFile) {
           activeFileId = draft.fileId;
@@ -455,26 +590,41 @@
           statusMessage = 'Recovered an unfinished annotation draft.';
         }
       } catch (error) {
-        statusMessage = `Draft recovery is unavailable: ${error instanceof Error ? error.message : 'native draft command failed'}`;
+        if (selectionGeneration === workspaceSelectionGeneration && review?.workspace.id === id) {
+          statusMessage = `Draft recovery is unavailable: ${error instanceof Error ? error.message : 'native draft command failed'}`;
+        }
       }
+      if (selectionGeneration !== workspaceSelectionGeneration || review?.workspace.id !== id) return;
       await loadPresentation(0, 220);
+      if (selectionGeneration !== workspaceSelectionGeneration || review?.workspace.id !== id) return;
       await loadOutline();
-    } finally { busy = false; }
+    } finally {
+      if (selectionGeneration === workspaceSelectionGeneration) busy = false;
+    }
   }
 
   /** The classification payload is capture-derived metadata. Join it by the
    * immutable review file id so filtering never walks the current checkout. */
   async function hydrateClassifications(workspaceId: string) {
     try {
-      const records = await api.getReviewFileClassifications(workspaceId);
+      if (!review) return;
+      const classified = await classifyReviewSnapshot(review, workspaceId);
       if (!review || review.workspace.id !== workspaceId) return;
-      const byFileId = new Map(records.map((record) => [record.fileId, record.classification]));
-      review = { ...review, files: review.files.map((file) => ({ ...file, classification: byFileId.get(file.id) ?? file.classification })) };
+      review = classified;
     } catch (error) {
       // Read-only metadata must never block opening a captured review. The UI
       // deliberately leaves classification filters empty rather than guessing.
       statusMessage = `File classifications are unavailable: ${error instanceof Error ? error.message : 'metadata command failed'}`;
     }
+  }
+
+  async function classifyReviewSnapshot(snapshot: ReviewData, workspaceId: string) {
+    const records = await api.getReviewFileClassifications(workspaceId);
+    const byFileId = new Map(records.map((record) => [record.fileId, record.classification]));
+    return {
+      ...snapshot,
+      files: snapshot.files.map((file) => ({ ...file, classification: byFileId.get(file.id) ?? file.classification }))
+    };
   }
 
   function syncActiveWorkspaceSummary(recalculateDrafts = false) {
@@ -495,11 +645,24 @@
   async function checkGitHubFreshness(workspaceId: string) {
     try {
       const status = await api.getGitHubUpdateStatus(workspaceId);
-      if (!review || review.workspace.id !== workspaceId) return;
       const refreshAvailable = status.baseChanged || status.headChanged;
-      review = { ...review, workspace: { ...review.workspace, refreshAvailable } };
-      workspaces = workspaces.map((workspace) => workspace.id === workspaceId ? { ...workspace, refreshAvailable } : workspace);
-      if (refreshAvailable) statusMessage = 'GitHub has newer base or head revisions. Refresh explicitly to capture them.';
+      // A negative provider read must never clear a newer native filesystem
+      // event. A positive read is published by the native command first; read
+      // its revisioned workspace summary back and use the same monotonic merge
+      // as watcher events, refresh responses, and workspace-list reloads.
+      if (!refreshAvailable) return;
+      const authoritativeWorkspaces = await api.listWorkspaces();
+      workspaces = mergeWorkspaceList(authoritativeWorkspaces);
+      const authoritative = workspaces.find((workspace) => workspace.id === workspaceId);
+      if (!review || review.workspace.id !== workspaceId || !authoritative) return;
+      review = {
+        ...review,
+        workspace: {
+          ...review.workspace,
+          ...mergeRefreshAvailability(authoritative, review.workspace)
+        }
+      };
+      statusMessage = 'GitHub has newer base or head revisions. Refresh explicitly to capture them.';
     } catch {
       // Provider status is optional read-only context. A network/auth issue
       // must not make the already-pinned local PR review unusable.
@@ -536,7 +699,7 @@
     busy = true;
     const generation = ++viewportGeneration;
     try {
-      const next = await api.getPresentationWindow({ fileId: activeFileId, comparisonId: activeFile?.comparisonId, mode, startRow, endRow, generation, fullFileSide, splitRatio });
+      const next = await api.getPresentationWindow({ fileId: activeFileId, comparisonId: activeFile?.comparisonId, mode, startRow, endRow, generation, fullFileSide: fullFileDisplaySide, splitRatio });
       if (next.generation !== viewportGeneration || next.fileId !== activeFileId || next.mode !== mode) return;
       presentation = next;
       rows = next.rows;
@@ -548,6 +711,8 @@
     await persistComposerDraftNow();
     activeFileId = fileId;
     activeLine = undefined;
+    nearestSourceLine = undefined;
+    nearestSourceSide = undefined;
     activeSelection = undefined;
     composer = undefined;
     restoredScrollTop = 0;
@@ -557,7 +722,7 @@
     await persistWorkspaceUiStateNow({ activeFileId: fileId, scrollTop: 0 });
     await loadPresentation(0, 220);
     await loadOutline();
-    if (review && !review.files.find((file) => file.id === fileId)?.viewed) {
+    if (review && canMutateReview && !review.files.find((file) => file.id === fileId)?.viewed) {
       await api.setViewed(review.workspace.id, fileId, true);
       review = {
         ...review,
@@ -569,14 +734,26 @@
   }
 
   async function setMode(next: DiffMode, location?: { side: DiffSide; line: number }) {
-    const source = location ?? (nearestSourceLine ? { side: nearestSourceSide ?? 'new' as DiffSide, line: nearestSourceLine } : undefined);
+    // A direct Full File tab selection should visibly begin with the file's
+    // first line. Reusing the hunk diff's scroll location made an entire-file
+    // presentation open hundreds of lines down and look like another bounded
+    // hunk. Explicit navigation (annotations and Difftastic alignment) still
+    // supplies a location and remains anchored there.
+    const startFullFileAtTop = next === 'full' && !location;
+    const source = location ?? (!startFullFileAtTop && nearestSourceLine ? { side: nearestSourceSide ?? 'new' as DiffSide, line: nearestSourceLine } : undefined);
     mode = next;
     // Difftastic can take materially longer than canonical presentation. The
     // selection must reach native storage before that work begins; otherwise
     // a quit or presentation failure leaves the visibly selected tab durable
     // only in the soon-to-be-destroyed webview.
-    await persistWorkspaceUiStateNow({ mode: next });
+    if (startFullFileAtTop) {
+      activeLine = undefined;
+      restoredScrollTop = 0;
+      requestRowJump(0);
+    }
+    await persistWorkspaceUiStateNow({ mode: next, ...(startFullFileAtTop ? { scrollTop: 0 } : {}) });
     if (source && activeFileId) await jumpToSource(activeFileId, source.side, source.line, next);
+    else if (startFullFileAtTop) await loadPresentation(0, 220);
     else await loadPresentation(presentation?.startRow ?? 0, (presentation?.startRow ?? 0) + 220);
   }
 
@@ -631,13 +808,18 @@
 
   function captureWorkspaceUiState(partial: Partial<WorkspaceUiState> = {}) {
     if (!review || review.historical || review.workspace.reviewReady === false) return undefined;
+    const state: WorkspaceUiState = {
+      mode, fullFileSide, nearestSourceLine, nearestSourceSide,
+      scrollTop: restoredScrollTop, splitRatio, rightTab,
+      selectedAnnotationIds: [...selectedAnnotationIds],
+      expandedFullFileDeletionBlocks: [...expandedFullFileDeletionBlocks],
+      ...partial
+    };
+    if (activeFileId) state.activeFileId = activeFileId;
+    if (!state.activeFileId) delete state.activeFileId;
     return {
       workspaceId: review.workspace.id,
-      state: {
-        activeFileId, mode, fullFileSide, nearestSourceLine, nearestSourceSide,
-        scrollTop: restoredScrollTop, splitRatio, rightTab,
-        selectedAnnotationIds: [...selectedAnnotationIds], ...partial
-      }
+      state
     };
   }
 
@@ -784,11 +966,11 @@
   }
 
   async function flushReviewPersistence() {
-    await Promise.all([persistWorkspaceUiStateNow(), persistComposerDraftNow()]);
+    await Promise.all([persistWorkspaceUiStateNow(), persistComposerDraftNow(), settingsSaveChain.catch(() => {})]);
   }
 
   async function flushPendingReviewPersistence() {
-    await Promise.all([flushPendingWorkspaceUiState(), flushPendingComposerDraft()]);
+    await Promise.all([flushPendingWorkspaceUiState(), flushPendingComposerDraft(), settingsSaveChain.catch(() => {})]);
   }
 
   async function discardComposerDraft(workspaceId: string) {
@@ -1226,30 +1408,145 @@
   function nextFile() {
     const list = shownFiles;
     const index = list.findIndex((file) => file.id === activeFileId);
-    if (list.length) selectFile(list[(index + 1 + list.length) % list.length].id);
+    if (list.length) void selectFile(list[index < 0 ? 0 : (index + 1) % list.length].id);
   }
   function previousFile() {
     const list = shownFiles;
     const index = list.findIndex((file) => file.id === activeFileId);
-    if (list.length) selectFile(list[(index - 1 + list.length) % list.length].id);
+    if (list.length) void selectFile(list[index < 0 ? list.length - 1 : (index - 1 + list.length) % list.length].id);
   }
-  function nextHunk() {
-    const locations = presentation?.hunks ?? [];
-    const target = locations.find((hunk) => (hunk.newLine ?? hunk.oldLine ?? 0) > (activeLine ?? nearestSourceLine ?? 0)) ?? locations[0];
-    if (!target) return;
-    activeLine = target.newLine ?? target.oldLine ?? activeLine;
-    jumpToRow = target.rowIndex;
-    persistWorkspaceUiState({ nearestSourceLine: activeLine });
+  function requestRowJump(rowIndex: number) {
+    jumpToRow = rowIndex;
+    // The row can be the same after wrapping (or when a file has one hunk).
+    // Keep each explicit navigation as a distinct request so the viewport is
+    // re-centered even if the reviewer scrolled away in between clicks.
+    jumpGeneration += 1;
   }
-  function previousHunk() {
-    const locations = presentation?.hunks ?? [];
-    const current = activeLine ?? nearestSourceLine ?? Number.MAX_SAFE_INTEGER;
-    const candidates = locations.filter((hunk) => (hunk.newLine ?? hunk.oldLine ?? 0) < current);
-    const target = candidates.at(-1) ?? locations.at(-1);
-    if (!target) return;
-    activeLine = target.newLine ?? target.oldLine;
-    jumpToRow = target.rowIndex;
-    persistWorkspaceUiState({ nearestSourceLine: activeLine });
+  function hunkLine(hunk: HunkLocation, side: DiffSide) {
+    return side === 'old' ? (hunk.oldLine ?? hunk.newLine ?? 0) : (hunk.newLine ?? hunk.oldLine ?? 0);
+  }
+  function nextHunk() { enqueueHunkNavigation(1); }
+  function previousHunk() { enqueueHunkNavigation(-1); }
+  function enqueueHunkNavigation(direction: 1 | -1) {
+    if (!canNavigateShownHunks) return;
+    const move = hunkNavigationChain
+      .catch(() => { /* one failed move must not poison later navigation */ })
+      .then(() => navigateHunk(direction));
+    hunkNavigationChain = move;
+    void move.catch((error) => {
+      statusMessage = `Could not navigate captured hunks: ${apiFailureMessage(error, 'native presentation command failed')}`;
+    });
+  }
+  async function navigateHunk(direction: 1 | -1) {
+    const originFileId = activeFileId;
+    if (!originFileId) return;
+    const originMode = mode;
+    const originFullFileSide = fullFileDisplaySide;
+    const navigationContextChanged = () => mode !== originMode
+      || (originMode === 'full' && fullFileDisplaySide !== originFullFileSide);
+    const originSide: DiffSide = originMode === 'full' ? originFullFileSide : 'new';
+    const locations = await hunkLocationsFor(originFileId, originSide);
+    // A direct file selection that happened during the native read owns the
+    // visible state; do not pull the reviewer back to an obsolete origin.
+    if (activeFileId !== originFileId || navigationContextChanged()) return;
+    const fallbackCurrent = direction === 1 ? 0 : Number.MAX_SAFE_INTEGER;
+    const currentSide = nearestSourceLine && nearestSourceSide ? nearestSourceSide : originSide;
+    const current = nearestSourceLine ?? activeLine ?? fallbackCurrent;
+    const inFile = direction === 1
+      ? locations.find((hunk) => hunkLine(hunk, currentSide) > current)
+      : locations.filter((hunk) => hunkLine(hunk, currentSide) < current).at(-1);
+    if (inFile) {
+      await landOnHunk(inFile, originSide);
+      return;
+    }
+
+    // No hunk remains in this direction. Walk the exact currently shown file
+    // order, skipping immutable documents with no textual hunks and including
+    // the origin at the end so single-file and whole-review wrap both work.
+    const list = shownFiles;
+    if (!list.length) return;
+    const originIndex = list.findIndex((file) => file.id === originFileId);
+    for (let offset = 1; offset <= list.length; offset += 1) {
+      const index = originIndex < 0
+        ? (direction === 1 ? offset - 1 : list.length - offset)
+        : (originIndex + direction * offset + list.length * 2) % list.length;
+      const candidate = list[index];
+      if (!candidate || candidate.hunkCount === 0) continue;
+      if (candidate.id !== activeFileId) await selectFile(candidate.id);
+      if (activeFileId !== candidate.id || navigationContextChanged()) return;
+      const candidateSide: DiffSide = originMode === 'full'
+        ? (candidate.status === 'deleted' ? 'old' : fullFileSide)
+        : 'new';
+      const candidateHunks = await hunkLocationsFor(candidate.id, candidateSide);
+      if (activeFileId !== candidate.id || navigationContextChanged()) return;
+      const target = direction === 1 ? candidateHunks[0] : candidateHunks.at(-1);
+      if (!target) continue;
+      await landOnHunk(target, candidateSide);
+      return;
+    }
+  }
+  async function hunkLocationsFor(fileId: string, side: DiffSide) {
+    if (presentation?.fileId === fileId && presentation.hunks.length) return presentation.hunks;
+    const file = review?.files.find((candidate) => candidate.id === fileId);
+    if (!file || file.hunkCount === 0) return [];
+    // Structural Difftastic rows intentionally carry no canonical hunks.
+    // Read only the complete hunk-location index from Unified, then resolve
+    // the chosen source line back into Difftastic when landing.
+    const locationMode: DiffMode = mode === 'difftastic' ? 'unified' : mode;
+    const generation = ++viewportGeneration;
+    const result = await api.getPresentationWindow({
+      fileId,
+      comparisonId: file.comparisonId,
+      mode: locationMode,
+      startRow: 0,
+      endRow: 1,
+      generation,
+      fullFileSide: side,
+      splitRatio
+    });
+    return result.fileId === fileId ? result.hunks : [];
+  }
+  async function landOnHunk(hunk: HunkLocation, side: DiffSide) {
+    // Full Current intentionally targets a deletion gate/Base row whenever a
+    // hunk removes source. Persist that actual Old-side target so restart and
+    // Difftastic fallback resolution return to the same row. Other modes use
+    // the requested side unless the hunk exists only on its opposite side.
+    const targetSide: DiffSide = mode === 'full' && hunk.oldLine
+      ? 'old'
+      : side === 'new' && !hunk.newLine && hunk.oldLine
+        ? 'old'
+        : side === 'old' && !hunk.oldLine && hunk.newLine
+          ? 'new'
+          : side;
+    const line = hunkLine(hunk, targetSide);
+    if (!line || !activeFileId) return;
+    activeLine = line;
+    nearestSourceLine = line;
+    nearestSourceSide = targetSide;
+    if (mode === 'difftastic') {
+      await jumpToSource(activeFileId, targetSide, line, mode);
+      return;
+    }
+    requestRowJump(hunk.rowIndex);
+    // Persist a safe restart anchor immediately; VirtualDiff follows with its
+    // exact centered scroll position after applying the row jump.
+    restoredScrollTop = Math.max(0, hunk.rowIndex * Math.round(24 * settings.fontScale));
+    void persistWorkspaceUiStateNow({
+      activeFileId,
+      nearestSourceLine: line,
+      nearestSourceSide: targetSide,
+      scrollTop: restoredScrollTop
+    });
+  }
+  function jumpToFullFileHunk(hunk: HunkLocation) {
+    const line = fullFileDisplaySide === 'old'
+      ? (hunk.oldLine ?? hunk.newLine)
+      : (hunk.newLine ?? hunk.oldLine);
+    requestRowJump(hunk.rowIndex);
+    activeLine = line ?? activeLine;
+    nearestSourceLine = activeLine;
+    nearestSourceSide = fullFileDisplaySide;
+    persistWorkspaceUiState({ nearestSourceLine, nearestSourceSide });
   }
   async function navigateAnnotation(direction: 1 | -1) {
     const annotations = shownAnnotations.filter(hasLineAnchor);
@@ -1283,7 +1580,7 @@
   }
   async function loadOutline() {
     if (!activeFileId) { outline = []; return; }
-    try { outline = await api.getOutline(activeFileId, fullFileSide, activeFile?.comparisonId); }
+    try { outline = await api.getOutline(activeFileId, fullFileDisplaySide, activeFile?.comparisonId); }
     catch { outline = []; }
   }
   async function setFullFileSide(side: FullFileSide) {
@@ -1294,6 +1591,29 @@
     await loadPresentation(presentation?.startRow ?? 0, (presentation?.startRow ?? 0) + 220);
     await loadOutline();
   }
+  async function updateFullFileDeletionBlocks(next: Set<string>) {
+    if (review?.historical) return;
+    expandedFullFileDeletionBlocks = next;
+    await persistWorkspaceUiStateNow({ expandedFullFileDeletionBlocks: [...next] });
+    await loadPresentation(presentation?.startRow ?? 0, (presentation?.startRow ?? 0) + 220);
+  }
+  async function toggleFullFileDeletionBlock(blockId: string) {
+    const next = new Set(expandedFullFileDeletionBlocks);
+    if (next.has(blockId)) next.delete(blockId);
+    else next.add(blockId);
+    await updateFullFileDeletionBlocks(next);
+  }
+  async function showAllFullFileDeletions() {
+    const next = new Set(expandedFullFileDeletionBlocks);
+    for (const block of presentation?.deletionBlocks ?? []) next.add(block.id);
+    await updateFullFileDeletionBlocks(next);
+  }
+  async function hideAllFullFileDeletions() {
+    const active = new Set((presentation?.deletionBlocks ?? []).map((block) => block.id));
+    await updateFullFileDeletionBlocks(new Set(
+      [...expandedFullFileDeletionBlocks].filter((id) => !active.has(id))
+    ));
+  }
   async function jumpToSource(fileId: string, side: DiffSide, line: number, targetMode: DiffMode = mode) {
     activeFileId = fileId;
     activeLine = line;
@@ -1302,7 +1622,7 @@
     try {
       const location = await api.resolvePresentationLocation(fileId, targetMode, side, line, review?.files.find((file) => file.id === fileId)?.comparisonId);
       await loadPresentation(Math.max(0, location.rowIndex - 100), location.rowIndex + 120);
-      jumpToRow = location.rowIndex;
+      requestRowJump(location.rowIndex);
       restoredScrollTop = Math.max(0, location.rowIndex * Math.round(24 * settings.fontScale));
       persistWorkspaceUiState({ activeFileId: fileId, nearestSourceLine: line, nearestSourceSide: side, scrollTop: restoredScrollTop });
     } catch (error) {
@@ -1393,21 +1713,245 @@
     try { await api.openInExternalEditor(review.workspace.id, activeFile.id, nearestSourceLine); }
     catch (error) { statusMessage = error instanceof Error ? error.message : 'Could not open an external editor.'; }
   }
+
+  function refreshedFileTarget(nextReview: ReviewData) {
+    const currentReview = review;
+    const currentFile = currentReview?.files.find((file) => file.id === activeFileId);
+    if (!currentReview || !currentFile) return { file: nextReview.files[0], preserved: false };
+    const currentRepository = currentReview.repositories.find((repository) => repository.id === currentFile.repositoryId);
+    const sameRepository = (file: ReviewData['files'][number]) => {
+      if (file.repositoryId === currentFile.repositoryId) return true;
+      const nextRepository = nextReview.repositories.find((repository) => repository.id === file.repositoryId);
+      return Boolean(currentRepository && nextRepository && currentRepository.path === nextRepository.path);
+    };
+    const stable = nextReview.files.find((file) => file.id === currentFile.id)
+      ?? nextReview.files.find((file) => sameRepository(file) && file.path === currentFile.path)
+      ?? nextReview.files.find((file) => sameRepository(file) && file.previousPath === currentFile.path)
+      ?? nextReview.files.find((file) => sameRepository(file) && currentFile.previousPath === file.path);
+    if (stable) return { file: stable, preserved: true };
+    const priorIndex = currentReview.files.findIndex((file) => file.id === currentFile.id);
+    return {
+      file: nextReview.files[Math.min(Math.max(0, priorIndex), Math.max(0, nextReview.files.length - 1))],
+      preserved: false
+    };
+  }
+
+  function refreshNavigationSignature() {
+    return `${activeFileId}\u0000${mode}\u0000${fullFileSide}\u0000${splitRatio}`;
+  }
+
+  function updateRefreshedWorkspaceSummary(snapshot: ReviewData, workspaceId: string) {
+    workspaces = workspaces.map((workspace) => workspace.id === workspaceId
+      ? { ...workspace, ...mergeRefreshAvailability(snapshot.workspace, workspace) }
+      : workspace);
+  }
+
+  function localRefreshFailureMessage(snapshot: ReviewData) {
+    const outcome = snapshot.refreshOutcome;
+    if (!outcome || outcome.status === 'success') return undefined;
+    const first = outcome.failures[0];
+    const firstFailure = first
+      ? ` ${first.repositoryPath || first.repositoryId}: ${first.error}`
+      : '';
+    const additional = outcome.failures.length > 1
+      ? ` ${outcome.failures.length - 1} additional ${outcome.failures.length === 2 ? 'repository' : 'repositories'} failed.`
+      : '';
+    const summary = outcome.status === 'partial'
+      ? `Refresh incomplete: ${outcome.capturedRepositoryCount} ${outcome.capturedRepositoryCount === 1 ? 'repository was' : 'repositories were'} updated, but ${outcome.failedRepositoryCount} failed.`
+      : `Refresh failed: no repositories were updated; ${outcome.failedRepositoryCount} failed.`;
+    return `${summary}${firstFailure}${additional} Open Review setup to correct the repository error, then retry.`;
+  }
+
+  function showNativeRefreshOutcome(snapshot: ReviewData, workspaceId: string, operationId: number, fetchBeforeCapture: boolean) {
+    const failure = localRefreshFailureMessage(snapshot);
+    if (failure) {
+      showTemporaryRefreshOutcome(workspaceId, {
+        operationId,
+        stage: 'failed',
+        fetchBeforeCapture,
+        partial: snapshot.refreshOutcome?.status === 'partial'
+      }, 5000);
+      return failure;
+    }
+    showTemporaryRefreshOutcome(workspaceId, {
+      operationId,
+      stage: 'updated',
+      fetchBeforeCapture,
+      fileCount: snapshot.files.length
+    }, 1600);
+    return undefined;
+  }
+
+  function refreshStateMatches(workspaceId: string, operationId: number) {
+    return refreshStates[workspaceId]?.operationId === operationId;
+  }
+
+  function setWorkspaceRefreshState(workspaceId: string, state: WorkspaceRefreshState | undefined) {
+    const next = { ...refreshStates };
+    if (state) next[workspaceId] = state;
+    else delete next[workspaceId];
+    refreshStates = next;
+  }
+
+  function showTemporaryRefreshOutcome(workspaceId: string, state: WorkspaceRefreshState, duration: number) {
+    const existingTimer = refreshOutcomeTimers.get(workspaceId);
+    if (existingTimer !== undefined) window.clearTimeout(existingTimer);
+    setWorkspaceRefreshState(workspaceId, state);
+    const timer = window.setTimeout(() => {
+      refreshOutcomeTimers.delete(workspaceId);
+      const current = refreshStates[workspaceId];
+      if (current?.operationId === state.operationId && current.stage === state.stage) {
+        setWorkspaceRefreshState(workspaceId, undefined);
+      }
+    }, duration);
+    refreshOutcomeTimers.set(workspaceId, timer);
+  }
+
+  async function prepareRefreshedDisplay(nextReview: ReviewData, operationId: number, workspaceId: string, selectionGeneration: number) {
+    if (!nextReview.files.length) {
+      viewportGeneration += 1;
+      return { activeFileId: '', preservedFile: false, presentation: undefined, rows: [] as DiffRow[], outline: [] as OutlineSymbol[] };
+    }
+    // Navigation remains live while capture is running. If the reviewer moves
+    // to another file or mode during one of these native reads, discard that
+    // prepared window and stage the latest visible location instead.
+    for (;;) {
+      if (!refreshStateMatches(workspaceId, operationId) || workspaceSelectionGeneration !== selectionGeneration || review?.workspace.id !== workspaceId) return undefined;
+      const signature = refreshNavigationSignature();
+      const target = refreshedFileTarget(nextReview);
+      if (!target.file) return { activeFileId: '', preservedFile: false, presentation: undefined, rows: [] as DiffRow[], outline: [] as OutlineSymbol[] };
+      const targetSide: FullFileSide = target.file.status === 'deleted' ? 'old' : fullFileSide;
+      const generation = ++viewportGeneration;
+      const startRow = target.preserved ? presentation?.startRow ?? 0 : 0;
+      const endRow = target.preserved ? startRow + Math.max(220, presentation?.rows.length ?? 0) : 220;
+      const [nextPresentation, nextOutline] = await Promise.all([
+        api.getPresentationWindow({
+          fileId: target.file.id,
+          comparisonId: target.file.comparisonId,
+          mode,
+          startRow,
+          endRow,
+          generation,
+          fullFileSide: targetSide,
+          splitRatio
+        }),
+        api.getOutline(target.file.id, targetSide, target.file.comparisonId).catch(() => [] as OutlineSymbol[])
+      ]);
+      if (!refreshStateMatches(workspaceId, operationId) || workspaceSelectionGeneration !== selectionGeneration || review?.workspace.id !== workspaceId) return undefined;
+      if (generation !== viewportGeneration || signature !== refreshNavigationSignature()) continue;
+      if (nextPresentation.fileId !== target.file.id || nextPresentation.mode !== mode || nextPresentation.generation !== generation) {
+        throw new Error('The prepared diff did not match the captured file and view.');
+      }
+      return { activeFileId: target.file.id, preservedFile: target.preserved, presentation: nextPresentation, rows: nextPresentation.rows, outline: nextOutline };
+    }
+  }
+
   async function refresh() {
     if (!review || !canMutateReview) return;
-    busy = true;
+    const workspaceId = review.workspace.id;
+    const currentRefreshState = refreshStates[workspaceId];
+    if (currentRefreshState?.stage === 'capturing' || currentRefreshState?.stage === 'preparing') return;
+    const operationId = ++refreshOperationId;
+    const selectionGeneration = workspaceSelectionGeneration;
+    const fetchBeforeCapture = settings.fetchOnReview;
+    const existingTimer = refreshOutcomeTimers.get(workspaceId);
+    if (existingTimer !== undefined) {
+      window.clearTimeout(existingTimer);
+      refreshOutcomeTimers.delete(workspaceId);
+    }
+    // Flush this button-local acknowledgement before invoking native capture,
+    // so even a slow IPC boundary cannot leave the click looking ignored.
+    flushSync(() => {
+      setWorkspaceRefreshState(workspaceId, { operationId, stage: 'capturing', fetchBeforeCapture });
+      statusMessage = `${fetchBeforeCapture ? 'Fetching configured remotes and capturing' : 'Capturing from local refs'}\u2026 The current snapshot remains available while this finishes.`;
+    });
     try {
-      review = normalizeReview(await api.refreshReview(review.workspace.id, { fetchBeforeCapture: settings.fetchOnReview, comparisonOptions: comparisonOptionsSupported ? comparisonOptions : undefined }));
-      syncActiveWorkspaceSummary();
-      await hydrateClassifications(review.workspace.id);
+      let nextReview = normalizeReview(await api.refreshReview(workspaceId, { fetchBeforeCapture, comparisonOptions: comparisonOptionsSupported ? comparisonOptions : undefined }));
+      if (!refreshStateMatches(workspaceId, operationId) || workspaceSelectionGeneration !== selectionGeneration || review?.workspace.id !== workspaceId) {
+        // This capture still completed natively. Keep its inactive rail card
+        // accurate without touching the workspace the reviewer moved to. A
+        // later watcher revision still wins over this older capture result.
+        updateRefreshedWorkspaceSummary(nextReview, workspaceId);
+        if (refreshStateMatches(workspaceId, operationId)) {
+          showNativeRefreshOutcome(nextReview, workspaceId, operationId, fetchBeforeCapture);
+        }
+        return;
+      }
+      const nativeRefreshFailure = localRefreshFailureMessage(nextReview);
+      if (nextReview.refreshOutcome?.status === 'failed') {
+        // No repository advanced, so the old file list and diff are already
+        // the correct complete visual state. Apply only the authoritative
+        // availability revision and expose the repository-scoped failure.
+        review = {
+          ...review,
+          workspace: mergeRefreshAvailability(nextReview.workspace, review.workspace)
+        };
+        updateRefreshedWorkspaceSummary(nextReview, workspaceId);
+        showNativeRefreshOutcome(nextReview, workspaceId, operationId, fetchBeforeCapture);
+        statusMessage = nativeRefreshFailure!;
+        return;
+      }
+      flushSync(() => {
+        setWorkspaceRefreshState(workspaceId, { operationId, stage: 'preparing', fetchBeforeCapture });
+        statusMessage = 'Snapshot captured. Preparing its file list and diff before one visual update\u2026';
+      });
+      let classificationWarning = '';
+      const classifiedReview = classifyReviewSnapshot(nextReview, workspaceId).catch((error) => {
+        classificationWarning = ` File classifications are unavailable: ${apiFailureMessage(error, 'metadata command failed')}`;
+        return nextReview;
+      });
+      const [preparedReview, refreshedState, preparedDisplay] = await Promise.all([
+        classifiedReview,
+        api.getWorkspaceUiState(workspaceId),
+        prepareRefreshedDisplay(nextReview, operationId, workspaceId, selectionGeneration)
+      ]);
+      if (!preparedDisplay || !refreshStateMatches(workspaceId, operationId) || workspaceSelectionGeneration !== selectionGeneration || review?.workspace.id !== workspaceId) {
+        updateRefreshedWorkspaceSummary(nextReview, workspaceId);
+        if (refreshStateMatches(workspaceId, operationId)) {
+          showNativeRefreshOutcome(nextReview, workspaceId, operationId, fetchBeforeCapture);
+        }
+        return;
+      }
+      nextReview = {
+        ...preparedReview,
+        workspace: mergeRefreshAvailability(preparedReview.workspace, review.workspace)
+      };
+
+      // Atomic visual promotion: every value consumed by the file tree,
+      // toolbar, diff, outline, counters, and minimap changes in this one
+      // synchronous turn. The prior snapshot stays complete until here.
+      review = nextReview;
+      activeFileId = preparedDisplay.activeFileId;
+      presentation = preparedDisplay.presentation;
+      rows = preparedDisplay.rows;
+      outline = preparedDisplay.outline;
+      expandedFullFileDeletionBlocks = new Set(refreshedState.expandedFullFileDeletionBlocks ?? []);
       changedSincePrevious = undefined;
       changedSincePreviousOnly = false;
-      activeFileId = review.files.some((file) => file.id === activeFileId) ? activeFileId : review.files[0]?.id ?? '';
-      await loadPresentation(0, 220);
-      statusMessage = `${settings.fetchOnReview ? 'Refreshed after fetching configured remotes.' : 'Refreshed from local refs; no automatic fetch.'} Comparison options were captured with this generation.`;
+      if (!preparedDisplay.preservedFile) {
+        activeLine = undefined;
+        nearestSourceLine = undefined;
+        nearestSourceSide = undefined;
+        restoredScrollTop = 0;
+        activeSelection = undefined;
+        composer = undefined;
+      }
+      workspaces = workspaces.map((workspace) => workspace.id === workspaceId
+        ? { ...workspace, ...mergeRefreshAvailability(nextReview.workspace, workspace) }
+        : workspace);
+      persistWorkspaceUiState({ activeFileId: preparedDisplay.activeFileId || undefined, scrollTop: restoredScrollTop });
+      statusMessage = nativeRefreshFailure
+        ? `${nativeRefreshFailure}${classificationWarning}`
+        : `${fetchBeforeCapture ? 'Refreshed after fetching configured remotes.' : 'Refreshed from local refs; no automatic fetch.'} The complete snapshot is now displayed.${classificationWarning}`;
+      showNativeRefreshOutcome(nextReview, workspaceId, operationId, fetchBeforeCapture);
     } catch (error) {
-      statusMessage = `Refresh failed: ${error instanceof Error ? error.message : 'unknown error'}`;
-    } finally { busy = false; }
+      if (refreshStateMatches(workspaceId, operationId)) {
+        showTemporaryRefreshOutcome(workspaceId, { operationId, stage: 'failed', fetchBeforeCapture }, 3200);
+      }
+      if (workspaceSelectionGeneration === selectionGeneration && review?.workspace.id === workspaceId) {
+        statusMessage = `Refresh failed; the previous snapshot remains displayed: ${apiFailureMessage(error, 'unknown error')}`;
+      }
+    }
   }
 
   async function beginNewReview() {
@@ -1440,6 +1984,7 @@
       selectedAnnotationIds = state.selectedAnnotationIds === undefined
         ? selectableAnnotationIds
         : new Set(state.selectedAnnotationIds.filter((id) => selectableAnnotationIds.has(id)));
+      expandedFullFileDeletionBlocks = new Set(state.expandedFullFileDeletionBlocks ?? []);
       await loadPresentation(0, 220);
       await loadOutline();
       showNewReview = false;
@@ -1451,15 +1996,39 @@
 
   const setupOperationsSupported = () => Boolean(review?.workspace.source.includes('local'));
   const selectedSetupIds = () => [...selectedSetupRepositoryIds];
+  const repositoryIsEnabled = (repository: RepositorySetup, staged = repositoryEnabled) => staged[repository.id] ?? repository.enabled;
+  $: includedRepositoryCount = repositorySetup.filter((repository) => repositoryIsEnabled(repository, repositoryEnabled)).length;
 
-  function syncRepositoryBaseInputs(rows: RepositorySetup[]) {
-    repositoryBases = Object.fromEntries(rows
-      .filter((repository) => repository.baseOverride)
-      .map((repository) => [repository.id, repository.baseOverride ?? '']));
+  function syncRepositoryBaseInputs(rows: RepositorySetup[], refreshRepositoryIds = new Set<string>()) {
+    const nextBases = { ...repositoryBases };
+    for (const repository of rows) {
+      if (refreshRepositoryIds.has(repository.id) || !Object.prototype.hasOwnProperty.call(nextBases, repository.id)) {
+        nextBases[repository.id] = repository.baseOverride ?? '';
+      }
+    }
+    const suggestedRepositories = review?.workspace.reviewReady === false
+      ? rows.filter((repository) => repository.enabled && !repository.baseOverride && !repository.resolvedBaseSha && repository.suggestedBase && repository.suggestedBase !== repository.effectiveBase)
+      : [];
+    for (const repository of suggestedRepositories) {
+      nextBases[repository.id] = repository.suggestedBase!;
+    }
+    repositoryBases = nextBases;
+    setupAutoBaseNotice = suggestedRepositories.length
+      ? `The configured base is unavailable. LocalReview selected ${suggestedRepositories.length === 1 ? suggestedRepositories[0].suggestedBase : 'each repository’s detected default branch'} for you.`
+      : '';
+  }
+
+  function syncRepositoryInclusionInputs(rows: RepositorySetup[]) {
+    const nextEnabled = { ...repositoryEnabled };
+    for (const repository of rows) {
+      if (!Object.prototype.hasOwnProperty.call(nextEnabled, repository.id)) nextEnabled[repository.id] = repository.enabled;
+    }
+    repositoryEnabled = nextEnabled;
   }
 
   async function loadRepositorySetup() {
     if (!review) return;
+    setupError = '';
     setupLoading = true;
     try {
       const rows = await api.getRepositorySetup(review.workspace.id);
@@ -1467,9 +2036,11 @@
       selectedSetupRepositoryIds = new Set([...selectedSetupRepositoryIds]
         .filter((repositoryId) => rows.some((repository) => repository.id === repositoryId)));
       syncRepositoryBaseInputs(rows);
+      syncRepositoryInclusionInputs(rows);
     } catch (error) {
       repositorySetup = [];
-      statusMessage = `Could not read repository setup: ${error instanceof Error ? error.message : 'unknown error'}`;
+      setupError = `Could not read repository setup: ${error instanceof Error ? error.message : 'unknown error'}`;
+      statusMessage = setupError;
     } finally {
       setupLoading = false;
     }
@@ -1481,52 +2052,38 @@
     selectedSetupRepositoryIds = next;
   }
 
-  async function toggleRepositoryInclusion(repositoryId: string, enabled: boolean) {
-    if (!review || !setupOperationsSupported()) return;
-    setupMutating = true;
-    try {
-      repositorySetup = await api.setRepositoryInclusion(review.workspace.id, [repositoryId], enabled);
-      syncRepositoryBaseInputs(repositorySetup);
-      statusMessage = `${enabled ? 'Included' : 'Excluded'} repository for the next explicit review capture.`;
-    } catch (error) {
-      statusMessage = `Could not change repository inclusion: ${error instanceof Error ? error.message : 'unknown error'}`;
-    } finally { setupMutating = false; }
+  function toggleRepositoryInclusion(repositoryId: string, enabled: boolean) {
+    repositoryEnabled = { ...repositoryEnabled, [repositoryId]: enabled };
+    setupError = '';
+    statusMessage = `${enabled ? 'Including' : 'Excluding'} repository when you save setup changes.`;
   }
 
-  async function applySetupBase() {
+  function applySetupBase() {
     if (!review || !setupOperationsSupported()) return;
     const repositoryIds = selectedSetupIds();
     if (!repositoryIds.length) { statusMessage = 'Select one or more repositories before applying an override.'; return; }
     if (!setupOverrideBase.trim()) { statusMessage = 'Enter a branch, remote branch, tag, or commit ID.'; return; }
-    setupMutating = true;
-    try {
-      repositorySetup = await api.applyRepositoryBase(review.workspace.id, repositoryIds, setupOverrideBase.trim());
-      syncRepositoryBaseInputs(repositorySetup);
-      setupOverrideBase = '';
-      statusMessage = `Applied the base override to ${repositoryIds.length} selected ${repositoryIds.length === 1 ? 'repository' : 'repositories'}. Refresh captures the new bases.`;
-    } catch (error) {
-      statusMessage = `Could not apply base override: ${error instanceof Error ? error.message : 'unknown error'}`;
-    } finally { setupMutating = false; }
+    setupError = '';
+    const base = setupOverrideBase.trim();
+    repositoryBases = { ...repositoryBases, ...Object.fromEntries(repositoryIds.map((repositoryId) => [repositoryId, base])) };
+    setupOverrideBase = '';
+    statusMessage = `Staged the base override for ${repositoryIds.length} selected ${repositoryIds.length === 1 ? 'repository' : 'repositories'}. Save changes to apply it.`;
   }
 
-  async function resetSetupBases() {
+  function resetSetupBases() {
     if (!review || !setupOperationsSupported()) return;
     const repositoryIds = selectedSetupIds();
     if (!repositoryIds.length) { statusMessage = 'Select one or more repositories before resetting overrides.'; return; }
-    setupMutating = true;
-    try {
-      repositorySetup = await api.resetRepositoryBaseOverrides(review.workspace.id, repositoryIds);
-      syncRepositoryBaseInputs(repositorySetup);
-      statusMessage = `Reset ${repositoryIds.length} ${repositoryIds.length === 1 ? 'override' : 'overrides'} to the workspace default.`;
-    } catch (error) {
-      statusMessage = `Could not reset base overrides: ${error instanceof Error ? error.message : 'unknown error'}`;
-    } finally { setupMutating = false; }
+    setupError = '';
+    repositoryBases = { ...repositoryBases, ...Object.fromEntries(repositoryIds.map((repositoryId) => [repositoryId, ''])) };
+    statusMessage = `Staged ${repositoryIds.length} ${repositoryIds.length === 1 ? 'override' : 'overrides'} to use the workspace default. Save changes to apply.`;
   }
 
   async function fetchSetupRepositories(all: boolean) {
     if (!review || !setupOperationsSupported()) return;
     const selectedIds = selectedSetupIds();
     if (!all && !selectedIds.length) { statusMessage = 'Select one or more repositories before fetching.'; return; }
+    setupError = '';
     setupMutating = true;
     try {
       repositorySetup = await api.fetchRepositories(review.workspace.id, all ? undefined : selectedIds);
@@ -1536,31 +2093,36 @@
         ? `Fetch completed with ${failures} repository ${failures === 1 ? 'error' : 'errors'}; successful siblings are preserved.`
         : `Fetched ${all ? 'all repositories' : `${selectedIds.length} selected ${selectedIds.length === 1 ? 'repository' : 'repositories'}`}.`;
     } catch (error) {
-      statusMessage = `Could not fetch repositories: ${error instanceof Error ? error.message : 'unknown error'}`;
+      setupError = `Could not fetch repositories: ${error instanceof Error ? error.message : 'unknown error'}`;
+      statusMessage = setupError;
     } finally { setupMutating = false; }
   }
 
   async function openBaselineSetup() {
-    if (!review || review.historical) return;
+    if (!review || review.historical || refreshLocksReview) return;
     setupError = '';
     workspaceBase = review.workspace.defaultBase ?? review.repositories[0]?.base ?? 'origin/master';
     repositoryBases = Object.fromEntries(review.repositories.filter((repository) => repository.isOverride).map((repository) => [repository.id, repository.base]));
+    repositoryEnabled = {};
     selectedSetupRepositoryIds = new Set();
     setupOverrideBase = '';
+    setupAutoBaseNotice = '';
     showBaselines = true;
     await loadRepositorySetup();
   }
 
   function closeBaselineSetup() {
-    if (review?.workspace.reviewReady === false) {
-      statusMessage = 'Finish setup and capture the initial review before leaving this screen.';
-      return;
-    }
+    const hasUnsavedChanges = Boolean(review && (
+      workspaceBase.trim() !== (review.workspace.defaultBase ?? review.repositories[0]?.base ?? 'origin/master')
+      || repositorySetup.some((repository) => repositoryIsEnabled(repository) !== repository.enabled)
+      || repositorySetup.some((repository) => (repositoryBases[repository.id]?.trim() || '') !== (repository.baseOverride?.trim() || ''))
+    ));
     showBaselines = false;
+    statusMessage = hasUnsavedChanges ? 'Discarded unsaved review setup changes.' : 'Review setup closed without changing the pinned review.';
   }
 
   async function applyBaselines() {
-    if (!review) return;
+    if (!review || refreshLocksReview) return;
     setupError = '';
     const needsInitialReview = review.workspace.reviewReady === false;
     const workspaceId = review.workspace.id;
@@ -1570,6 +2132,10 @@
     }));
     setupMutating = true;
     try {
+      const enableIds = repositorySetup.filter((repository) => repositoryIsEnabled(repository) && !repository.enabled).map((repository) => repository.id);
+      const disableIds = repositorySetup.filter((repository) => !repositoryIsEnabled(repository) && repository.enabled).map((repository) => repository.id);
+      if (enableIds.length) await api.setRepositoryInclusion(workspaceId, enableIds, true);
+      if (disableIds.length) await api.setRepositoryInclusion(workspaceId, disableIds, false);
       const configured = normalizeReview(await api.configureBaselines(workspaceId, workspaceBase.trim() || undefined, overrides));
       if (needsInitialReview) {
         // Keep the visible reviewReady=false guard in place until capture has
@@ -1579,14 +2145,21 @@
         // captured file, presentation, outline, per-session UI state, and
         // empty draft/export selection all become active immediately.
         await selectWorkspace(review.workspace.id);
-        workspaces = await api.listWorkspaces();
+        workspaces = mergeWorkspaceList(await api.listWorkspaces());
         showBaselines = false;
         statusMessage = 'Baseline settings saved and the initial review was captured from local refs.';
         return;
       }
       review = configured;
+      repositoryEnabled = {};
       await loadRepositorySetup();
-      statusMessage = 'Baseline settings saved. The active snapshot remains pinned until Refresh.';
+      const unresolved = repositorySetup.filter((repository) => repositoryIsEnabled(repository) && (repository.comparisonError || repository.discoveryError));
+      if (unresolved.length) {
+        setupError = `Settings were saved, but ${unresolved.length} included ${unresolved.length === 1 ? 'repository has' : 'repositories have'} an unresolved comparison. Fix ${unresolved.length === 1 ? 'it' : 'them'} before refreshing.`;
+        statusMessage = setupError;
+      } else {
+        statusMessage = 'Review setup saved. The active snapshot remains pinned until Refresh.';
+      }
     } catch (error) {
       setupError = `Could not ${needsInitialReview ? 'capture the initial review' : 'update baselines'}: ${apiFailureMessage(error, 'unknown error')}`;
       statusMessage = setupError;
@@ -1605,13 +2178,13 @@
     busy = true;
     try {
       const workspace = await api.openWorkspace({ path, base: localBase.trim() || undefined });
-      workspaces = await api.listWorkspaces();
+      workspaces = mergeWorkspaceList(await api.listWorkspaces());
       await selectWorkspace(workspace.id);
       showOpen = false;
       openLocalForm = false;
       if (workspace.reviewReady === false) {
         await openBaselineSetup();
-        statusMessage = `Opened ${workspace.name}. Choose a local base below to capture the initial review; fetching remains explicit.`;
+        statusMessage = `Opened ${workspace.name}. Review the detected repositories, then start the review.`;
       } else {
         statusMessage = `Opened ${workspace.name}; repository discovery is available in the review setup.`;
       }
@@ -1637,7 +2210,7 @@
     busy = true;
     try {
       const workspace = kind === 'github' ? await api.openGitHubPr(value) : await api.openSshWorkspace(value);
-      workspaces = await api.listWorkspaces();
+      workspaces = mergeWorkspaceList(await api.listWorkspaces());
       showOpen = false;
       openGitHubForm = false;
       openSshForm = false;
@@ -1678,7 +2251,9 @@
     busy = true;
     try {
       const reconnected = await api.reconnectSshWorkspace(workspace.id);
-      workspaces = workspaces.map((candidate) => candidate.id === reconnected.id ? reconnected : candidate);
+      workspaces = workspaces.map((candidate) => candidate.id === reconnected.id
+        ? mergeRefreshAvailability(reconnected, candidate)
+        : candidate);
       if (review?.workspace.id === reconnected.id) review = { ...review, workspace: reconnected };
       statusMessage = `Reconnected ${reconnected.name}; its change watcher was restarted.`;
     } catch (error) {
@@ -1708,7 +2283,9 @@
     if (!workspacePendingRename || !workspaceRenameValue.trim()) return;
     try {
       const updated = await api.updateWorkspaceMetadata(workspacePendingRename.id, { name: workspaceRenameValue });
-      workspaces = workspaces.map((item) => item.id === updated.id ? updated : item);
+      workspaces = workspaces.map((item) => item.id === updated.id
+        ? mergeRefreshAvailability(updated, item)
+        : item);
       if (review?.workspace.id === updated.id) review = { ...review, workspace: updated };
       workspacePendingRename = undefined;
       statusMessage = `Workspace renamed to ${updated.name}.`;
@@ -1718,6 +2295,11 @@
   }
 
   function requestWorkspaceDeletion(workspace: Workspace) {
+    const workspaceRefreshState = refreshStates[workspace.id];
+    if (workspaceRefreshState?.stage === 'capturing' || workspaceRefreshState?.stage === 'preparing') {
+      statusMessage = 'Wait for this workspace refresh to finish before archiving it.';
+      return;
+    }
     workspacePendingDeletion = workspace;
     deleteWorkspaceError = '';
     showDeleteWorkspace = true;
@@ -1730,7 +2312,7 @@
     deleteWorkspaceError = '';
     try {
       await api.deleteWorkspace(workspace.id);
-      workspaces = await api.listWorkspaces();
+      workspaces = mergeWorkspaceList(await api.listWorkspaces());
       if (review?.workspace.id === workspace.id) {
         review = undefined;
         activeFileId = '';
@@ -1754,7 +2336,7 @@
     busy = true;
     try {
       const reopened = await api.reopenArchivedWorkspace(workspace.id);
-      workspaces = await api.listWorkspaces();
+      workspaces = mergeWorkspaceList(await api.listWorkspaces());
       await selectWorkspace(reopened.id);
       archivedWorkspaces = await api.listArchivedWorkspaces();
       showHistory = false;
@@ -1788,6 +2370,7 @@
       review = snapshot;
       activeFileId = snapshot.files[0]?.id ?? '';
       selectedAnnotationIds = new Set();
+      expandedFullFileDeletionBlocks = new Set();
       mode = 'unified';
       fullFileSide = 'new';
       await loadPresentation(0, 220);
@@ -1822,7 +2405,7 @@
 
 <div class="theme-root" class:large-text-root={settings.fontScale > 1.25} data-theme={appTheme} style={`${codeStyle};--font-scale:${settings.fontScale}`}>
 <main class="app-shell" style={`${layoutStyle};${codeStyle}`} data-theme={appTheme} class:show-whitespace={settings.showWhitespace} class:large-text={settings.fontScale > 1.25} aria-busy={busy} on:dragover={(event) => { if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'; event.preventDefault(); }} on:drop={handleWorkspaceDrop}>
-  <WorkspaceRail workspaces={workspaces} selectedId={activeWorkspaceId} collapsed={settings.leftCollapsed} onSelect={selectWorkspace} onOpen={() => { localOpenError = ''; showOpen = true; }} onExpand={() => restorePanel('left')} onCollapse={() => togglePanel('left')} onSettings={() => showSettings = true} onDelete={requestWorkspaceDeletion} onReconnect={reconnectSshWorkspace} onPin={toggleWorkspacePin} onRename={requestWorkspaceRename} />
+  <WorkspaceRail workspaces={workspaces} refreshStages={workspaceRefreshStages} selectedId={activeWorkspaceId} collapsed={settings.leftCollapsed} onSelect={selectWorkspace} onOpen={() => { localOpenError = ''; showOpen = true; }} onExpand={() => restorePanel('left')} onCollapse={() => togglePanel('left')} onSettings={() => showSettings = true} onDelete={requestWorkspaceDeletion} onReconnect={reconnectSshWorkspace} onPin={toggleWorkspacePin} onRename={requestWorkspaceRename} />
   <!-- svelte-ignore a11y_no_noninteractive_tabindex a11y_no_noninteractive_element_interactions -- ARIA separator follows the splitter pattern and handles pointer plus arrow keys -->
   <div class="resize-handle left-handle" class:collapsed={settings.leftCollapsed} role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize workspace rail" aria-valuemin="180" aria-valuemax="420" aria-valuenow={settings.leftWidth} on:pointerdown={() => resizeSide = 'left'} on:keydown={(event) => resizePanelKey('left', event)} on:dblclick={() => resetDivider('left')}></div>
 
@@ -1830,35 +2413,56 @@
     <header class="topbar">
       <div class="topbar-leading">
         {#if settings.leftCollapsed}<button class="compact-panel-button" on:click={() => restorePanel('left')} aria-label="Open workspace rail"><span class="ui-icon" aria-hidden="true">☰</span><span>Workspace</span></button>{/if}
-        <button class="repo-picker" title="Choose repository" on:click={() => showFilePicker = true}><span class="repo-dot"></span>{activeRepo?.name ?? (review?.workspace.reviewReady === false ? 'Setup' : 'Loading')} <span class="chevron">⌄</span></button>
+        <button class="repo-picker" title="Choose repository" on:click={() => showFilePicker = true}><span class="repo-dot"></span>{displayRepo?.name ?? (review?.workspace.reviewReady === false ? 'Setup' : review?.files.length === 0 ? 'Workspace' : 'Loading')} <span class="chevron">⌄</span></button>
         <span class="path-divider">/</span>
-        <button class="file-picker" title="Find changed file (⌘P)" on:click={() => showFilePicker = true}>{activeFile?.path ?? (review?.workspace.reviewReady === false ? 'Initial review setup' : 'Loading diff')} <span class="chevron">⌄</span></button>
+        <button class="file-picker" title="Find changed file (⌘P)" on:click={() => showFilePicker = true}>{activeFile?.path ?? (review?.workspace.reviewReady === false ? 'Initial review setup' : review?.files.length === 0 ? 'No changed files' : 'Loading diff')} <span class="chevron">⌄</span></button>
         <span class:added={activeFile?.status === 'added'} class:modified={activeFile?.status === 'modified'} class="file-status">{activeFile?.status ?? ''}</span>
       </div>
       <div class="topbar-actions">
-        <button class="icon-button" title="Previous file (⌘[)" on:click={previousFile}>‹</button><button class="icon-button" title="Next file (⌘])" on:click={nextFile}>›</button>
+        <div class="navigation-group" role="group" aria-label="File navigation">
+          <span class="navigation-label" aria-hidden="true">File</span>
+          <span class="navigation-buttons">
+            <button disabled={!canNavigateShownFiles} title="Previous file (⌘[)" aria-label="Previous file" on:click={previousFile}>‹</button>
+            <button disabled={!canNavigateShownFiles} title="Next file (⌘])" aria-label="Next file" on:click={nextFile}>›</button>
+          </span>
+        </div>
+        <div class="navigation-group" role="group" aria-label="Hunk navigation">
+          <span class="navigation-label" aria-hidden="true">Hunk</span>
+          <span class="navigation-buttons">
+            <button disabled={!canNavigateShownHunks} title="Previous hunk across files (⌥↑)" aria-label="Previous hunk" on:click={previousHunk}>‹</button>
+            <button disabled={!canNavigateShownHunks} title="Next hunk across files (⌥↓)" aria-label="Next hunk" on:click={nextHunk}>›</button>
+          </span>
+        </div>
         <span class="toolbar-rule"></span>
-        <button class="status-button" disabled={!canMutateReview} on:click={refresh} title={review?.historical ? 'Archived review snapshots are read-only' : !reviewCaptureReady ? 'Finish initial setup before refreshing' : 'Capture a new review snapshot'}><span class:available={review?.workspace.refreshAvailable} class="status-light"></span>{review?.historical ? 'Archived snapshot' : review?.workspace.refreshAvailable ? 'Changes available · Refresh' : 'Refresh'}</button>
+        <button class="status-button" class:refreshing={refreshLocksReview} class:updated={activeRefreshState?.stage === 'updated'} class:failed={activeRefreshState?.stage === 'failed'} disabled={!canMutateReview} aria-label={refreshButtonAriaLabel} aria-live="polite" aria-busy={refreshLocksReview} aria-describedby={refreshLocksReview ? 'refresh-status' : undefined} on:click={refresh} title={review?.historical ? 'Archived review snapshots are read-only' : !reviewCaptureReady ? 'Finish initial setup before refreshing' : refreshLocksReview ? 'This workspace refresh is already running' : activeRefreshState?.stage === 'failed' ? 'Retry the review refresh' : 'Capture a new review snapshot'}><span class:available={review?.workspace.refreshAvailable && !activeRefreshState} class:refreshing={refreshLocksReview} class:updated={activeRefreshState?.stage === 'updated'} class:failed={activeRefreshState?.stage === 'failed'} class="status-light"></span><span class="status-button-label">{refreshButtonLabel}</span></button>
         <details class="actions-menu" bind:open={actionsOpen}>
           <summary aria-label="More review actions">Actions</summary>
-          <div role="menu" aria-label="Review actions"><button role="menuitem" disabled={!canExportReview || review?.historical} on:click={() => { actionsOpen = false; primaryFinishAction(); }}>{githubReview ? 'Finish review' : 'Copy review prompt'}</button><button role="menuitem" disabled={review?.historical} on:click={() => { actionsOpen = false; void openBaselineSetup(); }}>Baselines</button><button role="menuitem" disabled={!canMutateReview} on:click={() => { actionsOpen = false; showNewReview = true; }}>New review</button><button role="menuitem" on:click={() => { actionsOpen = false; void openHistory(); }}>History</button><button role="menuitem" disabled={!canExportReview} on:click={() => { actionsOpen = false; void openBlame(); }}>Blame selected lines</button><button role="menuitem" disabled={!canExportReview} on:click={() => { actionsOpen = false; void openCommitContext(); }}>Commit context</button><button role="menuitem" disabled={!canMutateReview} on:click={() => { actionsOpen = false; void showChangedSincePreviousReview(); }}>Changed since previous review</button><button role="menuitem" on:click={() => { actionsOpen = false; showSettings = true; }}>Settings</button></div>
+          <div role="menu" aria-label="Review actions"><button role="menuitem" disabled={!canExportReview || review?.historical || (githubReview && refreshLocksReview)} on:click={() => { actionsOpen = false; primaryFinishAction(); }}>{githubReview ? 'Finish review' : 'Copy review prompt'}</button><button role="menuitem" disabled={review?.historical || refreshLocksReview} on:click={() => { actionsOpen = false; void openBaselineSetup(); }}>Review setup</button><button role="menuitem" disabled={!canMutateReview} on:click={() => { actionsOpen = false; showNewReview = true; }}>New review</button><button role="menuitem" on:click={() => { actionsOpen = false; void openHistory(); }}>History</button><button role="menuitem" disabled={!canExportReview} on:click={() => { actionsOpen = false; void openBlame(); }}>Blame selected lines</button><button role="menuitem" disabled={!canExportReview} on:click={() => { actionsOpen = false; void openCommitContext(); }}>Commit context</button><button role="menuitem" disabled={!canMutateReview} on:click={() => { actionsOpen = false; void showChangedSincePreviousReview(); }}>Changed since previous review</button><button role="menuitem" on:click={() => { actionsOpen = false; showSettings = true; }}>Settings</button></div>
         </details>
-        <button class="finish-button" disabled={!canExportReview || review?.historical} on:click={primaryFinishAction}>{review?.historical ? 'Archived review' : githubReview ? 'Finish review' : 'Copy review prompt'} <span>⌘↵</span></button>
+        <button class="finish-button" disabled={!canExportReview || review?.historical || (githubReview && refreshLocksReview)} on:click={primaryFinishAction}>{review?.historical ? 'Archived review' : githubReview ? 'Finish review' : 'Copy review prompt'} <span>⌘↵</span></button>
       </div>
     </header>
 
     <div class="diff-toolbar">
-      <div class="base-summary"><span class="branch-icon">⑂</span><span>{activeRepo?.base ?? 'origin/master'}</span><span class="arrow">→</span><span>{activeRepo?.branch ?? 'HEAD'}</span><span class="sha">{activeRepo?.mergeBase ?? ''}</span></div>
+      <div class="base-summary"><span class="branch-icon">⑂</span><span>{displayRepo?.base ?? review?.workspace.defaultBase ?? 'origin/master'}</span><span class="arrow">→</span><span>{displayRepo?.branch ?? 'HEAD'}</span><span class="sha">{displayRepo?.mergeBase ?? ''}</span></div>
       <div class="mode-picker" role="tablist" aria-label="Diff view">
         {#each modes as item}
           <button role="tab" aria-selected={mode === item.id} class:active={mode === item.id} on:click={() => setMode(item.id)}>{item.label}</button>
         {/each}
       </div>
-      <div class="diff-stats"><span class="additions">+{activeFile?.additions ?? 0}</span><span class="deletions">−{activeFile?.deletions ?? 0}</span>{#if mode === 'full' && activeFile?.status !== 'added'}<span class="full-side-toggle" role="group" aria-label="Full-file source side"><button class:active={fullFileSide === 'new'} aria-pressed={fullFileSide === 'new'} on:click={() => setFullFileSide('new')}>Current</button><button class:active={fullFileSide === 'old'} aria-pressed={fullFileSide === 'old'} on:click={() => setFullFileSide('old')}>Base</button></span>{/if}<button class="icon-button small" title="Copy review content" aria-label="Copy review content" disabled={!canExportReview} aria-expanded={showCopyMenu} on:click={() => showCopyMenu = !showCopyMenu}>⧉</button><button class="icon-button small" title="Focus diff" aria-label="Focus diff" on:click={focusDiff}>⛶</button></div>
+      <div class="diff-stats"><span class="additions">+{activeFile?.additions ?? 0}</span><span class="deletions">−{activeFile?.deletions ?? 0}</span>{#if mode === 'full'}<span class="full-file-extent">{fullFileExtent}</span>{/if}{#if mode === 'full' && activeFile?.status !== 'added' && activeFile?.status !== 'untracked' && activeFile?.status !== 'deleted'}<span class="full-side-toggle" role="group" aria-label="Full-file source side"><button class:active={fullFileSide === 'new'} aria-pressed={fullFileSide === 'new'} title="Complete current file with removed Base lines shown inline" on:click={() => setFullFileSide('new')}>Current</button><button class:active={fullFileSide === 'old'} aria-pressed={fullFileSide === 'old'} title="File before the reviewed changes; removed lines are highlighted" on:click={() => setFullFileSide('old')}>Base</button></span>{/if}{#if mode === 'full' && fullFileDisplaySide === 'new' && (presentation?.deletionBlocks?.length ?? 0) > 0}<span class="full-deletion-controls" role="group" aria-label="Full-file deletion blocks"><button disabled={review?.historical || refreshLocksReview || presentation?.deletionBlocks?.every((block) => block.expanded)} on:click={showAllFullFileDeletions}>Show all deletions</button><button disabled={review?.historical || refreshLocksReview || presentation?.deletionBlocks?.every((block) => !block.expanded)} on:click={hideAllFullFileDeletions}>Hide all deletions</button></span>{/if}<button class="icon-button small" title="Copy review content" aria-label="Copy review content" disabled={!canExportReview} aria-expanded={showCopyMenu} on:click={() => showCopyMenu = !showCopyMenu}>⧉</button><button class="icon-button small" title="Focus diff" aria-label="Focus diff" on:click={focusDiff}>⛶</button></div>
     </div>
 
+    {#if refreshLocksReview}
+      <div class="refresh-status" id="refresh-status" role="status" aria-live="polite">
+        <span class="refresh-progress" role="progressbar" aria-label="Refresh progress" aria-valuetext={refreshStageLabel}><span></span></span>
+        <strong>{refreshStageLabel}</strong>
+        <span>The current snapshot stays available until the complete replacement is ready.</span>
+      </div>
+    {/if}
+
     {#if review?.historical}<div class="historical-banner" role="status">Browsing archived review {review.historicalSessionId?.slice(0, 8)} · frozen diff and annotations · read-only</div>{/if}
-    {#if mode === 'full' && activeFile?.status === 'deleted'}<div class="deleted-banner">This file was deleted. Showing the baseline version.</div>{/if}
+    {#if mode === 'full' && activeFile?.status === 'deleted'}<div class="deleted-banner" role="status">This file was deleted. Showing the complete Base snapshot; Current has no content.</div>{/if}
     {#if showCopyMenu}
       <div class="copy-menu" role="menu" aria-label="Copy review content">
         {#each [['source', 'Copy source'], ['source_with_line_numbers', 'Copy with line numbers'], ['path', 'Copy path'], ['hunk', 'Copy hunk'], ['patch', 'Copy patch'], ['provider_permalink', 'Copy GitHub permalink']] as item}
@@ -1867,9 +2471,27 @@
         {#if !review?.workspace.source.includes('github')}<button role="menuitem" on:click={openExternalEditor}>Open in external editor</button>{/if}
       </div>
     {/if}
-    <VirtualDiff {rows} windowStart={presentation?.startRow ?? 0} totalRows={presentation?.totalRows ?? rows.length} hunks={presentation?.hunks ?? []} oldTokens={presentation?.oldTokens ?? []} newTokens={presentation?.newTokens ?? []} difftastic={presentation?.difftastic} {mode} fontScale={settings.fontScale} {activeLine} composerSelection={composer?.selection} composerKind={composer?.kind ?? 'comment'} {splitRatio} {fullFileSide} {jumpToRow} initialScrollTop={restoredScrollTop} restorationKey={`${activeWorkspaceId}:${activeFileId}:${mode}`} repositoryName={activeRepo?.name ?? 'repository'} filePath={activeFile?.path ?? 'file'} annotationCountAt={annotationsAt} onAnnotate={annotate} onViewportRequest={requestViewport} onExpandHunk={expandHunk} onSplitRatio={updateSplitRatio} onCanonicalMode={setMode} onLocationChange={saveLocation} />
-    {#if mode === 'full'}
-      <nav class="full-minimap" aria-label="Changed-line and annotation minimap">{#each presentation?.hunks ?? [] as hunk (hunk.id)}<button title={`Jump to ${hunk.header}`} aria-label={`Jump to ${hunk.header}`} style:top={`${Math.min(94, Math.max(2, ((hunk.rowIndex / Math.max(1, presentation?.totalRows ?? 1)) * 92) + 2))}%`} on:click={() => { jumpToRow = hunk.rowIndex; activeLine = hunk.newLine ?? hunk.oldLine; }}></button>{/each}{#each (review?.annotations ?? []).filter((annotation) => annotation.fileId === activeFileId && annotation.startLine > 0) as annotation (annotation.id)}<button class="annotation-marker" title={`${annotation.kind} at ${annotation.side} line ${annotation.startLine}`} aria-label={`Jump to ${annotation.kind} at ${annotation.side} line ${annotation.startLine}`} style:top={`${Math.min(96, Math.max(1, (annotation.startLine / Math.max(1, presentation?.totalRows ?? 1)) * 96))}%`} on:click={() => void jumpToAnnotation(annotation)}></button>{/each}</nav>
+    {#if review?.workspace.reviewReady === false}
+      <section class="initial-review-empty" aria-labelledby="initial-review-heading">
+        <span class="initial-review-icon" aria-hidden="true">⑂</span>
+        <h2 id="initial-review-heading">Choose a base and start reviewing</h2>
+        <p>The configured base could not be captured. LocalReview can detect each repository’s default branch and lets you adjust only the ones that need it.</p>
+        <button class="primary-button" on:click={() => void openBaselineSetup()}>Set up review</button>
+        <small>Nothing is fetched or changed until you ask.</small>
+      </section>
+    {:else if review && review.files.length === 0}
+      <section class="initial-review-empty" aria-labelledby="no-changes-heading">
+        <span class="initial-review-icon" aria-hidden="true">✓</span>
+        <h2 id="no-changes-heading">No changes to review</h2>
+        <p>This workspace matches its selected comparison base. Refresh when you are ready to capture new local changes, or adjust the review setup.</p>
+        <div class="initial-review-actions"><button class="primary-button" disabled={refreshLocksReview} on:click={refresh}>{refreshLocksReview ? refreshButtonLabel : 'Refresh'}</button><button class="secondary-button" disabled={refreshLocksReview} on:click={() => void openBaselineSetup()}>Review setup</button></div>
+        <small>LocalReview refreshes only when you ask.</small>
+      </section>
+    {:else}
+      <VirtualDiff {rows} windowStart={presentation?.startRow ?? 0} totalRows={presentation?.totalRows ?? rows.length} hunks={presentation?.hunks ?? []} oldTokens={presentation?.oldTokens ?? []} newTokens={presentation?.newTokens ?? []} difftastic={presentation?.difftastic} {mode} fontScale={settings.fontScale} {activeLine} activeSide={nearestSourceSide} composerSelection={composer?.selection} composerKind={composer?.kind ?? 'comment'} {splitRatio} fullFileSide={fullFileDisplaySide} {jumpToRow} {jumpGeneration} initialScrollTop={restoredScrollTop} restorationKey={`${activeWorkspaceId}:${activeFileId}:${mode}`} repositoryName={activeRepo?.name ?? 'repository'} filePath={activeFile?.path ?? 'file'} annotationCountAt={annotationsAt} annotationsForRow={inlineAnnotationsAt} annotationsEditable={canMutateReview} onAnnotate={annotate} onEditAnnotation={editAnnotation} onViewportRequest={requestViewport} onExpandHunk={expandHunk} onToggleDeletionBlock={toggleFullFileDeletionBlock} onSplitRatio={updateSplitRatio} onCanonicalMode={setMode} onLocationChange={saveLocation} />
+      {#if mode === 'full'}
+      <nav class="full-minimap" aria-label="Changed-line and annotation minimap">{#each presentation?.hunks ?? [] as hunk (hunk.id)}<button title={`Jump to ${hunk.header}`} aria-label={`Jump to ${hunk.header}`} style:top={`${Math.min(94, Math.max(2, ((hunk.rowIndex / Math.max(1, presentation?.totalRows ?? 1)) * 92) + 2))}%`} on:click={() => jumpToFullFileHunk(hunk)}></button>{/each}{#each (review?.annotations ?? []).filter((annotation) => annotation.fileId === activeFileId && annotation.startLine > 0) as annotation (annotation.id)}<button class="annotation-marker" title={`${annotation.kind} at ${annotation.side} line ${annotation.startLine}`} aria-label={`Jump to ${annotation.kind} at ${annotation.side} line ${annotation.startLine}`} style:top={`${Math.min(96, Math.max(1, (annotation.startLine / Math.max(1, presentation?.totalRows ?? 1)) * 96))}%`} on:click={() => void jumpToAnnotation(annotation)}></button>{/each}</nav>
+      {/if}
     {/if}
 
     {#if composer}
@@ -2009,7 +2631,73 @@
 {/if}
 
 {#if showBaselines}
-  <div class="modal-backdrop" role="presentation"><dialog open class="modal baseline-modal" aria-modal="true" aria-labelledby="baseline-title" use:focusTrap={{ onClose: () => showBaselines = false }}><header><div><span class="eyebrow">REVIEW SETUP</span><h2 id="baseline-title">Baselines and comparison</h2><p>Setup never replaces this pinned review. It reads local Git status only when opened or when you press Refresh setup; fetching is always an explicit action.</p></div><button class="icon-button" aria-label="Close review setup" on:click={() => showBaselines = false}>×</button></header><div class="setup-content"><label>Workspace default base<input bind:value={workspaceBase} aria-label="Workspace default base" placeholder="origin/master" /></label>{#if setupError}<p class="modal-error" role="alert">{setupError}</p>{/if}{#if setupLoading}<div class="empty-state">Reading repository status and local refs…</div>{:else if repositorySetup.length}<section class="repository-setup" aria-labelledby="repository-setup-heading"><div class="setup-table-header"><div><h3 id="repository-setup-heading">Repositories</h3><p>Base source shows whether a repository inherits the workspace default or has its own override.</p></div><button class="secondary-button" disabled={setupMutating} on:click={() => void loadRepositorySetup()}>Refresh setup</button></div>{#if setupOperationsSupported()}<div class="setup-bulk-controls"><label>Base for selected repositories<input bind:value={setupOverrideBase} aria-label="Base override for selected repositories" placeholder="origin/HOTFIX-1, v2.0.0, or commit ID" /></label><div><button class="secondary-button" disabled={setupMutating || !selectedSetupRepositoryIds.size} on:click={() => void applySetupBase()}>Apply override</button><button class="secondary-button" disabled={setupMutating || !selectedSetupRepositoryIds.size} on:click={() => void resetSetupBases()}>Reset to inherited</button><button class="secondary-button" disabled={setupMutating || !selectedSetupRepositoryIds.size} on:click={() => void fetchSetupRepositories(false)}>Fetch selected</button><button class="secondary-button" disabled={setupMutating} on:click={() => void fetchSetupRepositories(true)}>Fetch all</button></div></div>{:else}<p class="form-hint">Repository inclusion, local-ref fetch, and base overrides are available for Local workspaces. This provider-pinned review is read-only here.</p>{/if}<div class="setup-table-wrap"><table class="repository-setup-table"><thead><tr><th scope="col">Use</th><th scope="col">Repository</th><th scope="col">Working tree</th><th scope="col">Effective base</th><th scope="col">Resolved revisions</th><th scope="col">Divergence</th><th scope="col">Fetch / errors</th></tr></thead><tbody>{#each repositorySetup as repository (repository.id)}<tr class:excluded={!repository.enabled}><td>{#if setupOperationsSupported()}<label class="setup-check"><input type="checkbox" checked={selectedSetupRepositoryIds.has(repository.id)} aria-label={`Select ${repository.path}`} on:change={(event) => toggleSetupSelection(repository.id, event.currentTarget.checked)} /><input type="checkbox" checked={repository.enabled} disabled={setupMutating} aria-label={`Include ${repository.path} in the next review`} on:change={(event) => void toggleRepositoryInclusion(repository.id, event.currentTarget.checked)} /><span>{repository.enabled ? 'Included' : 'Excluded'}</span></label>{:else}<span>{repository.enabled ? 'Included' : 'Excluded'}</span>{/if}</td><td><strong>{repository.path}</strong><small>{repository.branch}</small></td><td><span class:dirty={repository.clean === false} class:clean={repository.clean === true}>{repository.statusSummary}</span>{#if repository.changedFileCount !== undefined}<small>{repository.changedFileCount} changed {repository.changedFileCount === 1 ? 'file' : 'files'}{repository.statusCheckedAt ? ` · checked ${new Date(repository.statusCheckedAt).toLocaleTimeString()}` : ''}</small>{/if}</td><td><code>{repository.effectiveBase}</code><small>{repository.baseSource}{repository.baseOverride ? ' · explicit override' : ''}</small></td><td><small>Base <code>{repository.resolvedBaseSha?.slice(0, 12) ?? 'unresolved'}</code></small><small>Merge <code>{repository.mergeBaseSha?.slice(0, 12) ?? 'unresolved'}</code></small><small>HEAD <code>{repository.headSha?.slice(0, 12) ?? 'unresolved'}</code></small></td><td>{#if repository.ahead !== undefined || repository.behind !== undefined}<span>↑ {repository.ahead ?? '—'} · ↓ {repository.behind ?? '—'}</span>{:else}<span>Unavailable</span>{/if}</td><td>{#if repository.lastFetchAt}<small>Last fetch {new Date(repository.lastFetchAt).toLocaleString()}</small>{:else}<small>Not fetched by LocalReview</small>{/if}{#if repository.lastFetchError || repository.discoveryError || repository.comparisonError}<p class="setup-error" role="alert">{repository.lastFetchError ?? repository.discoveryError ?? repository.comparisonError}</p>{/if}</td></tr>{/each}</tbody></table></div></section>{:else}<div class="empty-state">No repositories are configured for this workspace.</div>{/if}<fieldset class="comparison-options"><legend>Capture comparison options</legend><label class="fetch-setting"><input type="checkbox" checked={comparisonOptions.ignoreAllWhitespace} disabled={!comparisonOptionsSupported} on:change={(event) => comparisonOptions = { ...comparisonOptions, ignoreAllWhitespace: event.currentTarget.checked }} /> Ignore all whitespace changes</label><label class="fetch-setting"><input type="checkbox" checked={comparisonOptions.ignoreSpaceAtEol} disabled={!comparisonOptionsSupported || comparisonOptions.ignoreAllWhitespace} on:change={(event) => comparisonOptions = { ...comparisonOptions, ignoreSpaceAtEol: event.currentTarget.checked }} /> Ignore whitespace at end of line</label><label class="fetch-setting"><input type="checkbox" checked={comparisonOptions.ignoreCrAtEol} disabled={!comparisonOptionsSupported} on:change={(event) => comparisonOptions = { ...comparisonOptions, ignoreCrAtEol: event.currentTarget.checked }} /> Ignore carriage return at end of line (CRLF)</label><small>{comparisonOptionsSupported ? 'These are Git comparison inputs, not presentation-only whitespace toggles. They apply on your next explicit Refresh or new review, including through the SSH companion.' : 'This GitHub PR uses provider-pinned base and head revisions, so comparison switches are unavailable.'}</small></fieldset><label class="fetch-setting"><input type="checkbox" checked={settings.fetchOnReview} on:change={(event) => setSettings({ fetchOnReview: event.currentTarget.checked })} /> Fetch remotes whenever I explicitly refresh this review</label></div><footer><button class="secondary-button" on:click={() => showBaselines = false}>Done</button><button class="primary-button" disabled={setupMutating} on:click={applyBaselines}>{review?.workspace.reviewReady === false ? 'Save and start review' : 'Save workspace default'}</button></footer></dialog></div>
+  <div class="modal-backdrop" role="presentation">
+    <dialog open class="modal baseline-modal" aria-modal="true" aria-labelledby="baseline-title" use:focusTrap={{ onClose: closeBaselineSetup }}>
+      <header>
+        <div>
+          <span class="eyebrow">REVIEW SETUP</span>
+          <h2 id="baseline-title">{githubReview ? 'Pull request comparison' : review?.workspace.reviewReady === false ? 'Start review' : 'Review setup'}</h2>
+          <p>{githubReview ? 'GitHub pins the base and head for this pull request.' : review?.workspace.reviewReady === false ? 'Choose what to compare. LocalReview has filled in the safest available defaults.' : 'Choose the bases for the next refresh. Your current review stays unchanged until then.'}</p>
+        </div>
+        <button class="icon-button" aria-label="Close review setup" on:click={closeBaselineSetup}>×</button>
+      </header>
+      <div class="setup-content simple-review-setup">
+        {#if githubReview}
+          <div class="setup-notice" role="status">This comparison is read-only. LocalReview uses the exact base and head selected by GitHub.</div>
+        {:else}
+          <label class="default-base-field">Default comparison branch
+            <input bind:value={workspaceBase} aria-label="Default comparison branch" placeholder="origin/master" />
+            <small>Used by every repository that does not have its own value below.</small>
+          </label>
+        {/if}
+        {#if setupAutoBaseNotice}<div class="setup-notice" role="status">✓ {setupAutoBaseNotice}</div>{/if}
+        {#if setupError}<p class="modal-error" role="alert">{setupError}</p>{/if}
+        {#if setupLoading}
+          <div class="empty-state">Checking repositories…</div>
+        {:else if repositorySetup.length}
+          <section class="simple-repository-list" aria-labelledby="repository-setup-heading">
+            <div class="simple-section-heading">
+              <div><h3 id="repository-setup-heading">Repositories to review</h3><p>Turn off anything you do not want in this review.</p></div>
+              <span>{includedRepositoryCount} of {repositorySetup.length} included</span>
+            </div>
+            {#each repositorySetup as repository (repository.id)}
+              <article class:excluded={!repositoryIsEnabled(repository, repositoryEnabled)} class="simple-repository-row">
+                {#if setupOperationsSupported()}
+                  <label class="include-toggle"><input type="checkbox" checked={repositoryIsEnabled(repository, repositoryEnabled)} disabled={setupMutating} aria-label={`Review ${repository.path}`} on:change={(event) => toggleRepositoryInclusion(repository.id, event.currentTarget.checked)} /><span>Review</span></label>
+                {:else}<span class="included-label">{repositoryIsEnabled(repository, repositoryEnabled) ? 'Included' : 'Excluded'}</span>{/if}
+                <div class="repository-identity"><strong>{repository.path}</strong><small>Current branch: {repository.branch}</small><small class:dirty={repository.clean === false} class:clean={repository.clean === true}>{repository.statusSummary}</small></div>
+                {#if githubReview}
+                  <div class="repository-override"><span>GitHub base</span><small><code>{repository.effectiveBase}</code></small></div>
+                {:else}
+                  <label class="repository-override">Compare against
+                    <input value={repositoryBases[repository.id] ?? ''} disabled={!setupOperationsSupported() || !repositoryIsEnabled(repository, repositoryEnabled)} aria-label={`Comparison branch for ${repository.path}`} placeholder={`Default: ${workspaceBase || 'origin/master'}`} on:input={(event) => repositoryBases = { ...repositoryBases, [repository.id]: event.currentTarget.value }} />
+                    {#if repositoryBases[repository.id]?.trim()}<small>Override: <code>{repositoryBases[repository.id].trim()}</code></small>{:else}<small>Uses default: <code>{workspaceBase.trim() || 'origin/master'}</code></small>{/if}
+                    {#if repository.comparisonError && (repositoryBases[repository.id]?.trim() || workspaceBase.trim()) === repository.effectiveBase}<small class="setup-inline-error">{repository.comparisonError}. Enter a different branch above.</small>{/if}
+                  </label>
+                {/if}
+              </article>
+            {/each}
+          </section>
+          {#if !githubReview}<details class="advanced-setup">
+            <summary>Advanced options</summary>
+            <div class="advanced-setup-content">
+              <div class="setup-table-header"><div><h3>Repository details</h3><p>Select rows only when applying the bulk actions below.</p></div><button class="secondary-button" disabled={setupMutating} on:click={() => void loadRepositorySetup()}>Recheck repositories</button></div>
+              {#if setupOperationsSupported()}
+                <div class="setup-bulk-controls"><label>Base for selected repositories<input bind:value={setupOverrideBase} aria-label="Base override for selected repositories" placeholder="origin/HOTFIX-1, v2.0.0, or commit ID" /></label><div><button class="secondary-button" disabled={setupMutating || !selectedSetupRepositoryIds.size} on:click={applySetupBase}>Apply to selected</button><button class="secondary-button" disabled={setupMutating || !selectedSetupRepositoryIds.size} on:click={resetSetupBases}>Use default</button><button class="secondary-button" disabled={setupMutating || !selectedSetupRepositoryIds.size} on:click={() => void fetchSetupRepositories(false)}>Fetch selected</button><button class="secondary-button" disabled={setupMutating} on:click={() => void fetchSetupRepositories(true)}>Fetch all</button></div></div>
+              {/if}
+              <div class="setup-table-wrap"><table class="repository-setup-table"><thead><tr><th scope="col">{setupOperationsSupported() ? 'Select' : 'State'}</th><th scope="col">Repository</th><th scope="col">Working tree</th><th scope="col">Saved base</th><th scope="col">Resolved revisions</th><th scope="col">Divergence</th><th scope="col">Fetch / errors</th></tr></thead><tbody>{#each repositorySetup as repository (repository.id)}<tr class:excluded={!repositoryIsEnabled(repository, repositoryEnabled)}><td>{#if setupOperationsSupported()}<label class="setup-check"><input type="checkbox" checked={selectedSetupRepositoryIds.has(repository.id)} aria-label={`Select ${repository.path} for a bulk action`} on:change={(event) => toggleSetupSelection(repository.id, event.currentTarget.checked)} /><span>Select</span></label>{:else}<span>{repositoryIsEnabled(repository, repositoryEnabled) ? 'Included' : 'Excluded'}</span>{/if}</td><td><strong>{repository.path}</strong><small>{repository.branch}</small></td><td><span class:dirty={repository.clean === false} class:clean={repository.clean === true}>{repository.statusSummary}</span>{#if repository.changedFileCount !== undefined}<small>{repository.changedFileCount} changed {repository.changedFileCount === 1 ? 'file' : 'files'}</small>{/if}</td><td><code>{repository.effectiveBase}</code><small>{repository.baseSource}</small></td><td><small>Base <code>{repository.resolvedBaseSha?.slice(0, 12) ?? 'unresolved'}</code></small><small>Merge <code>{repository.mergeBaseSha?.slice(0, 12) ?? 'unresolved'}</code></small><small>HEAD <code>{repository.headSha?.slice(0, 12) ?? 'unresolved'}</code></small></td><td>{#if repository.ahead !== undefined || repository.behind !== undefined}<span>↑ {repository.ahead ?? '—'} · ↓ {repository.behind ?? '—'}</span>{:else}<span>Unavailable</span>{/if}</td><td>{#if repository.lastFetchAt}<small>Last fetch {new Date(repository.lastFetchAt).toLocaleString()}</small>{:else}<small>Not fetched by LocalReview</small>{/if}{#if repository.lastFetchError || repository.discoveryError || repository.comparisonError}<p class="setup-error" role="alert">{repository.lastFetchError ?? repository.discoveryError ?? repository.comparisonError}</p>{/if}</td></tr>{/each}</tbody></table></div>
+              <fieldset class="comparison-options"><legend>Whitespace comparison</legend><label class="fetch-setting"><input type="checkbox" checked={comparisonOptions.ignoreAllWhitespace} disabled={!comparisonOptionsSupported} on:change={(event) => comparisonOptions = { ...comparisonOptions, ignoreAllWhitespace: event.currentTarget.checked }} /> Ignore all whitespace changes</label><label class="fetch-setting"><input type="checkbox" checked={comparisonOptions.ignoreSpaceAtEol} disabled={!comparisonOptionsSupported || comparisonOptions.ignoreAllWhitespace} on:change={(event) => comparisonOptions = { ...comparisonOptions, ignoreSpaceAtEol: event.currentTarget.checked }} /> Ignore whitespace at end of line</label><label class="fetch-setting"><input type="checkbox" checked={comparisonOptions.ignoreCrAtEol} disabled={!comparisonOptionsSupported} on:change={(event) => comparisonOptions = { ...comparisonOptions, ignoreCrAtEol: event.currentTarget.checked }} /> Ignore carriage returns at end of line</label></fieldset>
+              <label class="fetch-setting"><input type="checkbox" checked={settings.fetchOnReview} on:change={(event) => setSettings({ fetchOnReview: event.currentTarget.checked })} /> Fetch remotes when I explicitly refresh this review</label>
+            </div>
+          </details>{/if}
+        {:else if !setupError}<div class="empty-state">No Git repositories were found in this folder.</div>{/if}
+      </div>
+      <footer>
+        <button class="secondary-button" on:click={closeBaselineSetup}>{review?.workspace.reviewReady === false ? 'Cancel' : 'Close'}</button>
+        {#if !githubReview}<button class="primary-button" disabled={setupMutating || setupLoading || includedRepositoryCount === 0} on:click={applyBaselines}>{setupMutating ? review?.workspace.reviewReady === false ? 'Starting…' : 'Saving…' : review?.workspace.reviewReady === false ? 'Start review' : 'Save changes'}</button>{/if}
+      </footer>
+    </dialog>
+  </div>
 {/if}
 
 {#if showNewReview}

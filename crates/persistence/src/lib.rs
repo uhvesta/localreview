@@ -824,19 +824,22 @@ impl StateStore {
         })
     }
 
-    /// Promotes a prepared generation and every affected annotation rewrite in
-    /// one transaction.  The annotation revisions are inserted in that same
-    /// transaction, so a failed refresh cannot point at a new comparison while
-    /// retaining anchors for the old comparison (or vice versa).
-    pub fn save_prepared_review_generation_with_annotations(
+    /// Promotes every successfully prepared repository generation and all
+    /// affected annotation rewrites in one transaction.  Local refresh builds
+    /// every generation before entering this boundary so concurrent readers
+    /// can observe either the complete prior review or the complete promoted
+    /// review, never a repository-by-repository mixture.
+    pub fn save_prepared_review_refresh_with_annotations(
         &self,
         session: &ReviewSession,
-        generation: &PreparedReviewGeneration,
+        generations: &[PreparedReviewGeneration],
         annotations: &[Annotation],
     ) -> Result<(), PersistenceError> {
         self.with_connection(|connection| {
             let transaction = connection.transaction()?;
-            insert_review_generation(&transaction, session.id, generation)?;
+            for generation in generations {
+                insert_review_generation(&transaction, session.id, generation)?;
+            }
             for annotation in annotations {
                 upsert_annotation(&transaction, annotation)?;
             }
