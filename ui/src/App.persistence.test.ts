@@ -1,6 +1,6 @@
 import { flushSync, mount, tick, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ReviewData, ReviewSettings, Workspace } from './lib/types';
+import type { ReviewData, ReviewSettings, ViewportRequest, Workspace } from './lib/types';
 
 const harness = vi.hoisted(() => {
   const state = {
@@ -54,7 +54,7 @@ function deferred<T>() {
 const settings: ReviewSettings = {
   fontScale: 1, leftWidth: 244, rightWidth: 332, leftCollapsed: false, rightCollapsed: false,
   fetchOnReview: false, theme: 'dark', codeFont: 'SF Mono', externalEditor: 'system', tabWidth: 2,
-  showWhitespace: false, vimNavigation: false, shortcuts: {}
+  showWhitespace: false, wrapLines: false, vimNavigation: false, shortcuts: {}
 };
 
 function workspace(id: string, name: string, reviewReady = true): Workspace {
@@ -81,6 +81,7 @@ function review(value: Workspace): ReviewData {
 
 function installApi(workspaces: Workspace[], initialSettings: ReviewSettings = settings) {
   const reviews = new Map(workspaces.map((value) => [value.id, review(value)]));
+  const archivedWorkspaceIds = new Set(workspaces.filter((value) => value.archived).map((value) => value.id));
   let savedSettings = structuredClone(initialSettings);
   const durableUiStates = new Map<string, Record<string, unknown>>();
   const defaultUiState = { mode: 'unified', fullFileSide: 'new', scrollTop: 0, splitRatio: .5, rightTab: 'files' };
@@ -88,16 +89,35 @@ function installApi(workspaces: Workspace[], initialSettings: ReviewSettings = s
     drafts: [] as Array<Record<string, unknown>>,
     uiStates: [] as Array<{ workspaceId: string; state: Record<string, unknown> }>,
     sessionReads: [] as string[],
-    presentationRequests: [] as Array<{ fileId: string; mode: string; startRow?: number; endRow?: number; fullFileSide?: string }>,
+    presentationRequests: [] as ViewportRequest[],
     setupReads: [] as string[],
     inclusionWrites: [] as Array<{ workspaceId: string; repositoryIds: string[]; enabled: boolean }>,
     baselineWrites: [] as Array<{ workspaceId: string; defaultBase?: string; repositoryBases?: unknown[] }>,
     startRequests: [] as Array<{ workspaceId: string; request?: Record<string, unknown> }>,
     refreshRequests: [] as Array<{ workspaceId: string; request?: Record<string, unknown> }>,
-    settingsWrites: [] as Array<Partial<ReviewSettings>>
+    settingsWrites: [] as Array<Partial<ReviewSettings>>,
+    workspaceDeletes: [] as string[],
+    operationOrder: [] as string[]
   };
   harness.state.implementation = {
-    listWorkspaces: async () => structuredClone(workspaces),
+    listWorkspaces: async () => structuredClone(workspaces.filter((workspace) => !archivedWorkspaceIds.has(workspace.id))),
+    listArchivedWorkspaces: async () => structuredClone(workspaces
+      .filter((workspace) => archivedWorkspaceIds.has(workspace.id))
+      .map((workspace) => ({ ...workspace, archived: true }))),
+    reopenArchivedWorkspace: async (workspaceId: string) => {
+      archivedWorkspaceIds.delete(workspaceId);
+      const value = reviews.get(workspaceId)!;
+      value.workspace = { ...value.workspace, archived: false };
+      return structuredClone(value.workspace);
+    },
+    deleteWorkspace: async (workspaceId: string) => {
+      calls.operationOrder.push(`delete:${workspaceId}`);
+      calls.workspaceDeletes.push(workspaceId);
+      archivedWorkspaceIds.add(workspaceId);
+      const value = reviews.get(workspaceId)!;
+      value.workspace = { ...value.workspace, archived: true };
+    },
+    getReviewHistory: async (workspaceId: string) => structuredClone(reviews.get(workspaceId)?.history ?? []),
     getSettings: async () => structuredClone(savedSettings),
     saveSettings: async (partial: Partial<ReviewSettings>) => {
       calls.settingsWrites.push(structuredClone(partial));
@@ -117,7 +137,7 @@ function installApi(workspaces: Workspace[], initialSettings: ReviewSettings = s
       calls.sessionReads.push(`draft:${workspaceId}`);
       return undefined;
     },
-    getPresentationWindow: async (request: { fileId: string; mode: string; generation: number }) => {
+    getPresentationWindow: async (request: ViewportRequest) => {
       calls.sessionReads.push(`presentation:${request.fileId}`);
       calls.presentationRequests.push(structuredClone(request));
       return {
@@ -160,12 +180,14 @@ function installApi(workspaces: Workspace[], initialSettings: ReviewSettings = s
       return structuredClone(reviews.get(workspaceId));
     },
     saveWorkspaceUiState: async (workspaceId: string, state: Record<string, unknown>) => {
+      calls.operationOrder.push(`ui:${workspaceId}`);
       calls.uiStates.push({ workspaceId, state: structuredClone(state) });
       const saved = { ...defaultUiState, ...(durableUiStates.get(workspaceId) ?? {}), ...state };
       durableUiStates.set(workspaceId, saved);
       return structuredClone(saved);
     },
     saveAnnotationDraft: async (draft: Record<string, unknown>) => {
+      calls.operationOrder.push(`draft:${draft.workspaceId}`);
       calls.drafts.push(structuredClone(draft));
     },
     setViewed: async () => {}
@@ -188,6 +210,14 @@ async function settle(rounds = 3) {
   }
 }
 
+async function waitForUi(predicate: () => boolean, message: string, rounds = 40) {
+  for (let index = 0; index < rounds; index += 1) {
+    await settle(1);
+    if (predicate()) return;
+  }
+  throw new Error(`Timed out waiting for ${message}; status was: ${document.querySelector('.statusbar')?.textContent?.trim() ?? '<missing>'}`);
+}
+
 function emitNative(name: string, payload: unknown) {
   for (const callback of harness.state.listeners.get(name) ?? []) callback({ payload });
 }
@@ -206,6 +236,29 @@ afterEach(async () => {
 });
 
 describe('App review-session persistence boundaries', () => {
+  it('persists the line-wrap preference across app restarts', async () => {
+    const local = workspace('workspace-localreview', 'LocalReview');
+    const calls = installApi([local]);
+    const first = mount(App, { target: target() });
+    await settle(6);
+
+    const wrap = document.querySelector<HTMLButtonElement>('.wrap-toggle')!;
+    expect(wrap.getAttribute('aria-pressed')).toBe('false');
+    wrap.click();
+    await settle(5);
+    expect(calls.settingsWrites.at(-1)).toEqual({ wrapLines: true });
+    expect(document.querySelector('.diff-viewport')?.classList.contains('wrap-lines')).toBe(true);
+
+    unmount(first);
+    await settle();
+    components.push(mount(App, { target: target() }));
+    await settle(6);
+    const toggles = [...document.querySelectorAll<HTMLButtonElement>('.wrap-toggle')];
+    expect(toggles.at(-1)?.getAttribute('aria-pressed')).toBe('true');
+    const viewports = [...document.querySelectorAll('.diff-viewport')];
+    expect(viewports.at(-1)?.classList.contains('wrap-lines')).toBe(true);
+  });
+
   it('restores the last selected workspace and persists later rail selections', async () => {
     const first = workspace('workspace-first', 'First');
     const second = workspace('workspace-second', 'Second');
@@ -222,11 +275,238 @@ describe('App review-session persistence boundaries', () => {
     expect(tabs.find((tab) => tab.textContent?.includes('First'))?.getAttribute('aria-selected')).toBe('true');
   });
 
+  it('keeps the selected tab and visible stable panel identical through asynchronous hydration', async () => {
+    const local = workspace('workspace-localreview', 'LocalReview');
+    const calls = installApi([local]);
+    const hydratedState = deferred<Record<string, unknown>>();
+    harness.state.implementation.getWorkspaceUiState = () => hydratedState.promise;
+    components.push(mount(App, { target: target() }));
+    await settle(4);
+
+    const selectedTab = () => document.querySelector<HTMLButtonElement>('.panel-tabs [role="tab"][aria-selected="true"]');
+    const panelBodies = () => [...document.querySelectorAll<HTMLElement>('.right-panel-body')];
+    const panelBody = () => panelBodies().find((panel) => !panel.hidden);
+    const expectSelectedPanel = (tab: 'files' | 'comments' | 'outline') => {
+      expect(selectedTab()?.id).toBe(`right-panel-tab-${tab}`);
+      expect(selectedTab()?.getAttribute('aria-controls')).toBe(`right-panel-${tab}`);
+      expect(panelBody()?.id).toBe(`right-panel-${tab}`);
+      expect(panelBody()?.dataset.rightPanelBody).toBe(tab);
+      expect(panelBody()?.getAttribute('aria-labelledby')).toBe(`right-panel-tab-${tab}`);
+      expect(panelBodies().filter((panel) => !panel.hidden)).toHaveLength(1);
+      for (const panel of panelBodies()) {
+        expect(panel.getAttribute('aria-hidden')).toBe(String(panel.dataset.rightPanelBody !== tab));
+      }
+    };
+    const clickTab = async (label: string) => {
+      [...document.querySelectorAll<HTMLButtonElement>('.panel-tabs [role="tab"]')]
+        .find((button) => button.textContent?.startsWith(label))?.click();
+      await settle();
+    };
+
+    // All three panels have stable identities before the native per-session
+    // state read resolves. Only Files is initially visible and accessible.
+    expect(panelBodies().map((panel) => panel.dataset.rightPanelBody)).toEqual(['files', 'comments', 'outline']);
+    expectSelectedPanel('files');
+    expect(panelBody()?.querySelector('.panel-filter')).not.toBeNull();
+
+    hydratedState.resolve({
+      mode: 'unified',
+      fullFileSide: 'new',
+      scrollTop: 0,
+      splitRatio: .5,
+      rightTab: 'comments'
+    });
+    await settle(6);
+    expect(selectedTab()?.textContent).toBe('Comments');
+    expectSelectedPanel('comments');
+    expect(panelBody()?.querySelector('.comment-actions')).not.toBeNull();
+    expect(panelBody()?.querySelector('.panel-filter')).toBeNull();
+    expect(panelBody()?.querySelector('.outline-header')).toBeNull();
+    expect(document.querySelector('.statusbar')?.textContent).toContain('Opened LocalReview.');
+    expect(document.querySelector('.statusbar')?.textContent).not.toMatch(/Opening|Loading/);
+    expect(document.querySelector('.busy-indicator')).toBeNull();
+    expect(calls.sessionReads).toContain('presentation:file-localreview');
+
+    const hydratedCommentsBody = panelBody();
+    await clickTab('Comments');
+    expect(selectedTab()?.textContent).toBe('Comments');
+    expectSelectedPanel('comments');
+    expect(panelBody()).toBe(hydratedCommentsBody);
+    expect(panelBody()?.querySelector('.comment-actions')).not.toBeNull();
+
+    await clickTab('Outline');
+    expect(selectedTab()?.textContent).toBe('Outline');
+    expectSelectedPanel('outline');
+    expect(panelBody()?.querySelector('.outline-header')).not.toBeNull();
+    expect(panelBody()?.querySelector('.comment-actions')).toBeNull();
+
+    await clickTab('Comments');
+    expect(selectedTab()?.textContent).toBe('Comments');
+    expectSelectedPanel('comments');
+    expect(panelBody()?.querySelector('.comment-actions')).not.toBeNull();
+    expect(panelBody()?.querySelector('.outline-header')).toBeNull();
+
+    await clickTab('Files');
+    expect(selectedTab()?.textContent).toBe('Files');
+    expectSelectedPanel('files');
+    expect(panelBody()?.querySelector('.panel-filter')).not.toBeNull();
+    expect(panelBody()?.querySelector('.comment-actions')).toBeNull();
+
+    await new Promise((resolve) => window.setTimeout(resolve, 160));
+    await settle();
+    expect(calls.uiStates.at(-1)?.state).toMatchObject({ rightTab: 'files' });
+  });
+
+  it('surfaces an asynchronous workspace hydration failure instead of remaining stuck opening', async () => {
+    const local = workspace('workspace-localreview', 'Broken state');
+    installApi([local]);
+    harness.state.implementation.getWorkspaceUiState = async () => {
+      throw new Error('saved tab state is unavailable');
+    };
+    components.push(mount(App, { target: target() }));
+    await settle(6);
+
+    const status = document.querySelector('.statusbar')?.textContent ?? '';
+    expect(status).toContain('Could not open Broken state: saved tab state is unavailable');
+    expect(status).not.toContain('Opening Broken state');
+    expect(document.querySelector('.busy-indicator')).toBeNull();
+  });
+
+  it('expands, hides, and shows Full File deletions in history without persisting review state', async () => {
+    const local = workspace('workspace-localreview', 'Historical review');
+    const calls = installApi([local]);
+    const historical = review(local);
+    historical.historical = true;
+    historical.historicalSessionId = 'historical-session';
+    historical.files[0] = {
+      ...historical.files[0],
+      deletions: 2,
+      hunkCount: 1,
+      comparisonId: 'comparison-historical'
+    };
+    harness.state.implementation.loadReview = async () => structuredClone(historical);
+    harness.state.implementation.getWorkspaceUiState = async () => ({
+      mode: 'full',
+      fullFileSide: 'new',
+      scrollTop: 0,
+      splitRatio: .5,
+      rightTab: 'files',
+      expandedFullFileDeletionBlocks: []
+    });
+    const blockId = 'comparison-historical:old:4-5';
+    harness.state.implementation.getPresentationWindow = async (request: ViewportRequest) => {
+      calls.presentationRequests.push(structuredClone(request));
+      const expanded = (request.ephemeralExpandedFullFileDeletionBlocks ?? []).includes(blockId);
+      const gate = {
+        id: 'historical-gate',
+        kind: 'deletion_gate',
+        oldLine: 4,
+        oldEndLine: 5,
+        deletionBlockId: blockId,
+        deletionCount: 2,
+        deletionExpanded: expanded,
+        hasAnnotation: false
+      };
+      return {
+        fileId: request.fileId,
+        mode: request.mode,
+        generation: request.generation,
+        startRow: 0,
+        totalRows: expanded ? 3 : 1,
+        rows: expanded
+          ? [gate, { id: 'old-4', kind: 'deletion', oldLine: 4, oldText: 'removed four' }, { id: 'old-5', kind: 'deletion', oldLine: 5, oldText: 'removed five' }]
+          : [gate],
+        hunks: [{ id: 'historical-hunk', rowIndex: 0, oldLine: 4, header: '@@ -4,2 +4,0 @@' }],
+        deletionBlocks: [{ id: blockId, startLine: 4, endLine: 5, count: 2, expanded, rowIndex: 0 }],
+        oldTokens: [],
+        newTokens: [],
+        highlightStatus: 'highlighted'
+      };
+    };
+    components.push(mount(App, { target: target() }));
+    await settle(10);
+
+    expect(document.querySelector('.historical-banner')?.textContent).toContain('read-only');
+    const gate = document.querySelector<HTMLButtonElement>('.deletion-gate-toggle')!;
+    const showAll = [...document.querySelectorAll<HTMLButtonElement>('.full-deletion-controls button')]
+      .find((button) => button.textContent === 'Show all deletions')!;
+    const hideAll = [...document.querySelectorAll<HTMLButtonElement>('.full-deletion-controls button')]
+      .find((button) => button.textContent === 'Hide all deletions')!;
+    expect(gate.disabled).toBe(false);
+    expect(showAll.disabled).toBe(false);
+    expect(hideAll.disabled).toBe(true);
+
+    gate.click();
+    await settle(6);
+    expect(calls.presentationRequests.at(-1)?.ephemeralExpandedFullFileDeletionBlocks).toEqual([blockId]);
+    expect(document.querySelectorAll('.diff-row.removed')).toHaveLength(2);
+    expect(calls.uiStates).toHaveLength(0);
+
+    const refreshedHideAll = [...document.querySelectorAll<HTMLButtonElement>('.full-deletion-controls button')]
+      .find((button) => button.textContent === 'Hide all deletions')!;
+    refreshedHideAll.click();
+    await settle(6);
+    expect(calls.presentationRequests.at(-1)?.ephemeralExpandedFullFileDeletionBlocks).toEqual([]);
+    expect(document.querySelectorAll('.diff-row.removed')).toHaveLength(0);
+
+    const refreshedShowAll = [...document.querySelectorAll<HTMLButtonElement>('.full-deletion-controls button')]
+      .find((button) => button.textContent === 'Show all deletions')!;
+    refreshedShowAll.click();
+    await settle(6);
+    expect(calls.presentationRequests.at(-1)?.ephemeralExpandedFullFileDeletionBlocks).toEqual([blockId]);
+    expect(document.querySelectorAll('.diff-row.removed')).toHaveLength(2);
+    expect(calls.uiStates).toHaveLength(0);
+  });
+
+  it('flushes the active draft and viewport before archiving, then reopens the durable snapshot', async () => {
+    const local = workspace('workspace-localreview', 'Short-lived review');
+    const calls = installApi([local]);
+    components.push(mount(App, { target: target() }));
+    await settle(6);
+
+    [...document.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
+      .find((button) => button.textContent?.startsWith('Comments'))?.click();
+    await settle();
+    [...document.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent === 'File note')?.click();
+    await settle();
+    const draft = document.querySelector<HTMLTextAreaElement>('[aria-label="Annotation text"]')!;
+    draft.value = 'Keep this unsaved thought across archival';
+    draft.dispatchEvent(new Event('input', { bubbles: true }));
+
+    document.querySelector<HTMLButtonElement>('[aria-label="Delete workspace Short-lived review"]')?.click();
+    await settle();
+    expect(document.querySelector('#delete-workspace-title')?.textContent).toContain('Delete Short-lived review from LocalReview?');
+    expect(document.querySelector('[aria-labelledby="delete-workspace-title"]')?.textContent).toContain('folder and Git repositories on disk are not deleted');
+    [...document.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent === 'Archive workspace')?.click();
+    await settle(10);
+
+    expect(calls.workspaceDeletes).toEqual([local.id]);
+    const deleteIndex = calls.operationOrder.lastIndexOf(`delete:${local.id}`);
+    expect(calls.operationOrder.lastIndexOf(`draft:${local.id}`)).toBeLessThan(deleteIndex);
+    expect(calls.operationOrder.lastIndexOf(`ui:${local.id}`)).toBeLessThan(deleteIndex);
+    expect(calls.drafts.at(-1)).toMatchObject({
+      workspaceId: local.id,
+      body: 'Keep this unsaved thought across archival'
+    });
+    expect(document.querySelector(`[aria-label="Delete workspace Short-lived review"]`)).toBeNull();
+
+    [...document.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent === 'History')?.click();
+    await settle(5);
+    expect(document.querySelector('.archived-workspaces')?.textContent).toContain('Short-lived review');
+    [...document.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent === 'Reopen snapshot')?.click();
+    await settle(8);
+    expect(document.querySelector('.workspace-card.selected')?.textContent).toContain('Short-lived review');
+  });
+
   it('resumes initial setup after restart without reading a missing review session', async () => {
     const pending = workspace('workspace-localreview', 'Needs setup', false);
     const calls = installApi([pending]);
     components.push(mount(App, { target: target() }));
-    await settle(5);
+    await settle(8);
 
     expect(document.querySelector('[aria-labelledby="baseline-title"]')).not.toBeNull();
     expect(document.querySelector('#baseline-title')?.textContent).toBe('Start review');
@@ -379,7 +659,10 @@ describe('App review-session persistence boundaries', () => {
       return loaded;
     };
     components.push(mount(App, { target: target() }));
-    await settle(5);
+    await waitForUi(
+      () => calls.presentationRequests.some((request) => request.fileId === 'file-localreview'),
+      'the initial hunk presentation'
+    );
 
     [...document.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
       .find((button) => button.textContent === 'Full File')?.click();
@@ -528,9 +811,17 @@ describe('App review-session persistence boundaries', () => {
       return loaded;
     };
     const getPresentationWindow = harness.state.implementation.getPresentationWindow;
-    harness.state.implementation.getPresentationWindow = async (request: Record<string, unknown>) => ({
+    harness.state.implementation.getPresentationWindow = async (request: Record<string, any>) => ({
       ...(await getPresentationWindow(request)),
+      startRow: request.startRow,
       totalRows: 1_000,
+      rows: Array.from(
+        { length: Math.max(0, request.endRow - request.startRow) },
+        (_, index) => {
+          const line = request.startRow + index + 1;
+          return { id: `${request.fileId}:${line}`, kind: 'context', oldLine: line, newLine: line, oldText: `line ${line}`, newText: `line ${line}` };
+        }
+      ),
       hunks: request.fileId === 'file-zero' ? [] : request.fileId === 'file-other' ? [
         { id: 'other-first', rowIndex: 50, oldLine: 41, newLine: 51, header: '@@ -41 +51 @@' },
         { id: 'other-last', rowIndex: 300, oldLine: 281, newLine: 301, header: '@@ -281 +301 @@' }
@@ -540,23 +831,32 @@ describe('App review-session persistence boundaries', () => {
       ]
     });
     components.push(mount(App, { target: target() }));
-    await settle(5);
+    await waitForUi(
+      () => document.querySelector('.statusbar')?.textContent?.includes('Opened LocalReview.') === true,
+      'cross-file hunk workspace open completion'
+    );
 
     const next = () => document.querySelector<HTMLButtonElement>('[aria-label="Next hunk"]')?.click();
     const previous = () => document.querySelector<HTMLButtonElement>('[aria-label="Previous hunk"]')?.click();
     const activePath = () => document.querySelector('.file-picker')?.textContent ?? '';
     calls.presentationRequests.length = 0;
 
-    next(); await settle(5); // local first
-    next(); await settle(5); // local last
-    next(); await settle(10); // other first, skipping file-zero
+    // Issue the first traversal as real rapid button presses. The navigation
+    // queue must serialize local first → local last → the next file without
+    // depending on jsdom's synthetic viewport-location callbacks.
+    next();
+    next();
+    next();
+    await waitForUi(() => activePath().includes('other.ts'), 'cross-file forward hunk navigation', 160);
     expect(activePath()).toContain('other.ts');
     expect(calls.presentationRequests.some((request) => request.fileId === 'file-zero')).toBe(false);
 
-    previous(); await settle(10); // local last
+    previous();
+    await waitForUi(() => activePath().includes('localreview.ts'), 'cross-file reverse hunk navigation', 160);
     expect(activePath()).toContain('localreview.ts');
     previous(); await settle(5); // local first
-    previous(); await settle(10); // wrap to other last
+    previous();
+    await waitForUi(() => activePath().includes('other.ts'), 'wrapped reverse hunk navigation', 160);
     expect(activePath()).toContain('other.ts');
     await new Promise((resolve) => window.setTimeout(resolve, 160));
     await settle(3);
@@ -566,7 +866,8 @@ describe('App review-session persistence boundaries', () => {
     filter.value = 'localreview';
     filter.dispatchEvent(new Event('input', { bubbles: true }));
     await settle();
-    next(); await settle(10); // active file is outside filter; enter sole shown file
+    next();
+    await waitForUi(() => activePath().includes('localreview.ts'), 'filtered cross-file hunk navigation', 160);
     expect(activePath()).toContain('localreview.ts');
 
     // Two presses issued in one turn advance from local first to local last,
@@ -583,7 +884,10 @@ describe('App review-session persistence boundaries', () => {
     const local = workspace('workspace-localreview', 'LocalReview');
     installApi([local]);
     components.push(mount(App, { target: target() }));
-    await settle(5);
+    await waitForUi(
+      () => document.querySelector('.statusbar')?.textContent?.includes('Opened LocalReview.') === true,
+      'workspace open completion'
+    );
 
     expect(document.querySelector<HTMLButtonElement>('[aria-label="Previous file"]')?.disabled).toBe(true);
     expect(document.querySelector<HTMLButtonElement>('[aria-label="Next file"]')?.disabled).toBe(true);
@@ -601,7 +905,7 @@ describe('App review-session persistence boundaries', () => {
     harness.state.implementation.loadReview = async () => structuredClone(initial);
     const capture = deferred<ReviewData>();
     let refreshCalls = 0;
-    harness.state.implementation.refreshReview = () => {
+    harness.state.implementation.startNewReview = () => {
       refreshCalls += 1;
       return capture.promise;
     };
@@ -626,13 +930,14 @@ describe('App review-session persistence boundaries', () => {
     expect(refreshButton.disabled).toBe(true);
     expect(document.querySelector('.workspace-card.selected .refresh-dot')?.textContent).toContain('Capturing…');
     refreshButton.click();
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
     await settle(3);
 
     expect(refreshCalls).toBe(1);
     expect(refreshButton.disabled).toBe(true);
     expect(refreshButton.textContent).toContain('Capturing…');
-    expect(document.querySelector('.refresh-status strong')?.textContent).toContain('Capturing a snapshot');
-    expect(document.querySelector('[role="progressbar"]')?.getAttribute('aria-valuetext')).toContain('Capturing a snapshot');
+    expect(document.querySelector('.refresh-status strong')?.textContent).toContain('Archiving this round');
+    expect(document.querySelector('[role="progressbar"]')?.getAttribute('aria-valuetext')).toContain('Archiving this round');
     expect(document.querySelector('main')?.getAttribute('aria-busy')).not.toBe('true');
     expect(document.querySelector<HTMLButtonElement>('[aria-label="Next file"]')?.disabled).toBe(false);
     expect(document.querySelector<HTMLButtonElement>('.bulk-view-button')?.disabled).toBe(true);
@@ -691,8 +996,196 @@ describe('App review-session persistence boundaries', () => {
     expect(document.querySelector('.diff-stats .additions')?.textContent).toBe('+22');
     expect(document.querySelector('.review-progress strong')?.textContent).toBe('1/2');
     expect(document.querySelector('.diff-viewport')?.textContent).toContain('new snapshot');
-    expect(document.querySelector('.statusbar')?.textContent).toContain('complete snapshot is now displayed');
+    expect(document.querySelector('.statusbar')?.textContent).toContain('new review round is now displayed');
     expect(calls.uiStates.some((call) => call.state.activeFileId === 'next-1')).toBe(true);
+  });
+
+  it('uses Refresh as a durable review-round boundary and exposes the prior feedback in History', async () => {
+    const local = workspace('workspace-localreview', 'LocalReview');
+    const calls = installApi([local]);
+    const initial = review(local);
+    initial.files[0].comparisonId = 'comparison-prior-round';
+    initial.annotations = [{
+      id: 'feedback-1', fileId: initial.files[0].id, repositoryId: initial.repositories[0].id,
+      kind: 'comment', state: 'open', side: 'new', startLine: 1, endLine: 1,
+      body: 'Keep this feedback in the prior round.', selectedSource: 'new', labels: [],
+      localOnly: false, createdAt: '2026-07-22T00:00:00.000Z'
+    }];
+    initial.files[0].annotationCount = 1;
+    initial.workspace.draftCount = 1;
+    harness.state.implementation.loadReview = async () => structuredClone(initial);
+    const next = structuredClone(initial);
+    next.files[0].comparisonId = 'comparison-next-round';
+    next.annotations = [];
+    next.files[0].annotationCount = 0;
+    next.workspace.draftCount = 0;
+    next.history = [{
+      id: 'review:prior-round', type: 'review', label: 'Archived review',
+      annotationCount: 1, createdAt: '2026-07-22T00:01:00.000Z'
+    }];
+    harness.state.implementation.startNewReview = async (workspaceId: string, request?: Record<string, unknown>) => {
+      calls.startRequests.push({ workspaceId, request: structuredClone(request) });
+      return structuredClone(next);
+    };
+    harness.state.implementation.listArchivedWorkspaces = async () => [];
+    harness.state.implementation.getReviewHistory = async () => structuredClone(next.history);
+    components.push(mount(App, { target: target() }));
+    await waitForUi(
+      () => document.querySelector('.annotation-thread-toggle') !== null,
+      'the restored inline annotation'
+    );
+
+    document.querySelector<HTMLButtonElement>('.annotation-thread-toggle')?.click();
+    await settle(3);
+    expect(document.querySelector('.inline-thread-popover')?.textContent)
+      .toContain('Keep this feedback in the prior round.');
+
+    document.querySelector<HTMLButtonElement>('.status-button')?.click();
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    await settle(8);
+    expect(calls.startRequests).toHaveLength(1);
+    expect(calls.refreshRequests).toHaveLength(0);
+    expect([...document.querySelectorAll<HTMLButtonElement>('.panel-tabs [role="tab"]')]
+      .find((button) => button.textContent?.startsWith('Comments'))?.textContent).toBe('Comments');
+    expect(document.querySelector('.inline-thread-popover')).toBeNull();
+    expect(document.querySelector('.statusbar')?.textContent).toContain('Archived the prior round');
+
+    const actions = document.querySelector<HTMLDetailsElement>('.actions-menu')!;
+    actions.open = true;
+    [...actions.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+      .find((button) => button.textContent === 'History')?.click();
+    await settle(5);
+    expect(document.querySelector('.history-list')?.textContent).toContain('Archived review');
+    expect(document.querySelector('.history-list')?.textContent).toContain('1 annotations');
+  });
+
+  it('hands History off to each exact prompt export without stacking modal backdrops', async () => {
+    const local = workspace('workspace-localreview', 'LocalReview');
+    installApi([local]);
+    const initial = review(local);
+    const exactExports = [
+      { id: 'export:feedback', label: 'Review feedback', title: 'Review feedback', content: '# Exact feedback\n\nKeep the feedback exact.' },
+      { id: 'export:questions', label: 'Questions for investigation', title: 'Questions for investigation', content: '# Exact questions\n\nWhy does this happen?' },
+      { id: 'export:full', label: 'Full review prompt', title: 'Full review prompt', content: '# Exact full review\n\nFeedback and questions.' }
+    ];
+    initial.history = exactExports.map((entry, index) => ({
+      id: entry.id,
+      type: 'export' as const,
+      label: entry.label,
+      annotationCount: index + 1,
+      createdAt: `2026-07-22T00:0${index}:00.000Z`
+    }));
+    harness.state.implementation.loadReview = async () => structuredClone(initial);
+    harness.state.implementation.getReviewHistory = async () => structuredClone(initial.history);
+    const promptRequests: Array<{ workspaceId: string; historyId?: string }> = [];
+    harness.state.implementation.generatePrompt = async (workspaceId: string, request: { historyId?: string }) => {
+      promptRequests.push({ workspaceId, historyId: request.historyId });
+      const exact = exactExports.find((entry) => entry.id === request.historyId);
+      if (!exact) throw new Error('missing exact export');
+      return {
+        exportId: exact.id.slice('export:'.length),
+        title: exact.title,
+        content: exact.content,
+        annotationCount: 1,
+        estimatedTokens: 12
+      };
+    };
+    components.push(mount(App, { target: target() }));
+    await settle(6);
+
+    for (const exact of exactExports) {
+      const actions = document.querySelector<HTMLDetailsElement>('.actions-menu')!;
+      actions.open = true;
+      [...actions.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+        .find((button) => button.textContent === 'History')?.click();
+      await settle(5);
+
+      expect(document.querySelector('.history-modal')).not.toBeNull();
+      expect(document.querySelectorAll('dialog[open]')).toHaveLength(1);
+      const historyEntry = [...document.querySelectorAll<HTMLElement>('.history-list article')]
+        .find((article) => article.querySelector('strong')?.textContent === exact.label)!;
+      [...historyEntry.querySelectorAll<HTMLButtonElement>('button')]
+        .find((button) => button.textContent === 'Open exact export')?.click();
+      await settle(5);
+
+      expect(document.querySelector('.history-modal')).toBeNull();
+      expect(document.querySelectorAll('dialog[open]')).toHaveLength(1);
+      expect(document.querySelector('.prompt-modal #prompt-title')?.textContent).toBe(exact.title);
+      expect(document.querySelector('.prompt-modal pre')?.textContent).toBe(exact.content);
+      expect(document.querySelector('.prompt-exact-note')?.textContent).toContain('Exact durable export');
+
+      document.querySelector<HTMLButtonElement>('[aria-label="Close prompt preview"]')?.click();
+      await settle();
+      expect(document.querySelectorAll('dialog[open]')).toHaveLength(0);
+    }
+
+    expect(promptRequests).toEqual(exactExports.map((entry) => ({
+      workspaceId: local.id,
+      historyId: entry.id
+    })));
+  });
+
+  it('promotes the committed GitHub review round when the provider refresh fails', async () => {
+    const github = {
+      ...workspace('workspace-github', 'GitHub review'),
+      source: ['github'] as Workspace['source'],
+      refreshAvailable: true,
+      refreshAvailableRevision: 4
+    };
+    const calls = installApi([github]);
+    const initial = review(github);
+    initial.files[0] = { ...initial.files[0], comparisonId: 'github-prior', additions: 1 };
+    initial.annotations = [{
+      id: 'github-feedback', fileId: initial.files[0].id, repositoryId: initial.repositories[0].id,
+      kind: 'comment', state: 'open', side: 'new', startLine: 1, endLine: 1,
+      body: 'Preserve this in the archived GitHub round.', selectedSource: 'new', labels: [],
+      localOnly: false, createdAt: '2026-07-22T00:00:00.000Z'
+    }];
+    initial.files[0].annotationCount = 1;
+    initial.workspace.draftCount = 1;
+    harness.state.implementation.loadReview = async () => structuredClone(initial);
+
+    const next = structuredClone(initial);
+    next.files[0] = { ...next.files[0], comparisonId: 'github-next', additions: 19, annotationCount: 0 };
+    next.annotations = [];
+    next.workspace = { ...next.workspace, draftCount: 0 };
+    next.history = [{
+      id: 'review:github-prior', type: 'review', label: 'Archived GitHub review',
+      annotationCount: 1, createdAt: '2026-07-22T00:01:00.000Z'
+    }];
+    harness.state.implementation.startNewReview = async (workspaceId: string, request?: Record<string, unknown>) => {
+      calls.startRequests.push({ workspaceId, request: structuredClone(request) });
+      return structuredClone(next);
+    };
+    harness.state.implementation.refreshReview = async (workspaceId: string, request?: Record<string, unknown>) => {
+      calls.refreshRequests.push({ workspaceId, request: structuredClone(request) });
+      throw new Error('provider temporarily unavailable');
+    };
+    harness.state.implementation.getReviewHistory = async () => structuredClone(next.history);
+    components.push(mount(App, { target: target() }));
+    await settle(6);
+
+    document.querySelector<HTMLButtonElement>('.status-button')?.click();
+    await settle(12);
+
+    expect(calls.startRequests).toHaveLength(1);
+    expect(calls.refreshRequests).toHaveLength(1);
+    expect(document.querySelector('.diff-stats .additions')?.textContent).toBe('+19');
+    expect([...document.querySelectorAll<HTMLButtonElement>('.panel-tabs [role="tab"]')]
+      .find((button) => button.textContent?.startsWith('Comments'))?.textContent).toBe('Comments');
+    expect(document.querySelector<HTMLButtonElement>('.status-button')?.textContent)
+      .toContain('Refresh incomplete');
+    expect(document.querySelector('.statusbar')?.textContent)
+      .toContain('new review round is displayed at the previous pinned GitHub revisions');
+    expect(document.querySelector('.statusbar')?.textContent).toContain('provider temporarily unavailable');
+
+    const actions = document.querySelector<HTMLDetailsElement>('.actions-menu')!;
+    actions.open = true;
+    [...actions.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+      .find((button) => button.textContent === 'History')?.click();
+    await settle(5);
+    expect(document.querySelector('.history-list')?.textContent).toContain('Archived GitHub review');
+    expect(document.querySelector('.history-list')?.textContent).toContain('1 annotations');
   });
 
   it('keeps the old file list and diff intact when refreshed presentation staging fails', async () => {
@@ -702,7 +1195,7 @@ describe('App review-session persistence boundaries', () => {
     harness.state.implementation.loadReview = async () => structuredClone(initial);
     const next = structuredClone(initial);
     next.files[0] = { ...next.files[0], id: 'next-file', path: 'renamed.ts', previousPath: initial.files[0].path, additions: 99, comparisonId: 'next-comparison' };
-    harness.state.implementation.refreshReview = async () => structuredClone(next);
+    harness.state.implementation.startNewReview = async () => structuredClone(next);
     const normalPresentation = harness.state.implementation.getPresentationWindow;
     harness.state.implementation.getPresentationWindow = (request: Record<string, any>) => request.fileId === 'next-file'
       ? Promise.reject(new Error('presentation unavailable'))
@@ -718,7 +1211,7 @@ describe('App review-session persistence boundaries', () => {
     expect(document.querySelector('.file-picker')?.textContent).not.toContain('renamed.ts');
     expect(document.querySelector('.diff-stats .additions')?.textContent).toBe('+1');
     expect(document.querySelector('.diff-viewport')?.textContent).not.toBe('');
-    expect(document.querySelector('.statusbar')?.textContent).toContain('previous snapshot remains displayed: presentation unavailable');
+    expect(document.querySelector('.statusbar')?.textContent).toContain('previous snapshot remains displayed or is available in History: presentation unavailable');
     expect(document.querySelector<HTMLButtonElement>('.status-button')?.disabled).toBe(false);
     expect(document.querySelector<HTMLButtonElement>('.status-button')?.textContent).toContain('Refresh failed');
     expect(document.querySelector<HTMLButtonElement>('.status-button')?.getAttribute('aria-label')).toContain('Retry refresh');
@@ -735,7 +1228,7 @@ describe('App review-session persistence boundaries', () => {
       failedRepositoryCount: 1,
       failures: [{ repositoryId: 'repo-localreview', repositoryPath: '.', error: 'main no longer resolves to a commit' }]
     };
-    harness.state.implementation.refreshReview = async () => structuredClone(failed);
+    harness.state.implementation.startNewReview = async () => structuredClone(failed);
     components.push(mount(App, { target: target() }));
     await settle(8);
 
@@ -767,7 +1260,7 @@ describe('App review-session persistence boundaries', () => {
       failedRepositoryCount: 1,
       failures: [{ repositoryId: 'repo-b', repositoryPath: 'packages/b', error: 'repository changed during capture' }]
     };
-    harness.state.implementation.refreshReview = async () => structuredClone(partial);
+    harness.state.implementation.startNewReview = async () => structuredClone(partial);
     components.push(mount(App, { target: target() }));
     await settle(8);
 
@@ -791,7 +1284,7 @@ describe('App review-session persistence boundaries', () => {
     const second = workspace('workspace-b', 'Workspace B');
     installApi([first, second]);
     const capture = deferred<ReviewData>();
-    harness.state.implementation.refreshReview = () => capture.promise;
+    harness.state.implementation.startNewReview = () => capture.promise;
     components.push(mount(App, { target: target() }));
     await settle(6);
 
@@ -824,7 +1317,7 @@ describe('App review-session persistence boundaries', () => {
     const local = workspace('workspace-localreview', 'LocalReview');
     installApi([local]);
     const next = review({ ...local, refreshAvailable: true });
-    harness.state.implementation.refreshReview = async () => structuredClone(next);
+    harness.state.implementation.startNewReview = async () => structuredClone(next);
     components.push(mount(App, { target: target() }));
     await settle(8);
 
@@ -846,7 +1339,7 @@ describe('App review-session persistence boundaries', () => {
     const local = { ...workspace('workspace-localreview', 'LocalReview'), refreshAvailable: true, refreshAvailableRevision: 4 };
     installApi([local]);
     const capture = deferred<ReviewData>();
-    harness.state.implementation.refreshReview = () => capture.promise;
+    harness.state.implementation.startNewReview = () => capture.promise;
     components.push(mount(App, { target: target() }));
     await settle(8);
 
@@ -912,7 +1405,7 @@ describe('App review-session persistence boundaries', () => {
     const second = workspace('workspace-b', 'Workspace B');
     installApi([first, second]);
     const capture = deferred<ReviewData>();
-    harness.state.implementation.refreshReview = () => capture.promise;
+    harness.state.implementation.startNewReview = () => capture.promise;
     components.push(mount(App, { target: target() }));
     await settle(8);
 
@@ -942,7 +1435,7 @@ describe('App review-session persistence boundaries', () => {
       refreshAvailable: true,
       revision: 4
     });
-    harness.state.implementation.refreshReview = async () => { throw new Error('capture failed'); };
+    harness.state.implementation.startNewReview = async () => { throw new Error('capture failed'); };
     document.querySelector<HTMLButtonElement>('.status-button')?.click();
     await settle(8);
     vi.advanceTimersByTime(3201);

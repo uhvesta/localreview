@@ -190,6 +190,12 @@ export interface ViewportRequest {
   generation: number;
   fullFileSide?: FullFileSide;
   splitRatio?: number;
+  /**
+   * Presentation-only expansion override for a frozen historical snapshot.
+   * Native active reviews persist this choice in their session UI state;
+   * archived browsing must never write through to that active session.
+   */
+  ephemeralExpandedFullFileDeletionBlocks?: string[];
 }
 
 export interface DifftasticSpan {
@@ -333,6 +339,7 @@ export interface ReviewSettings {
   externalEditor: 'system' | 'vscode' | 'cursor' | 'zed' | 'sublime' | 'idea';
   tabWidth: number;
   showWhitespace: boolean;
+  wrapLines: boolean;
   vimNavigation: boolean;
   shortcuts: Record<string, string>;
 }

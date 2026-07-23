@@ -244,13 +244,17 @@ pub fn validate_ref(value: &str, label: &str) -> Result<(), ProtocolError> {
 
 pub fn validate_github_pr_url(value: &str) -> Result<(), ProtocolError> {
     validate_text(value, "GitHub pull request URL", 2_048)?;
-    let Some(rest) = value.strip_prefix("https://github.com/") else {
+    let Some(rest) = value.trim().strip_prefix("https://github.com/") else {
         return Err(ProtocolError::InvalidInput(
             "pull request URL must use https://github.com".into(),
         ));
     };
-    let parts: Vec<_> = rest.split('/').collect();
-    if parts.len() != 4
+    let path = rest
+        .split_once(['?', '#'])
+        .map_or(rest, |(path, _)| path)
+        .trim_end_matches('/');
+    let parts: Vec<_> = path.split('/').collect();
+    if parts.len() < 4
         || parts[0].is_empty()
         || parts[1].is_empty()
         || parts[2] != "pull"
@@ -330,8 +334,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn github_pr_urls_are_strict() {
+    fn github_pr_urls_accept_browser_copy_variants_on_the_strict_host_and_route() {
         assert!(validate_github_pr_url("https://github.com/acme/repo/pull/42").is_ok());
+        assert!(validate_github_pr_url(" https://github.com/acme/repo/pull/42/files ").is_ok());
+        assert!(validate_github_pr_url(
+            "https://github.com/acme/repo/pull/42/files?diff=split#discussion_r123"
+        )
+        .is_ok());
         assert!(validate_github_pr_url("http://github.com/acme/repo/pull/42").is_err());
         assert!(validate_github_pr_url("https://github.com/acme/repo/issues/42").is_err());
         assert!(validate_github_pr_url("https://github.com/acme/repo/pull/0").is_err());

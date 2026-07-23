@@ -628,13 +628,32 @@ impl ReviewService {
             .annotations(set.id)?
             .into_iter()
             .filter(|annotation| {
-                annotation.state != localreview_domain::AnnotationState::Deleted
+                // The UI only offers open annotations, but the service is the
+                // publication trust boundary. A resolved/outdated item must
+                // never reappear in a native review through a stale or crafted
+                // command invocation.
+                annotation.state == localreview_domain::AnnotationState::Open
                     && annotation.publication_state != PublicationState::LocalOnly
                     && annotation.publication_state != PublicationState::Published
                     && (requested.is_empty() || requested.contains(&annotation.id))
             })
             .collect::<Vec<_>>();
         selected.sort_by_key(|annotation| annotation.id);
+        if !requested.is_empty() {
+            let selected_ids = selected
+                .iter()
+                .map(|annotation| annotation.id)
+                .collect::<BTreeSet<_>>();
+            let unavailable = requested
+                .difference(&selected_ids)
+                .copied()
+                .collect::<Vec<_>>();
+            if !unavailable.is_empty() {
+                return Err(ServiceError::GitHubReviewAnnotationsUnavailable {
+                    annotation_ids: unavailable,
+                });
+            }
+        }
         let documents = self.review_documents(session.id)?;
         let comments = selected
             .iter()
@@ -1738,6 +1757,55 @@ mod tests {
     }
 
     #[test]
+    fn preview_rejects_resolved_or_unknown_selected_annotations() {
+        let fixture = fixture();
+        let opened = open(&fixture);
+        let workspace_id = opened.workspace.id;
+        let (session_id, annotation_id) =
+            add_publishable_annotation(&fixture.service, workspace_id);
+        let set = fixture
+            .service
+            .state
+            .active_annotation_set(session_id)
+            .unwrap()
+            .unwrap();
+        let mut annotation = fixture
+            .service
+            .state
+            .annotations(set.id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        annotation.state = AnnotationState::Resolved;
+        annotation.updated_at = Utc::now();
+        fixture.service.state.save_annotation(&annotation).unwrap();
+
+        for unavailable in [annotation_id, AnnotationId::new()] {
+            let error = fixture
+                .service
+                .preview_github_review(FinishGitHubReviewRequest {
+                    workspace_id,
+                    annotation_ids: vec![unavailable],
+                    summary_markdown: "Do not silently post only this summary.".into(),
+                    conclusion: ReviewConclusion::Comment,
+                })
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                ServiceError::GitHubReviewAnnotationsUnavailable {
+                    annotation_ids
+                } if annotation_ids == vec![unavailable]
+            ));
+        }
+        assert!(fixture
+            .service
+            .state
+            .github_publications_for_session::<GitHubPublicationRecord>(session_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn definitive_http_rejection_is_terminal_and_does_not_strand_later_previews() {
         let fixture = fixture();
         let opened = open(&fixture);
@@ -2650,6 +2718,38 @@ mod tests {
                 .head_sha,
             Some(fixture.head.clone())
         );
+        let (archived_session_id, archived_annotation_id) =
+            add_publishable_annotation(&fixture.service, opened.workspace.id);
+        let archived_set_id = fixture
+            .service
+            .state
+            .active_annotation_set(archived_session_id)
+            .unwrap()
+            .unwrap()
+            .id;
+        let archived_documents = fixture
+            .service
+            .review_documents(archived_session_id)
+            .unwrap();
+        let archived_export = localreview_domain::PromptExportRecord {
+            id: localreview_domain::PromptExportId::new(),
+            review_session_id: archived_session_id,
+            annotation_set_id: archived_set_id,
+            annotation_set_ids: vec![archived_set_id],
+            scope: localreview_domain::PromptScope::CommentsAndQuestions,
+            annotation_ids: vec![archived_annotation_id],
+            template_version: crate::PROMPT_TEMPLATE_VERSION,
+            rendered_markdown: Some("# Exact GitHub review export\n\nDurable fixture.".into()),
+            title: Some("Full review prompt".into()),
+            annotation_count: Some(1),
+            estimated_tokens: Some(12),
+            created_at: Utc::now(),
+        };
+        fixture
+            .service
+            .state
+            .save_prompt_export(&archived_export)
+            .unwrap();
 
         fs::write(new_worktree.join("do-not-delete.txt"), "dirty\n").unwrap();
         assert!(matches!(
@@ -2673,5 +2773,34 @@ mod tests {
             .unwrap()
             .archived_at
             .is_some());
+
+        let reopened =
+            ReviewService::new(StateStore::open(fixture.service.state().root()).unwrap());
+        assert_eq!(
+            reopened.review_documents(archived_session_id).unwrap(),
+            archived_documents,
+            "deleting the disposable worktree must not delete the frozen review"
+        );
+        assert_eq!(
+            reopened
+                .state
+                .annotations(archived_set_id)
+                .unwrap()
+                .iter()
+                .map(|annotation| annotation.id)
+                .collect::<Vec<_>>(),
+            vec![archived_annotation_id],
+            "archived GitHub feedback must remain durable after restart"
+        );
+        assert_eq!(
+            reopened
+                .state
+                .prompt_export(archived_export.id)
+                .unwrap()
+                .unwrap()
+                .rendered_markdown,
+            archived_export.rendered_markdown,
+            "exact prompt bytes must survive disposable-worktree deletion and restart"
+        );
     }
 }

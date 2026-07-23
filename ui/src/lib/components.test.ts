@@ -1,8 +1,9 @@
 import { flushSync, mount, tick, unmount } from 'svelte';
+import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it } from 'vitest';
-  import App from '../App.svelte';
-  import VirtualDiff from './VirtualDiff.svelte';
-  import VirtualFileList from './VirtualFileList.svelte';
+import App from '../App.svelte';
+import VirtualDiff from './VirtualDiff.svelte';
+import VirtualFileList from './VirtualFileList.svelte';
 import WorkspaceRail from './WorkspaceRail.svelte';
 import type { Annotation, DiffRow, Workspace } from './types';
 
@@ -84,6 +85,38 @@ describe('review components', () => {
     unmount(component);
   });
 
+  it('reveals All workspaces when a newly opened PR crosses the current source filter', async () => {
+    const component = mount(App, { target: target() });
+    await settle();
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+    await settle();
+    const sourceFilter = document.querySelector<HTMLElement>('[aria-label="Filter workspaces"]')!;
+    [...sourceFilter.querySelectorAll<HTMLButtonElement>('button')].find((button) => button.textContent === 'Local')?.click();
+    await settle();
+    expect(sourceFilter.querySelector<HTMLButtonElement>('[aria-pressed="true"]')?.textContent).toBe('Local');
+
+    document.querySelector<HTMLButtonElement>('.open-workspace')?.click();
+    await settle();
+    [...document.querySelectorAll<HTMLButtonElement>('.open-options button')]
+      .find((button) => button.textContent?.includes('Paste GitHub PR URL'))?.click();
+    await settle();
+    const input = document.querySelector<HTMLInputElement>('[aria-label="GitHub pull request URL"]')!;
+    input.value = 'https://github.com/spinyfin/mono/pull/2138';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    [...document.querySelectorAll<HTMLButtonElement>('.open-modal footer button')]
+      .find((button) => button.textContent === 'Open PR review')?.click();
+    await settle();
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+    await settle();
+
+    expect(sourceFilter.querySelector<HTMLButtonElement>('[aria-pressed="true"]')?.textContent).toBe('All');
+    expect([...document.querySelectorAll('.workspace-tab')].some((tab) => tab.textContent?.includes('LocalReview'))).toBe(true);
+    expect([...document.querySelectorAll('.workspace-tab')].some((tab) => tab.textContent?.includes('spinyfin/mono #2138'))).toBe(true);
+    expect([...document.querySelectorAll<HTMLElement>('.workspace-tab')]
+      .find((tab) => tab.textContent?.includes('spinyfin/mono #2138'))?.getAttribute('aria-selected')).toBe('true');
+    unmount(component);
+  });
+
   it('exposes explicit SSH reconnect and recoverable-remove actions in the workspace rail', async () => {
     const ssh: Workspace = { id: 'ssh', name: 'Remote', source: ['ssh'], location: 'host:/repo', detail: '', progress: { viewed: 0, total: 1 }, draftCount: 0, connection: 'offline' };
     const removed: string[] = [];
@@ -98,7 +131,9 @@ describe('review components', () => {
     });
     await settle();
     document.querySelector<HTMLButtonElement>('[aria-label="Reconnect Remote"]')?.click();
-    document.querySelector<HTMLButtonElement>('[aria-label="Remove Remote from workspace rail"]')?.click();
+    const deleteButton = document.querySelector<HTMLButtonElement>('[aria-label="Delete workspace Remote"]');
+    expect(deleteButton?.textContent).toBe('Delete…');
+    deleteButton?.click();
     expect(reconnected).toEqual(['ssh']);
     expect(removed).toEqual(['ssh']);
     unmount(component);
@@ -176,6 +211,41 @@ describe('review components', () => {
     unmount(component);
   });
 
+  it('shows a newly saved multiline annotation in the diff immediately', async () => {
+    const component = mount(App, { target: target() });
+    await settle();
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+    await settle();
+
+    document.querySelector<HTMLButtonElement>('[aria-label="Add annotation at new line 68"]')?.click();
+    await settle();
+    document.querySelector<HTMLButtonElement>('[aria-label="Add annotation at new line 70"]')
+      ?.dispatchEvent(new MouseEvent('click', { bubbles: true, shiftKey: true }));
+    await settle();
+    const textarea = document.querySelector<HTMLTextAreaElement>('[aria-label="Annotation text"]')!;
+    textarea.value = 'Keep the zoom update atomic across these lines.';
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    [...document.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.startsWith('Save annotation'))?.click();
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    await settle();
+
+    const startGutter = document.querySelector<HTMLButtonElement>('[data-side="new"][data-line="68"]')!;
+    const startRow = startGutter.closest<HTMLElement>('.diff-row')!;
+    expect(startRow.classList.contains('annotation-range')).toBe(true);
+    expect(startRow.getAttribute('aria-label')).toContain('1 annotation');
+    expect(document.querySelectorAll('.diff-row.annotation-range')).toHaveLength(4);
+
+    const toggle = document.querySelector<HTMLButtonElement>('[aria-label*="Show 1 annotation"][data-line="70"]')!;
+    expect(toggle).not.toBeNull();
+    toggle.click();
+    await settle();
+    expect(document.querySelector('.inline-thread-popover')?.textContent)
+      .toContain('Keep the zoom update atomic across these lines.');
+    unmount(component);
+  });
+
   it('lists every selected local item and its publication state before a GitHub submit', async () => {
     const component = mount(App, { target: target() });
     await settle();
@@ -190,7 +260,20 @@ describe('review components', () => {
     await settle();
     expect(document.querySelector('[aria-label="Selected review items"]')?.textContent).toContain('Selected local items');
     expect(document.querySelector('[aria-label="Selected review items"]')?.textContent).toContain('Local only · excluded from GitHub');
-    expect(document.querySelector('[aria-label="Exact GitHub review payload"]')).not.toBeNull();
+    expect(document.body.textContent).toContain('LocalReview verified every path and line anchor');
+    expect(document.querySelector('[aria-label="Exact GitHub review payload"]')).toBeNull();
+    const finishContent = document.querySelector<HTMLElement>('.finish-content')!;
+    const selectedItem = document.querySelector<HTMLElement>('.finish-items article')!;
+    const selectedPath = selectedItem.querySelector<HTMLElement>('code')!;
+    const selectedBody = selectedItem.querySelector<HTMLElement>('small')!;
+    expect(finishContent).not.toBeNull();
+    expect(selectedPath).not.toBeNull();
+    expect(selectedBody).not.toBeNull();
+    const appCss = readFileSync('src/app.css', 'utf8');
+    expect(appCss).toMatch(/\.finish-content\s*\{[^}]*overflow-x:\s*hidden/);
+    expect(appCss).toMatch(/\.finish-items article > div\s*\{[^}]*min-width:\s*0/);
+    expect(appCss).toMatch(/\.finish-items code\s*\{[^}]*min-width:\s*0[^}]*text-overflow:\s*ellipsis/);
+    expect(appCss).toMatch(/\.finish-items small\s*\{[^}]*white-space:\s*pre-wrap[^}]*overflow-wrap:\s*anywhere/);
     unmount(component);
   });
 
@@ -266,7 +349,7 @@ describe('review components', () => {
     unmount(component);
   });
 
-  it('renders collapsed Full File deletion gates with annotation state and expands on demand', async () => {
+  it('renders wrapped Full File deletion gates as compact full-width controls and expands on demand', async () => {
     const toggles: string[] = [];
     const host = target();
     const component = mount(VirtualDiff, {
@@ -279,6 +362,7 @@ describe('review components', () => {
         totalRows: 1,
         mode: 'full',
         fullFileSide: 'new',
+        wrapLines: true,
         onToggleDeletionBlock: (id: string) => toggles.push(id)
       }
     });
@@ -290,6 +374,15 @@ describe('review components', () => {
     const toggle = gate.querySelector<HTMLButtonElement>('.deletion-gate-toggle')!;
     expect(toggle.textContent).toContain('› 5 deleted lines · Base 4–8 · annotations hidden');
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    const appCss = readFileSync('src/app.css', 'utf8');
+    const gateColumns = appCss.match(/^\.diff-row\.deletion-gate-row\s*\{[^}]+\}/gm)?.at(-1) ?? '';
+    expect(gateColumns).toContain('minmax(0, 1fr)');
+    const wrappedGate = appCss.match(/\.diff-viewport\.wrap-lines \.diff-row\.deletion-gate-row\s*\{[^}]+\}/g)?.at(-1) ?? '';
+    expect(wrappedGate).toContain('white-space: nowrap');
+    const wrappedToggle = appCss.match(/\.diff-viewport\.wrap-lines \.deletion-gate-toggle\s*\{[^}]+\}/g)?.at(-1) ?? '';
+    expect(wrappedToggle).toContain('min-width: 0');
+    expect(wrappedToggle).toContain('overflow: hidden');
+    expect(wrappedToggle).toContain('text-overflow: ellipsis');
     toggle.click();
     expect(toggles).toEqual(['block-4-8']);
     unmount(component);
@@ -712,6 +805,34 @@ describe('review components', () => {
     await settle();
     expect((document.activeElement as HTMLElement).dataset.line).toBe('1');
     unmount(component);
+  });
+
+  it('wraps long diff rows without fixed-height clipping and keeps nowrap as the default', async () => {
+    const rows: DiffRow[] = [{ id: 'long-added', kind: 'addition', newLine: 1, newText: `const message = '${'long '.repeat(120)}';` }];
+    const nowrapHost = target();
+    const nowrap = mount(VirtualDiff, { target: nowrapHost, props: { rows, totalRows: 1, mode: 'unified' } });
+    await settle();
+    expect(nowrapHost.querySelector('.diff-viewport')?.classList.contains('wrap-lines')).toBe(false);
+    expect(nowrapHost.querySelector<HTMLElement>('.diff-row')?.style.height).toBe('24px');
+    expect(nowrapHost.querySelector('.diff-row')?.classList.contains('added')).toBe(true);
+    unmount(nowrap);
+
+    const wrapHost = target();
+    const wrapped = mount(VirtualDiff, { target: wrapHost, props: { rows, totalRows: 1, mode: 'unified', wrapLines: true } });
+    await settle();
+    expect(wrapHost.querySelector('.diff-viewport')?.classList.contains('wrap-lines')).toBe(true);
+    expect(wrapHost.querySelector<HTMLElement>('.diff-row')?.style.height).toBe('');
+    expect(wrapHost.querySelector<HTMLElement>('.diff-row')?.style.minHeight).toBe('24px');
+    expect(wrapHost.querySelector('.diff-row')?.getAttribute('data-virtual-row')).toBe('0');
+    unmount(wrapped);
+  });
+
+  it('sizes split columns from the center diff viewport instead of the OS window', async () => {
+    const appCss = readFileSync('src/app.css', 'utf8');
+    const splitRule = appCss.match(/\.diff-row\.split-row\s*\{[^}]+\}/g)?.at(-1) ?? '';
+    expect(splitRule).toContain('var(--split-old-width');
+    expect(splitRule).toContain('var(--split-new-width');
+    expect(splitRule).not.toContain('100vw');
   });
 
   it('uses prompt export as the primary local Finish action', async () => {

@@ -206,6 +206,10 @@ impl GitExecutor for ProcessGitExecutor {
             // produced. Mutating commands such as explicit fetch still take
             // their required locks; this disables only optional lock-taking.
             .env("GIT_OPTIONAL_LOCKS", "0")
+            // Desktop requests have no terminal in which to answer a Git
+            // credential prompt. Fail with an actionable authentication
+            // error instead of making PR import look permanently frozen.
+            .env("GIT_TERMINAL_PROMPT", "0")
             .args(&command.arguments)
             .output()
             .map_err(|source| GitError::Spawn {

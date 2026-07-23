@@ -301,6 +301,46 @@ describe('browser fallback API', () => {
     expect(await restarted.getWorkspaceUiState(workspaceId)).toMatchObject({ mode: 'unified', scrollTop: 0, rightTab: 'files' });
   });
 
+  it('migrates legacy mock files to navigable hunk counts', async () => {
+    const seed = makeMockApi();
+    await seed.setViewed('workspace-localreview', 'file-app', true);
+    const persisted = JSON.parse(localStorage.getItem('localreview.mock.v1')!);
+    for (const review of Object.values(persisted.reviews) as Array<{ files: Array<{ hunkCount?: number }> }>) {
+      for (const file of review.files) delete file.hunkCount;
+    }
+    localStorage.setItem('localreview.mock.v1', JSON.stringify(persisted));
+
+    const upgraded = makeMockApi();
+    const review = await upgraded.loadReview('workspace-localreview');
+    expect(review.files.every((file) => file.hunkCount > 0)).toBe(true);
+    expect(review.files.find((file) => file.id === 'file-app')?.hunkCount).toBe(2);
+    const migrated = JSON.parse(localStorage.getItem('localreview.mock.v1')!);
+    expect(migrated.reviews['workspace-localreview'].files.every((file: { hunkCount?: number }) => Number.isSafeInteger(file.hunkCount))).toBe(true);
+  });
+
+  it('models Full File Current removals as collapsed, expandable deletion gates', async () => {
+    const api = makeMockApi();
+    const collapsed = await api.getPresentationWindow({
+      fileId: 'file-app', mode: 'full', fullFileSide: 'new',
+      startRow: 0, endRow: 500, generation: 1
+    });
+    expect(collapsed.deletionBlocks?.length).toBeGreaterThan(0);
+    expect(collapsed.rows.filter((row) => row.kind === 'deletion_gate')).toHaveLength(collapsed.deletionBlocks!.length);
+    expect(collapsed.rows.some((row) => row.kind === 'deletion')).toBe(false);
+    expect(collapsed.hunks.every((hunk) => hunk.oldLine || hunk.newLine)).toBe(true);
+
+    const firstBlock = collapsed.deletionBlocks![0]!;
+    await expect(api.resolvePresentationLocation('file-app', 'full', 'old', firstBlock.startLine))
+      .resolves.toMatchObject({ rowIndex: firstBlock.rowIndex, side: 'old', line: firstBlock.startLine });
+    await api.saveWorkspaceUiState('workspace-localreview', { expandedFullFileDeletionBlocks: [firstBlock.id] });
+    const expanded = await api.getPresentationWindow({
+      fileId: 'file-app', mode: 'full', fullFileSide: 'new',
+      startRow: 0, endRow: 500, generation: 2
+    });
+    expect(expanded.deletionBlocks?.find((block) => block.id === firstBlock.id)?.expanded).toBe(true);
+    expect(expanded.rows.some((row) => row.kind === 'deletion' && row.oldLine === firstBlock.startLine)).toBe(true);
+  });
+
   it('keeps removed workspaces recoverable and can reopen their captured snapshot', async () => {
     const api = makeMockApi();
     const before = await api.loadReview('workspace-localreview');
@@ -314,6 +354,18 @@ describe('browser fallback API', () => {
     expect(reopened.files).toEqual(before.files);
     expect(reopened.annotations).toEqual(before.annotations);
     expect((await api.listWorkspaces()).some((workspace) => workspace.id === before.workspace.id)).toBe(true);
+  });
+
+  it('reactivates an archived local workspace when its path is opened again', async () => {
+    const api = makeMockApi();
+    const before = await api.loadReview('workspace-localreview');
+    await api.deleteWorkspace(before.workspace.id);
+
+    const reopened = await api.openWorkspace({ path: before.workspace.location });
+    expect(reopened.id).toBe(before.workspace.id);
+    expect(reopened.archived).not.toBe(true);
+    expect((await api.listArchivedWorkspaces()).some((workspace) => workspace.id === before.workspace.id)).toBe(false);
+    expect((await api.loadReview(reopened.id)).files).toEqual(before.files);
   });
 
   it('reconnects only SSH workspaces through the explicit recovery action', async () => {

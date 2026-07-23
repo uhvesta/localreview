@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { flushSync, onMount } from 'svelte';
+  import { flushSync, onMount, tick } from 'svelte';
   import { isTauri } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import WorkspaceRail from './lib/WorkspaceRail.svelte';
@@ -25,6 +25,12 @@
   const browserFixtureMode = !isTauri();
   const modes: { id: DiffMode; label: string; shortcut?: string }[] = [
     { id: 'unified', label: 'Unified' }, { id: 'split', label: 'Split' }, { id: 'full', label: 'Full File' }, { id: 'difftastic', label: 'Difftastic' }
+  ];
+  type RightPanelTab = 'files' | 'comments' | 'outline';
+  const rightPanelTabs: { id: RightPanelTab; label: string }[] = [
+    { id: 'files', label: 'Files' },
+    { id: 'comments', label: 'Comments' },
+    { id: 'outline', label: 'Outline' }
   ];
   function apiFailureMessage(error: unknown, fallback: string) {
     if (error instanceof Error && error.message) return error.message;
@@ -57,7 +63,7 @@
   let nearestSourceSide: DiffSide | undefined;
   let restoredScrollTop = 0;
   let outline: OutlineSymbol[] = [];
-  let rightTab: 'files' | 'comments' | 'outline' = 'files';
+  let rightTab: RightPanelTab = 'files';
   let fileSearch = '';
   let repositoryFilter = 'all';
   let fileGrouping: FileGrouping = 'repository';
@@ -77,7 +83,7 @@
   let changedFileIds = new Set<string>();
   let activeLine: number | undefined;
   let activeSelection: DiffSelection | undefined;
-  let settings: ReviewSettings = { fontScale: 1, leftWidth: 244, rightWidth: 332, leftCollapsed: false, rightCollapsed: false, fetchOnReview: false, theme: 'dark', codeFont: 'SF Mono', externalEditor: 'system', tabWidth: 2, showWhitespace: false, vimNavigation: false, shortcuts: {} };
+  let settings: ReviewSettings = { fontScale: 1, leftWidth: 244, rightWidth: 332, leftCollapsed: false, rightCollapsed: false, fetchOnReview: false, theme: 'dark', codeFont: 'SF Mono', externalEditor: 'system', tabWidth: 2, showWhitespace: false, wrapLines: false, vimNavigation: false, shortcuts: {} };
   let zoomToast = '';
   let busy = false;
   type RefreshStage = 'capturing' | 'preparing' | 'updated' | 'failed';
@@ -186,6 +192,8 @@
   // reads/writes. Serialize explicit presses so a rapid double press advances
   // twice from the first result instead of racing two stale file snapshots.
   let hunkNavigationChain: Promise<void> = Promise.resolve();
+  let pendingHunkNavigationCount = 0;
+  let queuedHunkCursor: { fileId: string; line: number; side: DiffSide; mode: DiffMode; fullFileSide: DiffSide } | undefined;
   let settingsRevision = 0;
   let finishPreviewGeneration = 0;
   const commandItems: Array<{ label: string; shortcut: string; run: () => void }> = [
@@ -203,6 +211,17 @@
 
   $: activeFile = review?.files.find((file) => file.id === activeFileId);
   $: activeRepo = review?.repositories.find((repository) => repository.id === activeFile?.repositoryId);
+  // VirtualDiff receives stable annotation lookup callbacks, so carry the
+  // mutable annotation payload as an explicit reactive invalidation key.
+  $: annotationRevision = JSON.stringify((review?.annotations ?? []).map((annotation) => [
+    annotation.id, annotation.fileId, annotation.side, annotation.startLine, annotation.endLine,
+    annotation.kind, annotation.state, annotation.body, annotation.labels, annotation.publishedId,
+    annotation.localOnly
+  ]));
+  $: annotationContextKey = activeFile?.comparisonId
+    ?? review?.historicalSessionId
+    ?? review?.history.find((item) => item.type === 'review')?.id
+    ?? '';
   $: displayRepo = activeRepo ?? (review?.files.length === 0 && review.repositories.length === 1 ? review.repositories[0] : undefined);
   // A deleted file has no current-side source. Keep the user's persisted side
   // preference for the next file, but never ask the renderer to label the
@@ -252,8 +271,8 @@
   $: refreshStageLabel = activeRefreshState?.stage === 'preparing'
     ? 'Preparing the captured diff'
     : activeRefreshState?.fetchBeforeCapture
-      ? 'Fetching configured remotes and capturing a snapshot'
-      : 'Capturing a snapshot from local refs';
+      ? 'Archiving this round, fetching remotes, and capturing the next'
+      : 'Archiving this round and capturing the next from local refs';
   $: refreshButtonLabel = review?.historical
     ? 'Archived snapshot'
     : activeRefreshState?.stage === 'capturing'
@@ -372,9 +391,12 @@
     return incoming;
   }
 
-  function mergeWorkspaceList(incoming: Workspace[]) {
+  function mergeWorkspaceList(incoming: Workspace[], preserveExisting = false) {
     const existing = new Map(workspaces.map((workspace) => [workspace.id, workspace]));
-    return incoming.map((workspace) => mergeRefreshAvailability(workspace, existing.get(workspace.id)));
+    const merged = incoming.map((workspace) => mergeRefreshAvailability(workspace, existing.get(workspace.id)));
+    if (!preserveExisting) return merged;
+    const incomingIds = new Set(incoming.map((workspace) => workspace.id));
+    return [...merged, ...workspaces.filter((workspace) => !incomingIds.has(workspace.id))];
   }
 
   function matchesShortcut(event: KeyboardEvent, configured: string | undefined) {
@@ -504,7 +526,9 @@
 
   async function selectWorkspace(id: string) {
     const selectionGeneration = ++workspaceSelectionGeneration;
+    const loadingMessage = `Opening ${workspaces.find((workspace) => workspace.id === id)?.name ?? 'workspace'}…`;
     busy = true;
+    statusMessage = loadingMessage;
     try {
       if (review && review.workspace.id !== id) await flushReviewPersistence();
       if (selectionGeneration !== workspaceSelectionGeneration) return;
@@ -554,7 +578,7 @@
       if (selectionGeneration !== workspaceSelectionGeneration || review?.workspace.id !== id) return;
       // A one-shot, read-only provider check on selection. This does not poll,
       // mutate pins, fetch a worktree, or refresh the review generation.
-      if (review?.workspace.source.includes('github')) void checkGitHubFreshness(id);
+      if (review?.workspace.source.includes('github') && !review.historical) void checkGitHubFreshness(id);
       if (review?.workspace.source.includes('github')) void loadGitHubContext(id);
       else { githubContext = undefined; githubThreads = []; githubConversation = []; }
       const state = await api.getWorkspaceUiState(id);
@@ -562,7 +586,7 @@
       mode = state.mode ?? 'unified';
       fullFileSide = state.fullFileSide ?? 'new';
       splitRatio = state.splitRatio ?? .5;
-      rightTab = state.rightTab ?? 'files';
+      await hydrateRightPanelTab(state.rightTab ?? 'files', false);
       nearestSourceLine = state.nearestSourceLine;
       nearestSourceSide = state.nearestSourceSide;
       restoredScrollTop = state.scrollTop ?? 0;
@@ -598,6 +622,13 @@
       await loadPresentation(0, 220);
       if (selectionGeneration !== workspaceSelectionGeneration || review?.workspace.id !== id) return;
       await loadOutline();
+      if (selectionGeneration === workspaceSelectionGeneration && statusMessage === loadingMessage) {
+        statusMessage = `Opened ${review.workspace.name}.`;
+      }
+    } catch (error) {
+      if (selectionGeneration === workspaceSelectionGeneration) {
+        statusMessage = `Could not open ${workspaces.find((workspace) => workspace.id === id)?.name ?? 'workspace'}: ${apiFailureMessage(error, 'native workspace load failed')}`;
+      }
     } finally {
       if (selectionGeneration === workspaceSelectionGeneration) busy = false;
     }
@@ -699,7 +730,19 @@
     busy = true;
     const generation = ++viewportGeneration;
     try {
-      const next = await api.getPresentationWindow({ fileId: activeFileId, comparisonId: activeFile?.comparisonId, mode, startRow, endRow, generation, fullFileSide: fullFileDisplaySide, splitRatio });
+      const next = await api.getPresentationWindow({
+        fileId: activeFileId,
+        comparisonId: activeFile?.comparisonId,
+        mode,
+        startRow,
+        endRow,
+        generation,
+        fullFileSide: fullFileDisplaySide,
+        splitRatio,
+        ephemeralExpandedFullFileDeletionBlocks: review?.historical && mode === 'full'
+          ? [...expandedFullFileDeletionBlocks]
+          : undefined
+      });
       if (next.generation !== viewportGeneration || next.fileId !== activeFileId || next.mode !== mode) return;
       presentation = next;
       rows = next.rows;
@@ -804,6 +847,27 @@
     if (uiStateSaveTimer) window.clearTimeout(uiStateSaveTimer);
     pendingUiStateSave = snapshot;
     uiStateSaveTimer = window.setTimeout(() => void flushPendingWorkspaceUiState(), 120);
+  }
+
+  function transitionRightPanelTab(nextTab: RightPanelTab, persist = true) {
+    // Each tab panel stays mounted with a stable DOM identity. Native WebKit
+    // previously retained the old keyed subtree when async hydration changed
+    // the selected tab, even though it updated the sibling tab attributes.
+    // Updating only visibility keeps the visual and accessibility trees tied
+    // to the same state transition without replacing either subtree.
+    rightTab = nextTab;
+    if (persist) persistWorkspaceUiState({ rightTab: nextTab });
+  }
+
+  async function hydrateRightPanelTab(nextTab: RightPanelTab, persist = true) {
+    transitionRightPanelTab(nextTab, persist);
+    // Let Svelte commit tab selection and panel visibility together before
+    // workspace startup continues with presentation and outline reads.
+    await tick();
+  }
+
+  function selectRightPanelTab(nextTab: RightPanelTab) {
+    transitionRightPanelTab(nextTab);
   }
 
   function captureWorkspaceUiState(partial: Partial<WorkspaceUiState> = {}) {
@@ -1100,7 +1164,7 @@
         return;
       }
       changedSincePreviousOnly = true;
-      rightTab = 'files';
+      await hydrateRightPanelTab('files');
       const changedCount = result.files.filter((file) => file.kind !== 'unchanged' && file.currentFileId).length;
       statusMessage = `Showing ${changedCount} files changed since the previous captured review${result.truncated ? ' (result truncated)' : ''}.`;
     } catch (error) {
@@ -1158,17 +1222,30 @@
     composer = undefined;
     editingAnnotationId = undefined;
     selectedAnnotationIds = new Set([...selectedAnnotationIds, saved.id]);
-    rightTab = 'comments';
+    await hydrateRightPanelTab('comments');
     persistWorkspaceUiState();
     await discardComposerDraft(workspaceId);
   }
 
-  async function previewPrompt(scope = promptScope, historyId = promptHistoryId, focusedAnnotationId?: string) {
+  async function previewPrompt(scope = promptScope, historyId = promptHistoryId, focusedAnnotationId?: string, closeHistoryOnSuccess = false) {
     if (!review || (!canExportReview && !historyId)) return;
+    const nextPrompt = await api.generatePrompt(review.workspace.id, { scope, portable: promptPortable, historyId, annotationIds: scope === 'focused_question' ? (focusedAnnotationId ? [focusedAnnotationId] : []) : scope === 'selected' ? [...selectedAnnotationIds] : undefined });
+    // A history export is a modal-to-modal handoff. Commit the preview state
+    // and dismiss History in the same render so the later History backdrop
+    // cannot remain above the prompt and make the action appear inert.
     promptScope = scope;
     promptHistoryId = historyId;
     largePromptCopyWarning = false;
-    prompt = await api.generatePrompt(review.workspace.id, { scope, portable: promptPortable, historyId, annotationIds: scope === 'focused_question' ? (focusedAnnotationId ? [focusedAnnotationId] : []) : scope === 'selected' ? [...selectedAnnotationIds] : undefined });
+    prompt = nextPrompt;
+    if (closeHistoryOnSuccess) showHistory = false;
+  }
+
+  async function previewPromptFromHistory(historyId: string) {
+    try {
+      await previewPrompt('all', historyId, undefined, true);
+    } catch (error) {
+      statusMessage = `Could not open review-history export: ${error instanceof Error ? error.message : 'unknown error'}`;
+    }
   }
 
   async function previewFocusedQuestion() {
@@ -1429,13 +1506,22 @@
   function previousHunk() { enqueueHunkNavigation(-1); }
   function enqueueHunkNavigation(direction: 1 | -1) {
     if (!canNavigateShownHunks) return;
+    pendingHunkNavigationCount += 1;
     const move = hunkNavigationChain
       .catch(() => { /* one failed move must not poison later navigation */ })
       .then(() => navigateHunk(direction));
     hunkNavigationChain = move;
-    void move.catch((error) => {
-      statusMessage = `Could not navigate captured hunks: ${apiFailureMessage(error, 'native presentation command failed')}`;
-    });
+    void move.then(
+      () => finishQueuedHunkNavigation(),
+      (error) => {
+        finishQueuedHunkNavigation();
+        statusMessage = `Could not navigate captured hunks: ${apiFailureMessage(error, 'native presentation command failed')}`;
+      }
+    );
+  }
+  function finishQueuedHunkNavigation() {
+    pendingHunkNavigationCount = Math.max(0, pendingHunkNavigationCount - 1);
+    if (pendingHunkNavigationCount === 0) queuedHunkCursor = undefined;
   }
   async function navigateHunk(direction: 1 | -1) {
     const originFileId = activeFileId;
@@ -1450,8 +1536,14 @@
     // visible state; do not pull the reviewer back to an obsolete origin.
     if (activeFileId !== originFileId || navigationContextChanged()) return;
     const fallbackCurrent = direction === 1 ? 0 : Number.MAX_SAFE_INTEGER;
-    const currentSide = nearestSourceLine && nearestSourceSide ? nearestSourceSide : originSide;
-    const current = nearestSourceLine ?? activeLine ?? fallbackCurrent;
+    const queueCursor = queuedHunkCursor?.fileId === originFileId
+      && queuedHunkCursor.mode === originMode
+      && queuedHunkCursor.fullFileSide === originFullFileSide
+      ? queuedHunkCursor
+      : undefined;
+    const currentSide = queueCursor?.side
+      ?? (nearestSourceLine && nearestSourceSide ? nearestSourceSide : originSide);
+    const current = queueCursor?.line ?? nearestSourceLine ?? activeLine ?? fallbackCurrent;
     const inFile = direction === 1
       ? locations.find((hunk) => hunkLine(hunk, currentSide) > current)
       : locations.filter((hunk) => hunkLine(hunk, currentSide) < current).at(-1);
@@ -1502,7 +1594,10 @@
       endRow: 1,
       generation,
       fullFileSide: side,
-      splitRatio
+      splitRatio,
+      ephemeralExpandedFullFileDeletionBlocks: review?.historical && locationMode === 'full'
+        ? [...expandedFullFileDeletionBlocks]
+        : undefined
     });
     return result.fileId === fileId ? result.hunks : [];
   }
@@ -1523,6 +1618,15 @@
     activeLine = line;
     nearestSourceLine = line;
     nearestSourceSide = targetSide;
+    if (pendingHunkNavigationCount > 0) {
+      queuedHunkCursor = {
+        fileId: activeFileId,
+        line,
+        side: targetSide,
+        mode,
+        fullFileSide: fullFileDisplaySide
+      };
+    }
     if (mode === 'difftastic') {
       await jumpToSource(activeFileId, targetSide, line, mode);
       return;
@@ -1592,9 +1696,14 @@
     await loadOutline();
   }
   async function updateFullFileDeletionBlocks(next: Set<string>) {
-    if (review?.historical) return;
     expandedFullFileDeletionBlocks = next;
-    await persistWorkspaceUiStateNow({ expandedFullFileDeletionBlocks: [...next] });
+    // A frozen review remains semantically immutable, but its disclosure
+    // controls are still useful for inspection. Historical expansion is sent
+    // only with the next presentation read and is never written into either
+    // the active or archived session UI-state record.
+    if (!review?.historical) {
+      await persistWorkspaceUiStateNow({ expandedFullFileDeletionBlocks: [...next] });
+    }
     await loadPresentation(presentation?.startRow ?? 0, (presentation?.startRow ?? 0) + 220);
   }
   async function toggleFullFileDeletionBlock(blockId: string) {
@@ -1631,7 +1740,7 @@
   }
 
   async function jumpToAnnotation(annotation: Annotation) {
-    rightTab = 'comments';
+    await hydrateRightPanelTab('comments');
     if (!hasLineAnchor(annotation)) {
       activeAnnotationId = annotation.id;
       statusMessage = annotation.kind === 'review_note'
@@ -1863,17 +1972,41 @@
     // so even a slow IPC boundary cannot leave the click looking ignored.
     flushSync(() => {
       setWorkspaceRefreshState(workspaceId, { operationId, stage: 'capturing', fetchBeforeCapture });
-      statusMessage = `${fetchBeforeCapture ? 'Fetching configured remotes and capturing' : 'Capturing from local refs'}\u2026 The current snapshot remains available while this finishes.`;
+      statusMessage = `${fetchBeforeCapture ? 'Archiving this review round, fetching configured remotes, and capturing the next' : 'Archiving this review round and capturing the next from local refs'}\u2026 The current snapshot remains available while this finishes.`;
     });
     try {
-      let nextReview = normalizeReview(await api.refreshReview(workspaceId, { fetchBeforeCapture, comparisonOptions: comparisonOptionsSupported ? comparisonOptions : undefined }));
+      // Refresh is the review-round boundary: persist every draft/view state,
+      // archive the pinned diff with its feedback, then capture into a fresh
+      // active session. GitHub gets one provider refresh after that boundary
+      // so a failed network update can never rewrite the archived anchors.
+      await flushReviewPersistence();
+      let nextReview = normalizeReview(await api.startNewReview(workspaceId, { fetchBeforeCapture, comparisonOptions: comparisonOptionsSupported ? comparisonOptions : undefined }));
+      let providerRefreshFailure = '';
+      if (nextReview.workspace.source.includes('github')) {
+        try {
+          nextReview = normalizeReview(await api.refreshReview(workspaceId, { fetchBeforeCapture }));
+        } catch (error) {
+          // startNewReview already committed the review-round boundary. Keep
+          // the UI aligned with that new active session even when GitHub is
+          // temporarily unavailable, and leave an explicit retry affordance.
+          providerRefreshFailure = apiFailureMessage(error, 'GitHub refresh failed');
+          nextReview = {
+            ...nextReview,
+            workspace: { ...nextReview.workspace, refreshAvailable: true }
+          };
+        }
+      }
       if (!refreshStateMatches(workspaceId, operationId) || workspaceSelectionGeneration !== selectionGeneration || review?.workspace.id !== workspaceId) {
         // This capture still completed natively. Keep its inactive rail card
         // accurate without touching the workspace the reviewer moved to. A
         // later watcher revision still wins over this older capture result.
         updateRefreshedWorkspaceSummary(nextReview, workspaceId);
         if (refreshStateMatches(workspaceId, operationId)) {
-          showNativeRefreshOutcome(nextReview, workspaceId, operationId, fetchBeforeCapture);
+          if (providerRefreshFailure) {
+            showTemporaryRefreshOutcome(workspaceId, { operationId, stage: 'failed', fetchBeforeCapture, partial: true }, 5000);
+          } else {
+            showNativeRefreshOutcome(nextReview, workspaceId, operationId, fetchBeforeCapture);
+          }
         }
         return;
       }
@@ -1908,7 +2041,11 @@
       if (!preparedDisplay || !refreshStateMatches(workspaceId, operationId) || workspaceSelectionGeneration !== selectionGeneration || review?.workspace.id !== workspaceId) {
         updateRefreshedWorkspaceSummary(nextReview, workspaceId);
         if (refreshStateMatches(workspaceId, operationId)) {
-          showNativeRefreshOutcome(nextReview, workspaceId, operationId, fetchBeforeCapture);
+          if (providerRefreshFailure) {
+            showTemporaryRefreshOutcome(workspaceId, { operationId, stage: 'failed', fetchBeforeCapture, partial: true }, 5000);
+          } else {
+            showNativeRefreshOutcome(nextReview, workspaceId, operationId, fetchBeforeCapture);
+          }
         }
         return;
       }
@@ -1928,6 +2065,12 @@
       expandedFullFileDeletionBlocks = new Set(refreshedState.expandedFullFileDeletionBlocks ?? []);
       changedSincePrevious = undefined;
       changedSincePreviousOnly = false;
+      composer = undefined;
+      editingAnnotationId = undefined;
+      activeSelection = undefined;
+      prompt = undefined;
+      promptHistoryId = undefined;
+      selectedAnnotationIds = new Set();
       if (!preparedDisplay.preservedFile) {
         activeLine = undefined;
         nearestSourceLine = undefined;
@@ -1940,16 +2083,22 @@
         ? { ...workspace, ...mergeRefreshAvailability(nextReview.workspace, workspace) }
         : workspace);
       persistWorkspaceUiState({ activeFileId: preparedDisplay.activeFileId || undefined, scrollTop: restoredScrollTop });
-      statusMessage = nativeRefreshFailure
+      statusMessage = providerRefreshFailure
+        ? `Archived the prior round. The new review round is displayed at the previous pinned GitHub revisions, but GitHub could not be refreshed: ${providerRefreshFailure}. Retry Refresh when GitHub is available.${classificationWarning}`
+        : nativeRefreshFailure
         ? `${nativeRefreshFailure}${classificationWarning}`
-        : `${fetchBeforeCapture ? 'Refreshed after fetching configured remotes.' : 'Refreshed from local refs; no automatic fetch.'} The complete snapshot is now displayed.${classificationWarning}`;
-      showNativeRefreshOutcome(nextReview, workspaceId, operationId, fetchBeforeCapture);
+        : `${fetchBeforeCapture ? 'Archived the prior round and refreshed after fetching configured remotes.' : 'Archived the prior round and refreshed from local refs; no automatic fetch.'} The new review round is now displayed.${classificationWarning}`;
+      if (providerRefreshFailure) {
+        showTemporaryRefreshOutcome(workspaceId, { operationId, stage: 'failed', fetchBeforeCapture, partial: true }, 5000);
+      } else {
+        showNativeRefreshOutcome(nextReview, workspaceId, operationId, fetchBeforeCapture);
+      }
     } catch (error) {
       if (refreshStateMatches(workspaceId, operationId)) {
         showTemporaryRefreshOutcome(workspaceId, { operationId, stage: 'failed', fetchBeforeCapture }, 3200);
       }
       if (workspaceSelectionGeneration === selectionGeneration && review?.workspace.id === workspaceId) {
-        statusMessage = `Refresh failed; the previous snapshot remains displayed: ${apiFailureMessage(error, 'unknown error')}`;
+        statusMessage = `Could not start the next review round; the previous snapshot remains displayed or is available in History: ${apiFailureMessage(error, 'unknown error')}`;
       }
     }
   }
@@ -1975,7 +2124,7 @@
       mode = state.mode ?? 'unified';
       fullFileSide = state.fullFileSide ?? 'new';
       splitRatio = state.splitRatio ?? .5;
-      rightTab = state.rightTab ?? 'files';
+      await hydrateRightPanelTab(state.rightTab ?? 'files', false);
       nearestSourceLine = state.nearestSourceLine;
       nearestSourceSide = state.nearestSourceSide;
       restoredScrollTop = state.scrollTop ?? 0;
@@ -2178,7 +2327,7 @@
     busy = true;
     try {
       const workspace = await api.openWorkspace({ path, base: localBase.trim() || undefined });
-      workspaces = mergeWorkspaceList(await api.listWorkspaces());
+      workspaces = mergeWorkspaceList(await api.listWorkspaces(), true);
       await selectWorkspace(workspace.id);
       showOpen = false;
       openLocalForm = false;
@@ -2210,7 +2359,7 @@
     busy = true;
     try {
       const workspace = kind === 'github' ? await api.openGitHubPr(value) : await api.openSshWorkspace(value);
-      workspaces = mergeWorkspaceList(await api.listWorkspaces());
+      workspaces = mergeWorkspaceList(await api.listWorkspaces(), true);
       showOpen = false;
       openGitHubForm = false;
       openSshForm = false;
@@ -2311,6 +2460,11 @@
     busy = true;
     deleteWorkspaceError = '';
     try {
+      // Archiving must be a persistence boundary just like switching or
+      // closing a workspace. Flush the active composer and exact viewport
+      // before the workspace leaves the rail so a restart/reopen cannot lose
+      // the reviewer's last few keystrokes or location.
+      if (review?.workspace.id === workspace.id) await flushReviewPersistence();
       await api.deleteWorkspace(workspace.id);
       workspaces = mergeWorkspaceList(await api.listWorkspaces());
       if (review?.workspace.id === workspace.id) {
@@ -2318,7 +2472,10 @@
         activeFileId = '';
         const next = workspaces[0];
         if (next) await selectWorkspace(next.id);
-        else statusMessage = 'Workspace archived. Its captured review remains recoverable in Review history.';
+        else {
+          await setSettings({ lastWorkspaceId: '' });
+          statusMessage = 'Workspace archived. Its captured review remains recoverable in Review history.';
+        }
       } else {
         statusMessage = `${workspace.name} was archived. Its captured review remains recoverable in Review history.`;
       }
@@ -2434,7 +2591,7 @@
           </span>
         </div>
         <span class="toolbar-rule"></span>
-        <button class="status-button" class:refreshing={refreshLocksReview} class:updated={activeRefreshState?.stage === 'updated'} class:failed={activeRefreshState?.stage === 'failed'} disabled={!canMutateReview} aria-label={refreshButtonAriaLabel} aria-live="polite" aria-busy={refreshLocksReview} aria-describedby={refreshLocksReview ? 'refresh-status' : undefined} on:click={refresh} title={review?.historical ? 'Archived review snapshots are read-only' : !reviewCaptureReady ? 'Finish initial setup before refreshing' : refreshLocksReview ? 'This workspace refresh is already running' : activeRefreshState?.stage === 'failed' ? 'Retry the review refresh' : 'Capture a new review snapshot'}><span class:available={review?.workspace.refreshAvailable && !activeRefreshState} class:refreshing={refreshLocksReview} class:updated={activeRefreshState?.stage === 'updated'} class:failed={activeRefreshState?.stage === 'failed'} class="status-light"></span><span class="status-button-label">{refreshButtonLabel}</span></button>
+        <button class="status-button" class:refreshing={refreshLocksReview} class:updated={activeRefreshState?.stage === 'updated'} class:failed={activeRefreshState?.stage === 'failed'} disabled={!canMutateReview} aria-label={refreshButtonAriaLabel} aria-live="polite" aria-busy={refreshLocksReview} aria-describedby={refreshLocksReview ? 'refresh-status' : undefined} on:click={refresh} title={review?.historical ? 'Archived review snapshots are read-only' : !reviewCaptureReady ? 'Finish initial setup before refreshing' : refreshLocksReview ? 'This workspace refresh is already running' : activeRefreshState?.stage === 'failed' ? 'Retry starting the next review round' : 'Archive this round and capture the next one'}><span class:available={review?.workspace.refreshAvailable && !activeRefreshState} class:refreshing={refreshLocksReview} class:updated={activeRefreshState?.stage === 'updated'} class:failed={activeRefreshState?.stage === 'failed'} class="status-light"></span><span class="status-button-label">{refreshButtonLabel}</span></button>
         <details class="actions-menu" bind:open={actionsOpen}>
           <summary aria-label="More review actions">Actions</summary>
           <div role="menu" aria-label="Review actions"><button role="menuitem" disabled={!canExportReview || review?.historical || (githubReview && refreshLocksReview)} on:click={() => { actionsOpen = false; primaryFinishAction(); }}>{githubReview ? 'Finish review' : 'Copy review prompt'}</button><button role="menuitem" disabled={review?.historical || refreshLocksReview} on:click={() => { actionsOpen = false; void openBaselineSetup(); }}>Review setup</button><button role="menuitem" disabled={!canMutateReview} on:click={() => { actionsOpen = false; showNewReview = true; }}>New review</button><button role="menuitem" on:click={() => { actionsOpen = false; void openHistory(); }}>History</button><button role="menuitem" disabled={!canExportReview} on:click={() => { actionsOpen = false; void openBlame(); }}>Blame selected lines</button><button role="menuitem" disabled={!canExportReview} on:click={() => { actionsOpen = false; void openCommitContext(); }}>Commit context</button><button role="menuitem" disabled={!canMutateReview} on:click={() => { actionsOpen = false; void showChangedSincePreviousReview(); }}>Changed since previous review</button><button role="menuitem" on:click={() => { actionsOpen = false; showSettings = true; }}>Settings</button></div>
@@ -2450,14 +2607,14 @@
           <button role="tab" aria-selected={mode === item.id} class:active={mode === item.id} on:click={() => setMode(item.id)}>{item.label}</button>
         {/each}
       </div>
-      <div class="diff-stats"><span class="additions">+{activeFile?.additions ?? 0}</span><span class="deletions">−{activeFile?.deletions ?? 0}</span>{#if mode === 'full'}<span class="full-file-extent">{fullFileExtent}</span>{/if}{#if mode === 'full' && activeFile?.status !== 'added' && activeFile?.status !== 'untracked' && activeFile?.status !== 'deleted'}<span class="full-side-toggle" role="group" aria-label="Full-file source side"><button class:active={fullFileSide === 'new'} aria-pressed={fullFileSide === 'new'} title="Complete current file with removed Base lines shown inline" on:click={() => setFullFileSide('new')}>Current</button><button class:active={fullFileSide === 'old'} aria-pressed={fullFileSide === 'old'} title="File before the reviewed changes; removed lines are highlighted" on:click={() => setFullFileSide('old')}>Base</button></span>{/if}{#if mode === 'full' && fullFileDisplaySide === 'new' && (presentation?.deletionBlocks?.length ?? 0) > 0}<span class="full-deletion-controls" role="group" aria-label="Full-file deletion blocks"><button disabled={review?.historical || refreshLocksReview || presentation?.deletionBlocks?.every((block) => block.expanded)} on:click={showAllFullFileDeletions}>Show all deletions</button><button disabled={review?.historical || refreshLocksReview || presentation?.deletionBlocks?.every((block) => !block.expanded)} on:click={hideAllFullFileDeletions}>Hide all deletions</button></span>{/if}<button class="icon-button small" title="Copy review content" aria-label="Copy review content" disabled={!canExportReview} aria-expanded={showCopyMenu} on:click={() => showCopyMenu = !showCopyMenu}>⧉</button><button class="icon-button small" title="Focus diff" aria-label="Focus diff" on:click={focusDiff}>⛶</button></div>
+      <div class="diff-stats"><span class="additions">+{activeFile?.additions ?? 0}</span><span class="deletions">−{activeFile?.deletions ?? 0}</span>{#if mode === 'full'}<span class="full-file-extent">{fullFileExtent}</span>{/if}{#if mode === 'full' && activeFile?.status !== 'added' && activeFile?.status !== 'untracked' && activeFile?.status !== 'deleted'}<span class="full-side-toggle" role="group" aria-label="Full-file source side"><button class:active={fullFileSide === 'new'} aria-pressed={fullFileSide === 'new'} title="Complete current file with removed Base lines shown inline" on:click={() => setFullFileSide('new')}>Current</button><button class:active={fullFileSide === 'old'} aria-pressed={fullFileSide === 'old'} title="File before the reviewed changes; removed lines are highlighted" on:click={() => setFullFileSide('old')}>Base</button></span>{/if}{#if mode === 'full' && fullFileDisplaySide === 'new' && (presentation?.deletionBlocks?.length ?? 0) > 0}<span class="full-deletion-controls" role="group" aria-label="Full-file deletion blocks"><button disabled={refreshLocksReview || presentation?.deletionBlocks?.every((block) => block.expanded)} on:click={showAllFullFileDeletions}>Show all deletions</button><button disabled={refreshLocksReview || presentation?.deletionBlocks?.every((block) => !block.expanded)} on:click={hideAllFullFileDeletions}>Hide all deletions</button></span>{/if}<button class="wrap-toggle" class:active={settings.wrapLines} aria-pressed={settings.wrapLines} title="Wrap long code lines instead of scrolling horizontally" on:click={() => setSettings({ wrapLines: !settings.wrapLines })}>Wrap</button><button class="icon-button small" title="Copy review content" aria-label="Copy review content" disabled={!canExportReview} aria-expanded={showCopyMenu} on:click={() => showCopyMenu = !showCopyMenu}>⧉</button><button class="icon-button small" title="Focus diff" aria-label="Focus diff" on:click={focusDiff}>⛶</button></div>
     </div>
 
     {#if refreshLocksReview}
       <div class="refresh-status" id="refresh-status" role="status" aria-live="polite">
         <span class="refresh-progress" role="progressbar" aria-label="Refresh progress" aria-valuetext={refreshStageLabel}><span></span></span>
         <strong>{refreshStageLabel}</strong>
-        <span>The current snapshot stays available until the complete replacement is ready.</span>
+        <span>This round and its feedback are archived; the current snapshot stays visible until the next round is ready.</span>
       </div>
     {/if}
 
@@ -2488,7 +2645,7 @@
         <small>LocalReview refreshes only when you ask.</small>
       </section>
     {:else}
-      <VirtualDiff {rows} windowStart={presentation?.startRow ?? 0} totalRows={presentation?.totalRows ?? rows.length} hunks={presentation?.hunks ?? []} oldTokens={presentation?.oldTokens ?? []} newTokens={presentation?.newTokens ?? []} difftastic={presentation?.difftastic} {mode} fontScale={settings.fontScale} {activeLine} activeSide={nearestSourceSide} composerSelection={composer?.selection} composerKind={composer?.kind ?? 'comment'} {splitRatio} fullFileSide={fullFileDisplaySide} {jumpToRow} {jumpGeneration} initialScrollTop={restoredScrollTop} restorationKey={`${activeWorkspaceId}:${activeFileId}:${mode}`} repositoryName={activeRepo?.name ?? 'repository'} filePath={activeFile?.path ?? 'file'} annotationCountAt={annotationsAt} annotationsForRow={inlineAnnotationsAt} annotationsEditable={canMutateReview} onAnnotate={annotate} onEditAnnotation={editAnnotation} onViewportRequest={requestViewport} onExpandHunk={expandHunk} onToggleDeletionBlock={toggleFullFileDeletionBlock} onSplitRatio={updateSplitRatio} onCanonicalMode={setMode} onLocationChange={saveLocation} />
+      <VirtualDiff {rows} windowStart={presentation?.startRow ?? 0} totalRows={presentation?.totalRows ?? rows.length} hunks={presentation?.hunks ?? []} oldTokens={presentation?.oldTokens ?? []} newTokens={presentation?.newTokens ?? []} difftastic={presentation?.difftastic} {mode} fontScale={settings.fontScale} wrapLines={settings.wrapLines} {activeLine} activeSide={nearestSourceSide} composerSelection={composer?.selection} composerKind={composer?.kind ?? 'comment'} {splitRatio} fullFileSide={fullFileDisplaySide} {jumpToRow} {jumpGeneration} initialScrollTop={restoredScrollTop} restorationKey={`${activeWorkspaceId}:${activeFileId}:${mode}`} repositoryName={activeRepo?.name ?? 'repository'} filePath={activeFile?.path ?? 'file'} annotationCountAt={annotationsAt} annotationsForRow={inlineAnnotationsAt} {annotationRevision} {annotationContextKey} annotationsEditable={canMutateReview} deletionBlocksExpandable={!refreshLocksReview} onAnnotate={annotate} onEditAnnotation={editAnnotation} onViewportRequest={requestViewport} onExpandHunk={expandHunk} onToggleDeletionBlock={toggleFullFileDeletionBlock} onSplitRatio={updateSplitRatio} onCanonicalMode={setMode} onLocationChange={saveLocation} />
       {#if mode === 'full'}
       <nav class="full-minimap" aria-label="Changed-line and annotation minimap">{#each presentation?.hunks ?? [] as hunk (hunk.id)}<button title={`Jump to ${hunk.header}`} aria-label={`Jump to ${hunk.header}`} style:top={`${Math.min(94, Math.max(2, ((hunk.rowIndex / Math.max(1, presentation?.totalRows ?? 1)) * 92) + 2))}%`} on:click={() => jumpToFullFileHunk(hunk)}></button>{/each}{#each (review?.annotations ?? []).filter((annotation) => annotation.fileId === activeFileId && annotation.startLine > 0) as annotation (annotation.id)}<button class="annotation-marker" title={`${annotation.kind} at ${annotation.side} line ${annotation.startLine}`} aria-label={`Jump to ${annotation.kind} at ${annotation.side} line ${annotation.startLine}`} style:top={`${Math.min(96, Math.max(1, (annotation.startLine / Math.max(1, presentation?.totalRows ?? 1)) * 96))}%`} on:click={() => void jumpToAnnotation(annotation)}></button>{/each}</nav>
       {/if}
@@ -2508,7 +2665,7 @@
       </section>
     {/if}
 
-    <footer class="statusbar"><span>{statusMessage}</span>{#if browserFixtureMode}<span class="dev-fixture-badge" title="Browser-only fixture; packaged Tauri uses native review data">DEV FIXTURE</span>{/if}{#if undoCheckpoint}<button on:click={undoClear}>Undo clear</button>{/if}<span class="statusbar-right"><button on:click={() => changeZoom(-.1)} aria-label="Decrease font size">A−</button><span>{codeFontPercent}%</span><button on:click={() => changeZoom(.1)} aria-label="Increase font size">A+</button></span></footer>
+    <footer class="statusbar"><span>{statusMessage}</span>{#if busy}<span class="busy-indicator" role="status"><span aria-hidden="true"></span>Working…</span>{/if}{#if browserFixtureMode}<span class="dev-fixture-badge" title="Browser-only fixture; packaged Tauri uses native review data">DEV FIXTURE</span>{/if}{#if undoCheckpoint}<button on:click={undoClear}>Undo clear</button>{/if}<span class="statusbar-right"><button on:click={() => changeZoom(-.1)} aria-label="Decrease font size">A−</button><span>{codeFontPercent}%</span><button on:click={() => changeZoom(.1)} aria-label="Increase font size">A+</button></span></footer>
   </section>
 
   <!-- svelte-ignore a11y_no_noninteractive_tabindex a11y_no_noninteractive_element_interactions -- ARIA separator follows the splitter pattern and handles pointer plus arrow keys -->
@@ -2518,16 +2675,17 @@
   {:else}
     <aside class="review-panel" aria-label="Files and review">
       <div class="panel-tabs" role="tablist">
-        {#each [['files', 'Files'], ['comments', `Comments${review?.annotations.length ? ` (${review.annotations.length})` : ''}`], ['outline', 'Outline']] as tab}
-          <button role="tab" aria-selected={rightTab === tab[0]} class:active={rightTab === tab[0]} on:click={() => { rightTab = tab[0] as typeof rightTab; persistWorkspaceUiState({ rightTab }); }}>{tab[1]}</button>
+        {#each rightPanelTabs as tab (tab.id)}
+          <button id={`right-panel-tab-${tab.id}`} role="tab" aria-controls={`right-panel-${tab.id}`} aria-selected={rightTab === tab.id} class:active={rightTab === tab.id} on:click={() => selectRightPanelTab(tab.id)}>{tab.label}{tab.id === 'comments' && review?.annotations.length ? ` (${review.annotations.length})` : ''}</button>
         {/each}
         <button class="icon-button panel-close" aria-label="Close review panel" on:click={() => togglePanel('right')}>×</button>
       </div>
-      {#if rightTab === 'files'}
+      <div id="right-panel-files" class="right-panel-body" role="tabpanel" aria-labelledby="right-panel-tab-files" data-right-panel-body="files" hidden={rightTab !== 'files'} aria-hidden={rightTab !== 'files'}>
         <div class="panel-filter"><label class="search-field"><span>⌕</span><input bind:value={fileSearch} placeholder="Fuzzy filter files" aria-label="Filter files" /></label><div class="file-filter-grid"><select bind:value={repositoryFilter} aria-label="Filter by repository"><option value="all">All repositories</option>{#each review?.repositories ?? [] as repository}<option value={repository.id}>{repository.name}</option>{/each}</select><select bind:value={viewedFilter} aria-label="Filter by viewed state"><option value="all">All viewed states</option><option value="unviewed">Unviewed</option><option value="viewed">Viewed</option></select><select bind:value={classificationFilter} aria-label="Filter by immutable file classification"><option value="all">All file classifications</option><option value="text">Text</option><option value="binary">Binary</option><option value="generated">Generated</option><option value="vendored">Vendored</option><option value="lockfile">Lockfiles</option><option value="lfs_pointer">Git LFS pointers</option><option value="submodule">Submodules</option></select><select bind:value={fileStatusFilter} aria-label="Filter by file status"><option value="all">All statuses</option><option value="modified">Modified</option><option value="added">Added</option><option value="deleted">Deleted</option><option value="renamed">Renamed</option><option value="untracked">Untracked</option></select><select bind:value={fileLanguageFilter} aria-label="Filter by file language"><option value="all">All languages</option>{#each fileLanguages as language}<option value={language}>{language}</option>{/each}</select><select bind:value={fileGrouping} aria-label="Group files"><option value="repository">Group: repository</option><option value="folder">Group: folder</option><option value="flat">Flat list</option></select><select bind:value={fileSort} aria-label="Sort files"><option value="review_order">Sort: review order</option><option value="path">Sort: path</option><option value="repository">Sort: repository</option><option value="change_size">Sort: change size</option><option value="annotations">Sort: annotations</option></select></div>{#if changedSincePreviousOnly}<div class="history-filter-notice"><span>Changed since prior review</span><button on:click={() => { changedSincePreviousOnly = false; changedSincePrevious = undefined; }}>Show all files</button></div>{/if}<div class="file-tree-actions"><button class="secondary-button" disabled={fileGrouping === 'flat'} on:click={() => collapseAllToken += 1}>Collapse tree</button><button class="secondary-button" disabled={fileGrouping === 'flat'} on:click={() => expandAllToken += 1}>Expand tree</button></div><button class="bulk-view-button" disabled={!canMutateReview} on:click={() => Promise.all(shownFiles.filter((file) => !file.viewed).map((file) => toggleViewed(file.id, true)))}>Mark filtered viewed</button></div>
         <div class="review-progress"><div><strong>{review?.workspace.progress.viewed ?? 0}/{review?.workspace.progress.total ?? 0}</strong><span> files viewed</span></div><div class="progress-track"><span style:width={`${((review?.workspace.progress.viewed ?? 0) / (review?.workspace.progress.total ?? 1)) * 100}%`}></span></div><div class="repository-progress" aria-label="Review progress by repository">{#each review?.repositories ?? [] as repository}{@const repositoryFiles = (review?.files ?? []).filter((file) => file.repositoryId === repository.id)}<span title={`${repository.name}: ${repositoryFiles.filter((file) => file.viewed).length} of ${repositoryFiles.length} viewed`}>{repository.name} {repositoryFiles.filter((file) => file.viewed).length}/{repositoryFiles.length}</span>{/each}</div></div>
         <VirtualFileList files={shownFiles} repositories={review?.repositories ?? []} grouping={fileGrouping} {activeFileId} fontScale={settings.fontScale} {collapseAllToken} {expandAllToken} onSelect={selectFile} onToggleViewed={toggleViewed} />
-      {:else if rightTab === 'comments'}
+      </div>
+      <div id="right-panel-comments" class="right-panel-body" role="tabpanel" aria-labelledby="right-panel-tab-comments" data-right-panel-body="comments" hidden={rightTab !== 'comments'} aria-hidden={rightTab !== 'comments'}>
         {#if githubReview}
           <section class="github-context" aria-label="Imported GitHub pull request context">
             <div class="github-context-header"><span>GITHUB · IMPORTED CONTEXT</span>{#if githubContextLoading}<small>Loading…</small>{:else}<small>Read-only</small>{/if}</div>
@@ -2550,11 +2708,12 @@
             </article>
           {:else}<div class="empty-state large"><span>◌</span><strong>{(review?.annotations.length ?? 0) ? 'No annotations match these filters' : 'No active annotations'}</strong><p>{(review?.annotations.length ?? 0) ? 'Change or clear a filter to see another local annotation.' : 'Add a comment from a code gutter, or browse archived sets in History.'}</p></div>{/each}
         </div>
-      {:else}
+      </div>
+      <div id="right-panel-outline" class="right-panel-body" role="tabpanel" aria-labelledby="right-panel-tab-outline" data-right-panel-body="outline" hidden={rightTab !== 'outline'} aria-hidden={rightTab !== 'outline'}>
         <div class="outline-header"><strong>Outline</strong><span>from Tree-sitter</span></div>
         <div class="outline-list">{#each outline as symbol (symbol.id)}<button style:padding-left={`${12 + symbol.depth * 14}px`} on:click={() => jumpToSource(activeFileId, symbol.side, symbol.startLine)}><span>{symbol.kind === 'function' || symbol.kind === 'method' ? 'ƒ' : '▣'}</span><code>{symbol.name}</code><small>{symbol.startLine}–{symbol.endLine}</small></button>{:else}<div class="empty-state">No outline is available for this captured file.</div>{/each}</div>
         <div class="outline-footer">The outline is derived from the immutable captured snapshot.</div>
-      {/if}
+      </div>
     </aside>
   {/if}
 </main>
@@ -2566,11 +2725,11 @@
 {/if}
 
 {#if showHistory}
-  <div class="modal-backdrop" role="presentation"><dialog open class="modal history-modal" aria-modal="true" aria-labelledby="history-title" use:focusTrap={{ onClose: () => showHistory = false }}><header><div><span class="eyebrow">DURABLE REVIEW DATA</span><h2 id="history-title">Review history</h2><p>Each workspace has one current review. Prior reviews are frozen here and remain available after restart.</p></div><button class="icon-button" on:click={() => showHistory = false}>×</button></header>{#if archivedWorkspaces.length}<section class="archived-workspaces" aria-label="Archived workspaces"><strong>Archived workspaces</strong>{#each archivedWorkspaces as workspace (workspace.id)}<article><div><strong>{workspace.name}</strong><p>{workspace.source.join(' + ')} · {workspace.location}</p><small>{workspace.detail} · {workspace.progress.total} captured files</small></div><button class="secondary-button" on:click={() => reopenArchivedWorkspace(workspace)}>Reopen snapshot</button></article>{/each}</section>{/if}<div class="history-list">{#each historyEntries as entry}<article><span class="history-type {entry.type}">{entry.type}</span><div><strong>{entry.label}</strong><p>{new Date(entry.createdAt).toLocaleString()} · {entry.annotationCount} annotations</p></div><div class="history-actions">{#if entry.type === 'review'}<button class="secondary-button" on:click={() => browseArchivedReview(entry.id)}>Browse frozen diff</button>{/if}<button class="secondary-button" on:click={() => previewPrompt('all', entry.id)}>{entry.type === 'export' ? 'Open exact export' : 'Export'}</button>{#if entry.annotations?.length}<button class="secondary-button" disabled={review?.historical} on:click={() => restoreHistory(entry.id)}>Restore</button>{/if}</div></article>{:else}{#if !archivedWorkspaces.length}<div class="empty-state">No review history yet.</div>{/if}{/each}</div><footer><button class="primary-button" on:click={() => showHistory = false}>Done</button></footer></dialog></div>
+  <div class="modal-backdrop" role="presentation"><dialog open class="modal history-modal" aria-modal="true" aria-labelledby="history-title" use:focusTrap={{ onClose: () => showHistory = false }}><header><div><span class="eyebrow">DURABLE REVIEW DATA</span><h2 id="history-title">Review history</h2><p>Each workspace has one current review. Prior reviews are frozen here and remain available after restart.</p></div><button class="icon-button" on:click={() => showHistory = false}>×</button></header>{#if archivedWorkspaces.length}<section class="archived-workspaces" aria-label="Archived workspaces"><strong>Archived workspaces</strong>{#each archivedWorkspaces as workspace (workspace.id)}<article><div><strong>{workspace.name}</strong><p>{workspace.source.join(' + ')} · {workspace.location}</p><small>{workspace.detail} · {workspace.progress.total} captured files</small></div><button class="secondary-button" on:click={() => reopenArchivedWorkspace(workspace)}>Reopen snapshot</button></article>{/each}</section>{/if}<div class="history-list">{#each historyEntries as entry}<article><span class="history-type {entry.type}">{entry.type}</span><div><strong>{entry.label}</strong><p>{new Date(entry.createdAt).toLocaleString()} · {entry.annotationCount} annotations</p></div><div class="history-actions">{#if entry.type === 'review'}<button class="secondary-button" on:click={() => browseArchivedReview(entry.id)}>Browse frozen diff</button>{/if}<button class="secondary-button" on:click={() => previewPromptFromHistory(entry.id)}>{entry.type === 'export' ? 'Open exact export' : 'Export'}</button>{#if entry.annotations?.length}<button class="secondary-button" disabled={review?.historical} on:click={() => restoreHistory(entry.id)}>Restore</button>{/if}</div></article>{:else}{#if !archivedWorkspaces.length}<div class="empty-state">No review history yet.</div>{/if}{/each}</div><footer><button class="primary-button" on:click={() => showHistory = false}>Done</button></footer></dialog></div>
 {/if}
 
 {#if showDeleteWorkspace}
-  <div class="modal-backdrop" role="presentation"><dialog open class="modal confirm-modal" aria-modal="true" aria-labelledby="delete-workspace-title" use:focusTrap={{ onClose: () => { showDeleteWorkspace = false; workspacePendingDeletion = undefined; } }}><header><span class="warning-icon">!</span><div><h2 id="delete-workspace-title">Remove {workspacePendingDeletion?.name}?</h2>{#if workspacePendingDeletion?.source.includes('github')}<p>The app-owned PR worktree will be deleted only if it is clean. The shared repository cache and all captured review history stay intact.</p>{:else}<p>This removes the workspace from the live rail. Its captured diff, annotations, and exports remain recoverable in Review history.</p>{/if}</div></header>{#if deleteWorkspaceError}<p class="modal-error" role="alert">{deleteWorkspaceError}</p>{/if}<footer><button class="secondary-button" on:click={() => { showDeleteWorkspace = false; workspacePendingDeletion = undefined; }}>Cancel</button><button class="primary-button warning" disabled={busy} on:click={confirmWorkspaceDeletion}>{workspacePendingDeletion?.source.includes('github') ? 'Delete clean worktree and archive' : 'Archive workspace'}</button></footer></dialog></div>
+  <div class="modal-backdrop" role="presentation"><dialog open class="modal confirm-modal" aria-modal="true" aria-labelledby="delete-workspace-title" use:focusTrap={{ onClose: () => { showDeleteWorkspace = false; workspacePendingDeletion = undefined; } }}><header><span class="warning-icon">!</span><div><span class="eyebrow">RECOVERABLE WORKSPACE ARCHIVE</span><h2 id="delete-workspace-title">Delete {workspacePendingDeletion?.name} from LocalReview?</h2>{#if workspacePendingDeletion?.source.includes('github')}<p>The clean app-owned PR worktree will be deleted. The shared repository cache, captured diff, comments, questions, and exported prompts remain recoverable in Review history.</p>{:else if workspacePendingDeletion?.source.includes('ssh')}<p>The SSH session will close, but no files on the remote machine are deleted. The captured diff, comments, questions, and exported prompts remain recoverable in Review history.</p>{:else}<p>The folder and Git repositories on disk are not deleted. The captured diff, comments, questions, and exported prompts remain recoverable in Review history.</p>{/if}</div></header>{#if deleteWorkspaceError}<p class="modal-error" role="alert">{deleteWorkspaceError}</p>{/if}<footer><button class="secondary-button" on:click={() => { showDeleteWorkspace = false; workspacePendingDeletion = undefined; }}>Cancel</button><button class="primary-button warning" disabled={busy} on:click={confirmWorkspaceDeletion}>{workspacePendingDeletion?.source.includes('github') ? 'Delete worktree and archive' : 'Archive workspace'}</button></footer></dialog></div>
 {/if}
 
 {#if workspacePendingRename}
@@ -2607,9 +2766,9 @@
           {#each selectableFinishAnnotations as annotation (annotation.id)}<article class:blocked={annotation.localOnly || !hasLineAnchor(annotation) || annotation.state !== 'open'} class:failed={finishPreviewError?.annotationId === annotation.id}><div><span class="annotation-kind {annotation.kind}">{annotation.kind.replace('_', ' ')}</span><code>{annotation.kind === 'review_note' ? 'whole review' : `${review?.files.find((file) => file.id === annotation.fileId)?.path ?? 'captured file'}${hasLineAnchor(annotation) ? `:${annotation.startLine}` : ''}`}</code></div><p>{finishItemStatus(annotation)}</p><small>{annotation.body}</small></article>{:else}<p class="finish-empty">No local annotations are selected. Select an inline annotation in Comments before preparing a GitHub review.</p>{/each}
         </section>
         <div class="publish-preview" aria-live="polite">
-          <span>Exact native payload preview</span>
-          <strong>{finishPreviewLoading ? 'Preparing server-authoritative payload…' : `${finishPreview?.annotationCount ?? finishAnnotations.length} inline comments · ${finishSummary ? '1 summary' : 'no summary'} · ${finishConclusion.replace('_', ' ')}`}</strong>
-          <p>{finishPreview ? `Pinned to ${finishPreview.pinnedHeadSha}. This is the JSON submitted by the native GitHub boundary.` : 'Payload is prepared and anchor-validated before submission.'}</p>
+          <span>GitHub review check</span>
+          <strong>{finishPreviewLoading ? 'Checking every selected comment…' : `${finishPreview?.annotationCount ?? finishAnnotations.length} inline comments · ${finishSummary ? '1 summary' : 'no summary'} · ${finishConclusion.replace('_', ' ')}`}</strong>
+          <p>{finishPreview ? `Ready to submit at ${finishPreview.pinnedHeadSha.slice(0, 12)}. LocalReview verified every path and line anchor against this exact commit.` : 'LocalReview checks every path and line anchor before enabling submission.'}</p>
           {#if finishPreviewError}<p class="finish-preview-error" role="alert">{finishPreviewError.message}</p>{/if}
           {#if finishSubmissionError}<p class="finish-preview-error" role="alert">{finishSubmissionError}</p>{/if}
           {#if finishSubmissionAmbiguous}
@@ -2619,7 +2778,6 @@
               <button class="secondary-button warning" disabled={finishSubmitting} on:click={abandonUnresolvedFinishReview}>Abandon unresolved attempt</button>
             </div>
           {/if}
-          {#if finishPreview}<pre aria-label="Exact GitHub review payload">{finishPreview.payloadJson}</pre>{/if}
         </div>
       </div>
       <footer>
@@ -2705,7 +2863,7 @@
 {/if}
 
 {#if showOpen}
-  <div class="modal-backdrop" role="presentation"><dialog open class="modal open-modal" aria-modal="true" aria-labelledby="open-title" use:focusTrap={{ onClose: () => { showOpen = false; openLocalForm = false; openGitHubForm = false; openSshForm = false; localOpenError = ''; } }}><header><div><span class="eyebrow">OPEN OR CONNECT</span><h2 id="open-title">Add a workspace</h2></div><button class="icon-button" on:click={() => { showOpen = false; openLocalForm = false; openGitHubForm = false; openSshForm = false; localOpenError = ''; }}>×</button></header>{#if openLocalForm}<div class="setup-content"><label>Local folder path<input bind:value={localPath} on:input={() => localOpenError = ''} aria-label="Local folder path" placeholder="/Users/me/Projects/workspace" /></label><label>Default base reference<input bind:value={localBase} on:input={() => localOpenError = ''} aria-label="Default base reference" placeholder="origin/master" /></label><p class="form-hint">In the desktop app, use the native folder picker. In browser development, enter a path to exercise the same open contract.</p>{#if localOpenError}<p class="modal-error" role="alert">{localOpenError}</p>{/if}</div><footer><button class="secondary-button" on:click={() => { openLocalForm = false; localOpenError = ''; }}>Back</button><button class="secondary-button" disabled={busy} on:click={chooseLocalFolder}>Choose folder…</button><button class="primary-button" disabled={busy} on:click={openLocalWorkspace}>{busy ? 'Opening…' : 'Open local folder'}</button></footer>{:else if openGitHubForm}<div class="setup-content"><label>GitHub pull request URL<input bind:value={githubPrUrl} aria-label="GitHub pull request URL" placeholder="https://github.com/owner/repository/pull/123" /></label><p class="form-hint">The desktop app resolves the exact GitHub.com head/base and prepares a read-only worktree.</p></div><footer><button class="secondary-button" on:click={() => openGitHubForm = false}>Back</button><button class="primary-button" on:click={() => openForwardedWorkspace('github')}>Open PR review</button></footer>{:else if openSshForm}<div class="setup-content"><label>SSH target<input bind:value={sshTarget} aria-label="SSH target" placeholder="build@host:/absolute/path" /></label><p class="form-hint">The desktop app launches the managed LocalReview companion over your SSH configuration.</p></div><footer><button class="secondary-button" on:click={() => openSshForm = false}>Back</button><button class="primary-button" on:click={() => openForwardedWorkspace('ssh')}>Connect workspace</button></footer>{:else}<div class="open-options"><button on:click={() => { localOpenError = ''; openLocalForm = true; }}><span>⌂</span><strong>Open local folder</strong><small>Discover repositories under a local directory.</small></button><button on:click={() => openGitHubForm = true}><span>⌘</span><strong>Paste GitHub PR URL</strong><small>Create an isolated, read-only PR worktree.</small></button><button on:click={() => openSshForm = true}><span>↗</span><strong>Connect over SSH</strong><small>Review code through a LocalReview companion.</small></button><button on:click={() => { showOpen = false; openHistory(); }}><span>◴</span><strong>Reopen archived review</strong><small>Browse durable review history.</small></button></div>{/if}</dialog></div>
+  <div class="modal-backdrop" role="presentation"><dialog open class="modal open-modal" aria-modal="true" aria-labelledby="open-title" aria-busy={busy} use:focusTrap={{ onClose: () => { showOpen = false; openLocalForm = false; openGitHubForm = false; openSshForm = false; localOpenError = ''; } }}><header><div><span class="eyebrow">OPEN OR CONNECT</span><h2 id="open-title">Add a workspace</h2></div><button class="icon-button" aria-label="Close add workspace" disabled={busy} on:click={() => { showOpen = false; openLocalForm = false; openGitHubForm = false; openSshForm = false; localOpenError = ''; }}>×</button></header>{#if openLocalForm}<div class="setup-content"><label>Local folder path<input bind:value={localPath} on:input={() => localOpenError = ''} aria-label="Local folder path" placeholder="/Users/me/Projects/workspace" /></label><label>Default base reference<input bind:value={localBase} on:input={() => localOpenError = ''} aria-label="Default base reference" placeholder="origin/master" /></label><p class="form-hint">In the desktop app, use the native folder picker. In browser development, enter a path to exercise the same open contract.</p>{#if localOpenError}<p class="modal-error" role="alert">{localOpenError}</p>{/if}</div><footer><button class="secondary-button" disabled={busy} on:click={() => { openLocalForm = false; localOpenError = ''; }}>Back</button><button class="secondary-button" disabled={busy} on:click={chooseLocalFolder}>Choose folder…</button><button class="primary-button" disabled={busy} on:click={openLocalWorkspace}>{busy ? 'Opening…' : 'Open local folder'}</button></footer>{:else if openGitHubForm}<div class="setup-content"><label>GitHub pull request URL<input bind:value={githubPrUrl} disabled={busy} aria-label="GitHub pull request URL" placeholder="https://github.com/owner/repository/pull/123" /></label><p class="form-hint">The desktop app resolves the exact GitHub.com head/base and prepares a read-only worktree.</p></div><footer><button class="secondary-button" disabled={busy} on:click={() => openGitHubForm = false}>Back</button><button class="primary-button" disabled={busy} on:click={() => openForwardedWorkspace('github')}>{busy ? 'Preparing PR…' : 'Open PR review'}</button></footer>{:else if openSshForm}<div class="setup-content"><label>SSH target<input bind:value={sshTarget} disabled={busy} aria-label="SSH target" placeholder="build@host:/absolute/path" /></label><p class="form-hint">The desktop app launches the managed LocalReview companion over your SSH configuration.</p></div><footer><button class="secondary-button" disabled={busy} on:click={() => openSshForm = false}>Back</button><button class="primary-button" disabled={busy} on:click={() => openForwardedWorkspace('ssh')}>{busy ? 'Connecting…' : 'Connect workspace'}</button></footer>{:else}<div class="open-options"><button on:click={() => { localOpenError = ''; openLocalForm = true; }}><span>⌂</span><strong>Open local folder</strong><small>Discover repositories under a local directory.</small></button><button on:click={() => openGitHubForm = true}><span>⌘</span><strong>Paste GitHub PR URL</strong><small>Create an isolated, read-only PR worktree.</small></button><button on:click={() => openSshForm = true}><span>↗</span><strong>Connect over SSH</strong><small>Review code through a LocalReview companion.</small></button><button on:click={() => { showOpen = false; openHistory(); }}><span>◴</span><strong>Reopen archived review</strong><small>Browse durable review history.</small></button></div>{/if}</dialog></div>
 {/if}
 
 {#if showFilePicker}
@@ -2725,6 +2883,7 @@
       <label>External editor<select value={settings.externalEditor} on:change={(event) => setSettings({ externalEditor: event.currentTarget.value as ReviewSettings['externalEditor'] })} aria-label="External editor"><option value="system">System default</option><option value="vscode">Visual Studio Code CLI</option><option value="cursor">Cursor CLI</option><option value="zed">Zed CLI</option><option value="sublime">Sublime Text CLI</option><option value="idea">JetBrains IDE CLI</option></select></label>
       <label>Tab width<select value={String(settings.tabWidth)} on:change={(event) => setSettings({ tabWidth: Number(event.currentTarget.value) })} aria-label="Tab width"><option value="2">2 spaces</option><option value="4">4 spaces</option><option value="8">8 spaces</option></select></label>
       <label class="fetch-setting"><input type="checkbox" checked={settings.showWhitespace} on:change={(event) => setSettings({ showWhitespace: event.currentTarget.checked })} /> Show whitespace</label>
+      <label class="fetch-setting"><input type="checkbox" checked={settings.wrapLines} on:change={(event) => setSettings({ wrapLines: event.currentTarget.checked })} /> Wrap long code lines</label>
       <label class="fetch-setting"><input type="checkbox" checked={settings.vimNavigation} on:change={(event) => setSettings({ vimNavigation: event.currentTarget.checked })} /> Enable Vim j/k file navigation</label>
       <div class="shortcut-settings"><strong>Shortcut defaults</strong>{#each Object.entries(settings.shortcuts) as [action, shortcut]}<label>{action}<input value={shortcut} on:change={(event) => setSettings({ shortcuts: { ...settings.shortcuts, [action]: event.currentTarget.value } })} /></label>{/each}</div>
       <section class="diagnostics-panel" aria-label="LocalReview diagnostics"><div><strong>Persistence diagnostics</strong><p>Database integrity and aggregate backup storage only.</p></div><button class="secondary-button" on:click={() => void loadPersistenceDiagnostics()}>Check health</button>{#if persistenceDiagnostics}<dl><div><dt>Database</dt><dd>{persistenceDiagnostics.databaseHealthy ? 'Healthy' : persistenceDiagnostics.integrityDiagnostic}</dd></div><div><dt>Backups</dt><dd>{persistenceDiagnostics.backupStorage.retainedCount} · {persistenceDiagnostics.backupStorage.retainedBytes.toLocaleString()} bytes</dd></div><div><dt>Recoverable</dt><dd>{persistenceDiagnostics.recoverableBackupCount}</dd></div></dl><button class="secondary-button" on:click={() => void copyPersistenceDiagnostics()}>Copy source-free JSON</button>{/if}</section>

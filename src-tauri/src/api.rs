@@ -117,6 +117,7 @@ pub struct PartialReviewSettings {
     pub external_editor: Option<String>,
     pub tab_width: Option<u8>,
     pub show_whitespace: Option<bool>,
+    pub wrap_lines: Option<bool>,
     pub vim_navigation: Option<bool>,
     pub shortcuts: Option<std::collections::BTreeMap<String, String>>,
 }
@@ -188,19 +189,26 @@ pub fn pick_local_folder() -> PickedFolder {
 }
 
 #[tauri::command]
-pub fn open_workspace(
+pub async fn open_workspace(
     request: OpenWorkspaceRequest,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<WorkspaceView, ApiError> {
-    let (workspace, _) = state
-        .controller
-        .open_local_workspace(OpenWorkspaceInput {
+    let controller = std::sync::Arc::clone(&state.controller);
+    let (workspace, _) = tauri::async_runtime::spawn_blocking(move || {
+        controller.open_local_workspace(OpenWorkspaceInput {
             path: request.path,
             base: request.base,
             repository_bases: request.repository_bases,
         })
-        .map_err(ApiError::from)?;
+    })
+    .await
+    .map_err(|error| ApiError {
+        code: "local_open_worker_failed",
+        message: format!("local workspace open worker stopped unexpectedly: {error}"),
+        recovery_preview_token: None,
+    })?
+    .map_err(ApiError::from)?;
     activate_main_window(&app);
     Ok(workspace)
 }
@@ -228,19 +236,26 @@ pub fn get_persistence_diagnostics(
         .map_err(ApiError::from)
 }
 
-/// Opens a strict GitHub.com pull-request URL through the native provider.
+/// Opens a GitHub.com pull-request URL through the native provider.
 /// The URL is the only input; neither the frontend nor CLI can supply a local
 /// checkout path or arbitrary `gh` arguments.
 #[tauri::command]
-pub fn open_github_pr(
+pub async fn open_github_pr(
     url: String,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<WorkspaceView, ApiError> {
-    let (workspace, _) = state
-        .controller
-        .open_github_pull_request(OpenGitHubPullRequestInput { url })
-        .map_err(ApiError::from)?;
+    let controller = std::sync::Arc::clone(&state.controller);
+    let (workspace, _) = tauri::async_runtime::spawn_blocking(move || {
+        controller.open_github_pull_request(OpenGitHubPullRequestInput { url })
+    })
+    .await
+    .map_err(|error| ApiError {
+        code: "github_open_worker_failed",
+        message: format!("GitHub PR open worker stopped unexpectedly: {error}"),
+        recovery_preview_token: None,
+    })?
+    .map_err(ApiError::from)?;
     activate_main_window(&app);
     Ok(workspace)
 }
@@ -249,27 +264,40 @@ pub fn open_github_pr(
 /// `host:/absolute/path`; no remote command, shell, or local checkout path is
 /// accepted from the frontend.
 #[tauri::command]
-pub fn open_ssh_workspace(
+pub async fn open_ssh_workspace(
     target: String,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<WorkspaceView, ApiError> {
-    let (workspace, _) = state
-        .controller
-        .open_ssh_workspace(OpenSshWorkspaceInput { target })
-        .map_err(ApiError::from)?;
+    let controller = std::sync::Arc::clone(&state.controller);
+    let (workspace, _) = tauri::async_runtime::spawn_blocking(move || {
+        controller.open_ssh_workspace(OpenSshWorkspaceInput { target })
+    })
+    .await
+    .map_err(|error| ApiError {
+        code: "ssh_open_worker_failed",
+        message: format!("SSH workspace open worker stopped unexpectedly: {error}"),
+        recovery_preview_token: None,
+    })?
+    .map_err(ApiError::from)?;
     activate_main_window(&app);
     Ok(workspace)
 }
 
 #[tauri::command]
-pub fn reconnect_ssh_workspace(
+pub async fn reconnect_ssh_workspace(
     workspace_id: String,
     state: State<'_, AppState>,
 ) -> Result<WorkspaceView, ApiError> {
-    state
-        .controller
-        .reconnect_ssh_workspace(parse_workspace(&workspace_id)?)
+    let workspace_id = parse_workspace(&workspace_id)?;
+    let controller = std::sync::Arc::clone(&state.controller);
+    tauri::async_runtime::spawn_blocking(move || controller.reconnect_ssh_workspace(workspace_id))
+        .await
+        .map_err(|error| ApiError {
+            code: "ssh_reconnect_worker_failed",
+            message: format!("SSH workspace reconnect worker stopped unexpectedly: {error}"),
+            recovery_preview_token: None,
+        })?
         .map_err(ApiError::from)
 }
 
@@ -405,14 +433,22 @@ pub fn get_changed_since_previous_review(
 }
 
 #[tauri::command]
-pub fn get_github_update_status(
+pub async fn get_github_update_status(
     workspace_id: String,
     state: State<'_, AppState>,
 ) -> Result<GitHubPullRequestUpdateStatusView, ApiError> {
-    state
-        .controller
-        .github_pull_request_update_status(parse_workspace(&workspace_id)?)
-        .map_err(ApiError::from)
+    let workspace_id = parse_workspace(&workspace_id)?;
+    let controller = std::sync::Arc::clone(&state.controller);
+    tauri::async_runtime::spawn_blocking(move || {
+        controller.github_pull_request_update_status(workspace_id)
+    })
+    .await
+    .map_err(|error| ApiError {
+        code: "github_status_worker_failed",
+        message: format!("GitHub status worker stopped unexpectedly: {error}"),
+        recovery_preview_token: None,
+    })?
+    .map_err(ApiError::from)
 }
 
 #[tauri::command]
@@ -801,14 +837,21 @@ pub fn configure_baselines(
 }
 
 #[tauri::command]
-pub fn start_new_review(
+pub async fn start_new_review(
     workspace_id: String,
     request: Option<StartOrRefreshInput>,
     state: State<'_, AppState>,
 ) -> Result<ReviewData, ApiError> {
-    state
-        .controller
-        .start_new_review(parse_workspace(&workspace_id)?, request.unwrap_or_default())
+    let workspace_id = parse_workspace(&workspace_id)?;
+    let request = request.unwrap_or_default();
+    let controller = std::sync::Arc::clone(&state.controller);
+    tauri::async_runtime::spawn_blocking(move || controller.start_new_review(workspace_id, request))
+        .await
+        .map_err(|error| ApiError {
+            code: "review_worker_failed",
+            message: format!("review capture worker stopped unexpectedly: {error}"),
+            recovery_preview_token: None,
+        })?
         .map_err(ApiError::from)
 }
 
@@ -832,14 +875,20 @@ pub async fn refresh_review(
 }
 
 #[tauri::command]
-pub fn finish_review(
+pub async fn finish_review(
     workspace_id: String,
     submission: FinishReviewSubmissionInput,
     state: State<'_, AppState>,
 ) -> Result<FinishReviewResult, ApiError> {
-    state
-        .controller
-        .finish_review(parse_workspace(&workspace_id)?, submission)
+    let workspace_id = parse_workspace(&workspace_id)?;
+    let controller = std::sync::Arc::clone(&state.controller);
+    tauri::async_runtime::spawn_blocking(move || controller.finish_review(workspace_id, submission))
+        .await
+        .map_err(|error| ApiError {
+            code: "github_review_worker_failed",
+            message: format!("GitHub review worker stopped unexpectedly: {error}"),
+            recovery_preview_token: None,
+        })?
         .map_err(ApiError::from)
 }
 
@@ -959,6 +1008,9 @@ pub fn save_ui_settings(
     }
     if let Some(value) = settings.show_whitespace {
         merged.show_whitespace = value;
+    }
+    if let Some(value) = settings.wrap_lines {
+        merged.wrap_lines = value;
     }
     if let Some(value) = settings.vim_navigation {
         merged.vim_navigation = value;
@@ -1424,7 +1476,7 @@ mod tests {
             ("workspace".into(), "file".into(), Some(19))
         );
         let settings: PartialReviewSettings =
-            serde_json::from_str(r#"{"lastWorkspaceId":"workspace-last","fontScale":1.2,"leftCollapsed":true,"theme":"light","codeFont":"JetBrains Mono","tabWidth":4,"showWhitespace":true,"vimNavigation":true,"shortcuts":{"nextHunk":"Alt+J"}}"#).unwrap();
+            serde_json::from_str(r#"{"lastWorkspaceId":"workspace-last","fontScale":1.2,"leftCollapsed":true,"theme":"light","codeFont":"JetBrains Mono","tabWidth":4,"showWhitespace":true,"wrapLines":true,"vimNavigation":true,"shortcuts":{"nextHunk":"Alt+J"}}"#).unwrap();
         assert_eq!(
             settings.last_workspace_id.as_deref(),
             Some("workspace-last")
@@ -1433,6 +1485,7 @@ mod tests {
         assert_eq!(settings.left_collapsed, Some(true));
         assert_eq!(settings.theme.as_deref(), Some("light"));
         assert_eq!(settings.tab_width, Some(4));
+        assert_eq!(settings.wrap_lines, Some(true));
         assert_eq!(
             settings
                 .shortcuts
@@ -1489,5 +1542,51 @@ mod tests {
         assert!(body.contains("Arc::clone(&state.controller)"));
         assert!(body.contains("spawn_blocking(move ||"));
         assert!(body.contains("refresh_worker_failed"));
+    }
+
+    #[test]
+    fn github_network_boundaries_stay_off_the_tauri_invoke_thread() {
+        let source = include_str!("api.rs");
+        for (signature, worker_code) in [
+            ("pub async fn open_github_pr(", "github_open_worker_failed"),
+            (
+                "pub async fn get_github_update_status(",
+                "github_status_worker_failed",
+            ),
+            ("pub async fn finish_review(", "github_review_worker_failed"),
+        ] {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature} must remain async"));
+            let tail = &source[start..];
+            let end = tail.find("\n#[tauri::command]").unwrap_or(tail.len());
+            let body = &tail[..end];
+            assert!(body.contains("Arc::clone(&state.controller)"));
+            assert!(body.contains("spawn_blocking(move ||"));
+            assert!(body.contains(worker_code));
+        }
+    }
+
+    #[test]
+    fn workspace_open_boundaries_stay_off_the_tauri_invoke_thread() {
+        let source = include_str!("api.rs");
+        for (signature, worker_code) in [
+            ("pub async fn open_workspace(", "local_open_worker_failed"),
+            ("pub async fn open_ssh_workspace(", "ssh_open_worker_failed"),
+            (
+                "pub async fn reconnect_ssh_workspace(",
+                "ssh_reconnect_worker_failed",
+            ),
+        ] {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature} must remain async"));
+            let tail = &source[start..];
+            let end = tail.find("\n#[tauri::command]").unwrap_or(tail.len());
+            let body = &tail[..end];
+            assert!(body.contains("Arc::clone(&state.controller)"));
+            assert!(body.contains("spawn_blocking(move ||"));
+            assert!(body.contains(worker_code));
+        }
     }
 }

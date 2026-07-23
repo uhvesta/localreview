@@ -219,6 +219,78 @@ function positionedRows(fileId: string) {
   return { rows, oldTokens, newTokens };
 }
 
+function mockFullFileProjection(fileId: string, side: 'old' | 'new', expandedBlocks: Set<string>) {
+  const source = positionedRows(fileId);
+  if (side === 'old') {
+    return {
+      ...source,
+      rows: source.rows.filter((entry) => entry.kind !== 'header' && entry.oldLine !== undefined),
+      deletionBlocks: [] as NonNullable<DiffPresentationWindow['deletionBlocks']>
+    };
+  }
+  const rows: DiffRow[] = [];
+  const deletionBlocks: NonNullable<DiffPresentationWindow['deletionBlocks']> = [];
+  for (let index = 0; index < source.rows.length;) {
+    const current = source.rows[index]!;
+    if (current.kind === 'header') {
+      index += 1;
+      continue;
+    }
+    if (current.kind !== 'deletion') {
+      if (current.newLine !== undefined) rows.push(current);
+      index += 1;
+      continue;
+    }
+    const removed: DiffRow[] = [];
+    while (source.rows[index]?.kind === 'deletion') {
+      removed.push(source.rows[index]!);
+      index += 1;
+    }
+    const startLine = removed[0]?.oldLine ?? 0;
+    const endLine = removed.at(-1)?.oldLine ?? startLine;
+    const id = `${fileId}:deletion:${startLine}-${endLine}`;
+    const expanded = expandedBlocks.has(id);
+    deletionBlocks.push({ id, startLine, endLine, count: removed.length, expanded, rowIndex: rows.length });
+    rows.push({
+      id: `${id}:gate`,
+      kind: 'deletion_gate',
+      oldLine: startLine,
+      oldEndLine: endLine,
+      deletionBlockId: id,
+      deletionCount: removed.length,
+      deletionExpanded: expanded,
+      text: `${removed.length} deleted ${removed.length === 1 ? 'line' : 'lines'}`
+    });
+    if (expanded) rows.push(...removed.map((entry) => ({ ...entry, deletionExpanded: true })));
+  }
+  return { ...source, rows, deletionBlocks };
+}
+
+function mockHunks(sourceRows: DiffRow[], presentedRows: DiffRow[]) {
+  return sourceRows.flatMap((entry, index) => {
+    if (entry.kind !== 'header') return [];
+    const firstSource = sourceRows.slice(index + 1).find((candidate) => candidate.kind !== 'header' && (candidate.oldLine || candidate.newLine));
+    if (!firstSource) return [];
+    const rowIndex = Math.max(0, presentedRows.findIndex((candidate) =>
+      candidate.id === firstSource.id
+      || (candidate.kind === 'deletion_gate'
+        && firstSource.oldLine !== undefined
+        && candidate.oldLine !== undefined
+        && candidate.oldEndLine !== undefined
+        && firstSource.oldLine >= candidate.oldLine
+        && firstSource.oldLine <= candidate.oldEndLine)
+    ));
+    return [{
+      id: entry.hunkId ?? entry.id,
+      rowIndex,
+      oldLine: firstSource.oldLine,
+      newLine: firstSource.newLine,
+      header: entry.hunk ?? 'Changed lines',
+      collapsedContextLines: 12
+    }];
+  });
+}
+
 function demoDifftastic(rows: DiffRow[]): DifftasticPresentation {
   const cells = rows.filter((row) => row.kind !== 'header').slice(0, 80).map((row) => ({
     old: row.oldLine ? { lineNumber: row.oldLine, text: row.oldText ?? '', changedSpans: row.kind === 'deletion' ? [{ start: 0, end: Math.min(18, (row.oldText ?? '').length), highlight: 'keyword' as const }] : [] } : undefined,
@@ -249,6 +321,7 @@ const defaultSettings: ReviewSettings = {
   externalEditor: 'system',
   tabWidth: 2,
   showWhitespace: false,
+  wrapLines: false,
   vimNavigation: false,
   shortcuts: {
     nextHunk: 'Alt+ArrowDown', previousHunk: 'Alt+ArrowUp', filePicker: 'Meta+P',
@@ -353,6 +426,11 @@ export function makeMockApi(): ReviewApi {
       data.workspace.reviewReady = true;
       stateMigrated = true;
     }
+    for (const file of data.files) {
+      if (Number.isSafeInteger(file.hunkCount) && file.hunkCount >= 0) continue;
+      file.hunkCount = positionedRows(file.id).rows.filter((entry) => entry.kind === 'header').length;
+      stateMigrated = true;
+    }
   }
   const finishPreviews = new Map<string, { workspaceId: string; annotationIds: string[]; payloadJson: string; pinnedHeadSha: string }>();
   let settings = (() => {
@@ -428,6 +506,10 @@ export function makeMockApi(): ReviewApi {
       for (const repositoryBase of request.repositoryBases ?? []) validateMockBase(repositoryBase.base);
       const existing = Object.values(state.reviews).find(({ workspace }) => workspace.location === request.path);
       if (existing) {
+        // Match native canonical-root reuse: explicitly opening an archived
+        // path is also an explicit request to return that workspace to the
+        // live rail. Its durable review/session identity remains unchanged.
+        existing.workspace.archived = false;
         if (request.base) {
           existing.workspace.defaultBase = request.base;
           existing.repositories = existing.repositories.map((repository) => repository.isOverride ? repository : { ...repository, base: request.base! });
@@ -662,13 +744,15 @@ export function makeMockApi(): ReviewApi {
     },
     async getRows(fileId, _mode: DiffMode) { return positionedRows(fileId).rows; },
     async getPresentationWindow(request: ViewportRequest) {
-      const all = positionedRows(request.fileId);
+      const source = positionedRows(request.fileId);
+      const expandedBlocks = new Set(request.ephemeralExpandedFullFileDeletionBlocks
+        ?? Object.values(workspaceUiStates)
+          .flatMap((workspaceState) => workspaceState.expandedFullFileDeletionBlocks ?? []));
+      const all = request.mode === 'full'
+        ? mockFullFileProjection(request.fileId, request.fullFileSide === 'old' ? 'old' : 'new', expandedBlocks)
+        : { ...source, deletionBlocks: [] as NonNullable<DiffPresentationWindow['deletionBlocks']> };
       const startRow = Math.max(0, Math.min(all.rows.length, request.startRow));
       const endRow = Math.max(startRow, Math.min(all.rows.length, request.endRow));
-      const hunkRows = all.rows.flatMap((row, index) => row.kind === 'header' ? [{
-        id: row.hunkId ?? row.id, rowIndex: index, oldLine: row.oldLine, newLine: row.newLine,
-        header: row.hunk ?? 'Changed lines', collapsedContextLines: 12
-      }] : []);
       return {
         generation: request.generation,
         mode: request.mode,
@@ -676,7 +760,8 @@ export function makeMockApi(): ReviewApi {
         startRow,
         totalRows: all.rows.length,
         rows: all.rows.slice(startRow, endRow),
-        hunks: hunkRows,
+        hunks: mockHunks(source.rows, all.rows),
+        deletionBlocks: all.deletionBlocks,
         oldTokens: all.oldTokens,
         newTokens: all.newTokens,
         highlightStatus: 'highlighted',
@@ -684,10 +769,27 @@ export function makeMockApi(): ReviewApi {
       };
     },
     async resolvePresentationLocation(fileId, mode, side, line) {
-      const all = positionedRows(fileId).rows;
+      const source = positionedRows(fileId);
+      const expandedBlocks = new Set(Object.values(workspaceUiStates)
+        .flatMap((workspaceState) => workspaceState.expandedFullFileDeletionBlocks ?? []));
+      const fullFileSide = Object.values(workspaceUiStates)
+        .find((workspaceState) => workspaceState.activeFileId === fileId && workspaceState.mode === 'full')
+        ?.fullFileSide ?? 'new';
+      const all = mode === 'full'
+        ? mockFullFileProjection(fileId, fullFileSide, expandedBlocks).rows
+        : source.rows;
       let rowIndex = all.findIndex((entry) => (side === 'old' ? entry.oldLine : entry.newLine) === line);
+      if (rowIndex < 0 && mode === 'full' && side === 'old') {
+        rowIndex = all.findIndex((entry) =>
+          entry.kind === 'deletion_gate'
+          && entry.oldLine !== undefined
+          && entry.oldEndLine !== undefined
+          && line >= entry.oldLine
+          && line <= entry.oldEndLine
+        );
+      }
       if (mode === 'difftastic') {
-        const structural = demoDifftastic(all);
+        const structural = demoDifftastic(source.rows);
         const exact = structural.alignment.findIndex((entry) => (side === 'old' ? entry.oldLine : entry.newLine) === line);
         if (exact >= 0) rowIndex = exact;
       }

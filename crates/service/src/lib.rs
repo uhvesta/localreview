@@ -255,6 +255,10 @@ pub enum ServiceError {
         workspace_id: WorkspaceId,
         preview_token: String,
     },
+    #[error(
+        "selected GitHub review annotations are no longer open and publishable: {annotation_ids:?}"
+    )]
+    GitHubReviewAnnotationsUnavailable { annotation_ids: Vec<AnnotationId> },
     #[error("GitHub review preview {preview_token} is not submit-ready: {reason}")]
     GitHubReviewPreviewNotReady {
         preview_token: String,

@@ -398,6 +398,10 @@ pub struct PresentationRequest {
     pub generation: u64,
     pub full_file_side: Option<String>,
     pub split_ratio: Option<f64>,
+    /// Optional presentation-only state used while browsing a frozen review.
+    /// It is validated against the owning immutable session and is never
+    /// written to either the archived or active session UI-state record.
+    pub ephemeral_expanded_full_file_deletion_blocks: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1218,6 +1222,7 @@ pub struct ReviewSettings {
     pub external_editor: String,
     pub tab_width: u8,
     pub show_whitespace: bool,
+    pub wrap_lines: bool,
     pub vim_navigation: bool,
     pub shortcuts: BTreeMap<String, String>,
 }
@@ -1237,6 +1242,7 @@ impl Default for ReviewSettings {
             external_editor: "system".into(),
             tab_width: 2,
             show_whitespace: false,
+            wrap_lines: false,
             vim_navigation: false,
             shortcuts: BTreeMap::from([
                 ("saveAnnotation".into(), "Meta+Enter".into()),
@@ -1856,12 +1862,20 @@ impl DesktopController {
         let workspaces = self.state().workspaces()?;
         if let Some(id) = parse_workspace_id(selector) {
             if let Some(workspace) = self.state().workspace(id)? {
+                if workspace.archived_at.is_some() {
+                    return Err(DispatchError::Invalid(
+                        "workspace is archived; reopen it from Review history or open its local path again"
+                            .into(),
+                    ));
+                }
                 return self.workspace_view(&workspace);
             }
         }
         let matches = workspaces
             .into_iter()
-            .filter(|workspace| workspace.display_name == selector)
+            .filter(|workspace| {
+                workspace.archived_at.is_none() && workspace.display_name == selector
+            })
             .collect::<Vec<_>>();
         match matches.len() {
             0 => Err(DispatchError::NotFound(selector.into())),
@@ -2032,7 +2046,24 @@ impl DesktopController {
                 historical_session_id: None,
             });
         };
-        self.review_data_for_session(&workspace, &repositories, &session, false)
+        // Deleting a GitHub workspace removes its app-owned checkout but keeps
+        // this immutable capture. If the user reopens that archived snapshot,
+        // expose it as read-only instead of presenting refresh/edit actions
+        // which require a worktree that intentionally no longer exists.
+        let detached_github_snapshot =
+            matches!(workspace.source, WorkspaceSource::PullRequest { .. })
+                && self
+                    .service
+                    .github_pull_request(workspace.id)
+                    .map_or(true, |review| {
+                        !Path::new(review.managed_worktree.worktree_path.as_str()).is_dir()
+                    });
+        self.review_data_for_session(
+            &workspace,
+            &repositories,
+            &session,
+            detached_github_snapshot,
+        )
     }
 
     /// Opens an archived review generation as a strictly read-only browsing
@@ -2514,10 +2545,30 @@ impl DesktopController {
             .ok_or_else(|| {
                 DispatchError::Invalid("file is not part of a retained immutable review".into())
             })?;
-        let ui_state = self
+        let mut ui_state = self
             .state()
             .review_session_ui_state::<ReviewUiState>(session.id)?
             .unwrap_or_default();
+        if let Some(values) = request
+            .ephemeral_expanded_full_file_deletion_blocks
+            .as_ref()
+        {
+            const MAX_EXPANDED_DELETION_BLOCKS: usize = 10_000;
+            if values.len() > MAX_EXPANDED_DELETION_BLOCKS {
+                return Err(DispatchError::Invalid(format!(
+                    "ephemeralExpandedFullFileDeletionBlocks may contain at most {MAX_EXPANDED_DELETION_BLOCKS} values"
+                )));
+            }
+            let expanded = values.iter().cloned().collect::<BTreeSet<_>>();
+            let valid = valid_full_file_deletion_block_ids(&self.current_documents(session.id)?);
+            if !expanded.is_subset(&valid) {
+                return Err(DispatchError::Invalid(
+                    "ephemeralExpandedFullFileDeletionBlocks contains a stale or foreign block"
+                        .into(),
+                ));
+            }
+            ui_state.expanded_full_file_deletion_blocks = expanded;
+        }
         let settings = self.get_settings()?;
 
         if mode == "difftastic" {
@@ -2665,6 +2716,7 @@ impl DesktopController {
                         generation: 0,
                         full_file_side: Some(side_name(side).into()),
                         split_ratio: None,
+                        ephemeral_expanded_full_file_deletion_blocks: None,
                     },
                     &document,
                     &ui_state,
@@ -4212,8 +4264,10 @@ impl DesktopController {
         let refresh_revision = matches!(workspace.source, WorkspaceSource::LocalDirectory { .. })
             .then(|| self.restart_local_watcher_for_capture(&workspace))
             .transpose()?;
-        // Starting/opening a review is strictly local and never fetches. A
-        // remote update is an explicit Refresh-only action.
+        let settings = self.get_settings()?;
+        if input.fetch_before_capture || settings.fetch_on_review {
+            self.fetch_workspace_repositories(workspace_id)?;
+        }
         let started = self.service.start_local_review(StartReviewRequest {
             workspace_id,
             application_default_base: self.application_base()?,
@@ -4221,14 +4275,20 @@ impl DesktopController {
             options,
         })?;
         self.persist_local_capture_outcomes(workspace_id, &started)?;
+        let refresh_outcome = local_refresh_outcome(&started);
         if started.failures.is_empty() {
             if let Some(refresh_revision) = refresh_revision {
                 self.clear_refresh_available_at_boundary(workspace_id, refresh_revision);
-            } else {
+            } else if matches!(workspace.source, WorkspaceSource::LocalDirectory { .. }) {
+                // A GitHub start_new_review only archives the prior round and
+                // captures its existing immutable pin. Provider freshness is
+                // acknowledged exclusively by refresh_review below.
                 self.clear_refresh_available(workspace_id);
             }
         }
-        self.load_review(workspace_id)
+        let mut review = self.load_review(workspace_id)?;
+        review.refresh_outcome = Some(refresh_outcome);
+        Ok(review)
     }
 
     pub fn refresh_review(
@@ -4249,8 +4309,15 @@ impl DesktopController {
                     "GitHub PR bases and comparison rules are pinned by GitHub metadata; refresh the PR instead of overriding them".into(),
                 ));
             }
-            self.service
-                .refresh_github_pull_request(workspace_id, self.application_base()?)?;
+            if let Err(error) = self
+                .service
+                .refresh_github_pull_request(workspace_id, self.application_base()?)
+            {
+                // The review-round boundary may already have succeeded. Keep
+                // the provider retry visible and preserve the provider error.
+                self.mark_refresh_available(workspace_id)?;
+                return Err(error.into());
+            }
             self.clear_refresh_available(workspace_id);
             return self.load_review(workspace_id);
         }
@@ -10113,6 +10180,7 @@ mod tests {
                     generation: 1,
                     full_file_side: Some("new".into()),
                     split_ratio: None,
+                    ephemeral_expanded_full_file_deletion_blocks: None,
                 },
                 resources.path(),
             )
@@ -10147,6 +10215,7 @@ mod tests {
                     generation: 2,
                     full_file_side: Some("new".into()),
                     split_ratio: None,
+                    ephemeral_expanded_full_file_deletion_blocks: None,
                 },
                 resources.path(),
             )
@@ -10162,6 +10231,7 @@ mod tests {
                     generation: 3,
                     full_file_side: Some("new".into()),
                     split_ratio: None,
+                    ephemeral_expanded_full_file_deletion_blocks: None,
                 },
                 resources.path(),
             )
@@ -10539,6 +10609,7 @@ mod tests {
     #[test]
     fn archived_workspace_can_be_reopened_with_its_captured_review_intact() {
         let fixture = review_fixture("before\n", "after\n");
+        let state_root = fixture.controller.state().root().to_path_buf();
         let before = fixture
             .controller
             .load_review(fixture.workspace_id)
@@ -10558,26 +10629,38 @@ mod tests {
         assert!(archived[0].archived);
         assert_eq!(archived[0].progress.total, before.files.len());
         assert!(fixture.controller.local_watchers.lock().unwrap().is_empty());
+        assert!(matches!(
+            fixture
+                .controller
+                .focus_workspace(&fixture.workspace_id.to_string()),
+            Err(DispatchError::Invalid(message)) if message.contains("archived")
+        ));
+        assert!(matches!(
+            fixture.controller.focus_workspace(&before.workspace.name),
+            Err(DispatchError::NotFound(_))
+        ));
 
-        let reopened = fixture
-            .controller
+        // Archival, captured documents, annotations, and the ability to
+        // recover them are durable database state rather than process-local
+        // rail state.
+        let restarted = DesktopController::new(StateStore::open(state_root).unwrap());
+        let archived_after_restart = restarted.list_archived_workspaces().unwrap();
+        assert_eq!(archived_after_restart.len(), 1);
+        assert_eq!(
+            archived_after_restart[0].id,
+            fixture.workspace_id.to_string()
+        );
+        let reopened = restarted
             .reopen_archived_workspace(fixture.workspace_id)
             .unwrap();
         assert!(!reopened.archived);
-        let after = fixture
-            .controller
-            .load_review(fixture.workspace_id)
-            .unwrap();
+        let after = restarted.load_review(fixture.workspace_id).unwrap();
         assert_eq!(after.files.len(), before.files.len());
         assert_eq!(after.files[0].id, before.files[0].id);
         assert_eq!(after.files[0].path, before.files[0].path);
         assert_eq!(after.annotations.len(), before.annotations.len());
-        assert_eq!(fixture.controller.list_workspaces().unwrap().len(), 1);
-        assert!(fixture
-            .controller
-            .list_archived_workspaces()
-            .unwrap()
-            .is_empty());
+        assert_eq!(restarted.list_workspaces().unwrap().len(), 1);
+        assert!(restarted.list_archived_workspaces().unwrap().is_empty());
     }
 
     #[test]
@@ -10675,6 +10758,7 @@ mod tests {
         assert_eq!(restored.theme, "dark");
         assert_eq!(restored.code_font, "SF Mono");
         assert_eq!(restored.tab_width, 2);
+        assert!(!restored.wrap_lines);
         assert!(!restored.shortcuts.is_empty());
     }
 
@@ -10817,6 +10901,7 @@ mod tests {
                     generation: 7,
                     full_file_side: Some("new".into()),
                     split_ratio: Some(0.5),
+                    ephemeral_expanded_full_file_deletion_blocks: None,
                 },
                 resources.path(),
             )
@@ -10843,6 +10928,7 @@ mod tests {
                     generation: 8,
                     full_file_side: None,
                     split_ratio: None,
+                    ephemeral_expanded_full_file_deletion_blocks: None,
                 },
                 resources.path(),
             )
@@ -10865,6 +10951,7 @@ mod tests {
                     generation: 9,
                     full_file_side: Some("new".into()),
                     split_ratio: None,
+                    ephemeral_expanded_full_file_deletion_blocks: None,
                 },
                 resources.path(),
             )
@@ -10935,6 +11022,7 @@ mod tests {
                     generation: 10,
                     full_file_side: Some("new".into()),
                     split_ratio: None,
+                    ephemeral_expanded_full_file_deletion_blocks: None,
                 },
                 resources.path(),
             )
@@ -10995,6 +11083,33 @@ mod tests {
             .map(|block| block.id.clone())
             .collect::<Vec<_>>();
         expanded_ids.sort();
+        let ephemeral = fixture
+            .controller
+            .presentation_window(
+                PresentationRequest {
+                    file_id: fixture.file_id.to_string(),
+                    comparison_id: None,
+                    mode: "full".into(),
+                    start_row: 0,
+                    end_row: u32::MAX,
+                    generation: 11,
+                    full_file_side: Some("new".into()),
+                    split_ratio: None,
+                    ephemeral_expanded_full_file_deletion_blocks: Some(expanded_ids.clone()),
+                },
+                resources.path(),
+            )
+            .unwrap();
+        assert!(ephemeral.deletion_blocks.iter().all(|block| block.expanded));
+        assert!(
+            fixture
+                .controller
+                .workspace_ui_state(fixture.workspace_id)
+                .unwrap()
+                .expanded_full_file_deletion_blocks
+                .is_empty(),
+            "a presentation-only expansion must not mutate durable session UI state"
+        );
         assert!(fixture
             .controller
             .save_workspace_ui_state(
@@ -11032,9 +11147,10 @@ mod tests {
                     mode: "full".into(),
                     start_row: 0,
                     end_row: u32::MAX,
-                    generation: 11,
+                    generation: 12,
                     full_file_side: Some("new".into()),
                     split_ratio: None,
+                    ephemeral_expanded_full_file_deletion_blocks: None,
                 },
                 resources.path(),
             )
@@ -11996,6 +12112,7 @@ mod tests {
                     generation: 1,
                     full_file_side: None,
                     split_ratio: None,
+                    ephemeral_expanded_full_file_deletion_blocks: None,
                 },
                 Path::new("."),
             )
@@ -12295,6 +12412,73 @@ mod tests {
 
         assert!(summary.refresh_available);
         assert!(summary.refresh_available_revision > 0);
+    }
+
+    #[test]
+    fn github_round_boundary_and_failed_provider_refresh_keep_retry_available() {
+        let workspace_directory = TempDir::new().unwrap();
+        let repository = workspace_directory.path();
+        let git = |arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(repository)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "review@example.invalid"]);
+        git(&["config", "user.name", "Review Test"]);
+        std::fs::write(repository.join("review.rs"), "fn old() {}\n").unwrap();
+        git(&["add", "review.rs"]);
+        git(&["commit", "-m", "base"]);
+        git(&["switch", "-c", "feature"]);
+        std::fs::write(repository.join("review.rs"), "fn captured() {}\n").unwrap();
+
+        let state_directory = TempDir::new().unwrap();
+        let controller = DesktopController::new(StateStore::open(state_directory.path()).unwrap());
+        let (opened, _) = controller
+            .open_local_workspace(OpenWorkspaceInput {
+                path: repository.to_string_lossy().into_owned(),
+                base: Some("main".into()),
+                repository_bases: Vec::new(),
+            })
+            .unwrap();
+        let workspace_id = parse_workspace_id(&opened.id).unwrap();
+        let mut workspace = controller.state().workspace(workspace_id).unwrap().unwrap();
+        workspace.source = WorkspaceSource::PullRequest {
+            url: "https://github.com/acme/project/pull/42".into(),
+            owner: "acme".into(),
+            repository: "project".into(),
+            number: 42,
+            worktree: StoredPath::new(repository),
+        };
+        controller.state().upsert_workspace(&workspace).unwrap();
+
+        controller.mark_refresh_available(workspace_id).unwrap();
+        let started = controller
+            .start_new_review(workspace_id, StartOrRefreshInput::default())
+            .unwrap();
+        assert!(started.workspace.refresh_available);
+
+        controller.clear_refresh_available(workspace_id);
+        let error = controller
+            .refresh_review(workspace_id, StartOrRefreshInput::default())
+            .unwrap_err();
+        assert!(matches!(error, DispatchError::Service(_)));
+        assert!(
+            controller
+                .list_workspaces()
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.id == workspace_id.to_string())
+                .unwrap()
+                .refresh_available
+        );
     }
 
     #[test]
@@ -12677,6 +12861,7 @@ mod tests {
                     generation: 11,
                     full_file_side: None,
                     split_ratio: Some(0.5),
+                    ephemeral_expanded_full_file_deletion_blocks: None,
                 },
                 &resource_dir,
             )

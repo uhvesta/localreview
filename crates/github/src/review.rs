@@ -902,6 +902,10 @@ fn validate_github_path(path: &StoredPath) -> Result<(), ReviewPublishError> {
     if raw.is_empty()
         || raw.starts_with('/')
         || raw.contains('\0')
+        // GitHub's review API always addresses repository paths with `/`.
+        // On Unix a Windows drive path otherwise looks relative and could
+        // leak an app/cache location into a malformed publication payload.
+        || raw.contains('\\')
         || raw
             .split('/')
             .any(|component| component.is_empty() || component == "." || component == "..")
@@ -1082,6 +1086,56 @@ mod tests {
     }
 
     #[test]
+    fn native_payload_rejects_host_paths_and_encodes_old_side_ranges_exactly() {
+        for path in [
+            StoredPath::from("/private/var/tmp/review.rs"),
+            StoredPath::from(r"C:\Users\review\src\lib.rs"),
+            StoredPath::from("../src/lib.rs"),
+        ] {
+            let draft = NativeReviewDraft {
+                pinned_head_sha: GitSha::new("1234567890abcdef1234567890abcdef12345678").unwrap(),
+                publication_attempt_id: "018f6af0-8af2-7ad0-a98a-123456789abc".to_owned(),
+                conclusion: ReviewConclusion::Comment,
+                summary_markdown: None,
+                comments: vec![NativeReviewComment {
+                    body_markdown: "must stay repository-relative".to_owned(),
+                    path,
+                    line: 2,
+                    side: GitHubLineSide::Right,
+                    start_line: None,
+                    start_side: None,
+                }],
+            };
+            assert!(matches!(
+                draft.prepare(),
+                Err(ReviewPublishError::InvalidPath(_))
+            ));
+        }
+
+        let draft = NativeReviewDraft {
+            pinned_head_sha: GitSha::new("1234567890abcdef1234567890abcdef12345678").unwrap(),
+            publication_attempt_id: "018f6af0-8af2-7ad0-a98a-abcdefabcdef".to_owned(),
+            conclusion: ReviewConclusion::RequestChanges,
+            summary_markdown: Some("Old-side range fixture".to_owned()),
+            comments: vec![NativeReviewComment {
+                body_markdown: "This deleted range needs another look.".to_owned(),
+                path: StoredPath::from("src/removed.rs"),
+                line: 8,
+                side: GitHubLineSide::Left,
+                start_line: Some(6),
+                start_side: Some(GitHubLineSide::Left),
+            }],
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&draft.prepare().unwrap().payload_json).unwrap();
+        assert_eq!(payload["comments"][0]["path"], "src/removed.rs");
+        assert_eq!(payload["comments"][0]["line"], 8);
+        assert_eq!(payload["comments"][0]["side"], "LEFT");
+        assert_eq!(payload["comments"][0]["start_line"], 6);
+        assert_eq!(payload["comments"][0]["start_side"], "LEFT");
+    }
+
+    #[test]
     fn only_completed_http_client_rejections_are_definitive() {
         let rejection = ReviewPublishError::Gh(GhError::CommandFailed {
             command: "gh api --method POST repos/a/b/pulls/1/reviews".into(),
@@ -1163,5 +1217,43 @@ mod tests {
             NativeReviewComment::from_annotation(&annotation, comparison_id),
             Err(ReviewPublishError::OutdatedAnnotation { .. })
         ));
+    }
+
+    #[test]
+    fn annotation_ranges_map_to_the_exact_github_side_contract() {
+        let comparison_id = ComparisonId::new();
+        let now = Utc::now();
+        let annotation = Annotation {
+            id: localreview_domain::AnnotationId::new(),
+            annotation_set_id: localreview_domain::AnnotationSetId::new(),
+            kind: localreview_domain::AnnotationKind::Comment,
+            state: localreview_domain::AnnotationState::Open,
+            publication_state: localreview_domain::PublicationState::IncludedInNextReview,
+            labels: Vec::new(),
+            body_markdown: "Review the removed range.".to_owned(),
+            anchor: Some(
+                localreview_domain::AnnotationAnchor::from_line(
+                    localreview_domain::LineAnchorInput {
+                        comparison_id,
+                        repository_id: localreview_domain::RepositoryId::new(),
+                        file_path: StoredPath::from("src/removed.rs"),
+                        side: DiffSide::Old,
+                        start_line: 6,
+                        end_line: 8,
+                        selected_source: "old six through eight".to_owned(),
+                        surrounding_context: "old-side fixture".to_owned(),
+                    },
+                )
+                .unwrap(),
+            ),
+            created_at: now,
+            updated_at: now,
+        };
+        let comment = NativeReviewComment::from_annotation(&annotation, comparison_id).unwrap();
+        assert_eq!(comment.path, StoredPath::from("src/removed.rs"));
+        assert_eq!(comment.side, GitHubLineSide::Left);
+        assert_eq!(comment.line, 8);
+        assert_eq!(comment.start_line, Some(6));
+        assert_eq!(comment.start_side, Some(GitHubLineSide::Left));
     }
 }

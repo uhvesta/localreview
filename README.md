@@ -111,6 +111,7 @@ localreview open [path]
 localreview open [path] --base <ref>
 localreview open [path] --repo-base <relative-path>=<ref>
 localreview workspace <name-or-id>
+localreview focus <name-or-id> # alias for workspace
 localreview pr <github-pr-url>
 localreview ssh <host>:<absolute-path>
 localreview list
@@ -119,6 +120,19 @@ localreview recover status
 localreview recover restore <backup-file-name> --confirm
 localreview agent --stdio
 ```
+
+`open` canonicalizes the folder and reuses its durable workspace when it is
+already registered; `workspace`/`focus` selects an existing live workspace
+without recapturing it. On macOS the CLI starts LocalReview when necessary. On
+Linux it forwards to an already-running authenticated desktop endpoint, or
+through the managed SSH reverse channel when invoked in a connected remote
+shell.
+
+Deleting a workspace in the desktop archives its captured reviews, inline
+comments/questions, prompt exports, and UI location. Local folders and remote
+files are never deleted. An app-owned GitHub PR worktree is removed only when
+clean, while the shared repository cache is retained. Archived workspaces can
+be reopened from **Review history** after restarting the app.
 
 `localreview agent --stdio` is the bounded remote companion protocol, not a
 general shell-execution API. A manually installed companion may be placed in

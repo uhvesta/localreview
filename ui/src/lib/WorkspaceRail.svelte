@@ -17,6 +17,15 @@
 
   let filter: 'all' | WorkspaceSource = 'all';
   let search = '';
+  let observedSelectedId = selectedId;
+  // A workspace opened by the GUI/CLI must remain visible. If an external
+  // selection crosses the current source filter, reveal All rather than
+  // making the other workspaces appear to have vanished or undoing the open.
+  $: if (selectedId !== observedSelectedId) {
+    observedSelectedId = selectedId;
+    const selected = workspaces.find((workspace) => workspace.id === selectedId);
+    if (selected && filter !== 'all' && !selected.source.includes(filter)) filter = 'all';
+  }
   $: filtered = workspaces.filter((workspace) =>
     (filter === 'all' || workspace.source.includes(filter)) &&
     `${workspace.name} ${workspace.location}`.toLowerCase().includes(search.toLowerCase())
@@ -73,7 +82,7 @@
             {#if workspace.source.includes('ssh')}
               <button class="workspace-action" aria-label={`Reconnect ${workspace.name}`} on:click={() => onReconnect(workspace)}>Reconnect</button>
             {/if}
-            <button class="workspace-action destructive" aria-label={`Remove ${workspace.name} from workspace rail`} on:click={() => onDelete(workspace)}>Remove</button>
+            <button class="workspace-action destructive" aria-label={`Delete workspace ${workspace.name}`} title="Archive this workspace and remove it from the rail" on:click={() => onDelete(workspace)}>Delete…</button>
           </div>
         </div>
       {/each}

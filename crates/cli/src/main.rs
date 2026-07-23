@@ -68,7 +68,8 @@ enum Command {
         #[arg(long = "repo-base")]
         repository_bases: Vec<String>,
     },
-    /// Focus an existing workspace by exact ID or unambiguous name.
+    /// Focus an existing live workspace by exact ID or unambiguous name.
+    #[command(alias = "focus")]
     Workspace { name_or_id: String },
     /// Open a GitHub.com pull request in an isolated desktop review workspace.
     Pr { github_pr_url: String },
@@ -3022,7 +3023,13 @@ fn unix_seconds() -> u64 {
 }
 
 fn next_request_id() -> String {
-    format!("cli-{}-{}", std::process::id(), unix_seconds())
+    static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    let sequence = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("cli-{}-{timestamp}-{sequence}", std::process::id())
 }
 
 struct Endpoint {
@@ -3084,6 +3091,116 @@ impl CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_exposes_distinct_new_open_and_existing_focus_flows() {
+        let open = Cli::try_parse_from([
+            "localreview",
+            "open",
+            "/tmp/work",
+            "--base",
+            "origin/main",
+            "--repo-base",
+            "services/api=origin/HOTFIX-1",
+        ])
+        .unwrap();
+        match open.command {
+            Command::Open {
+                path,
+                base,
+                repository_bases,
+            } => {
+                assert_eq!(path, PathBuf::from("/tmp/work"));
+                assert_eq!(base.as_deref(), Some("origin/main"));
+                assert_eq!(repository_bases, ["services/api=origin/HOTFIX-1"]);
+            }
+            other => panic!("expected open command, received {other:?}"),
+        }
+
+        for command_name in ["workspace", "focus"] {
+            let focus =
+                Cli::try_parse_from(["localreview", command_name, "My active workspace"]).unwrap();
+            assert!(matches!(
+                focus.command,
+                Command::Workspace { ref name_or_id } if name_or_id == "My active workspace"
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_unix_forwarding_preserves_open_contract_on_macos_and_linux() {
+        use std::os::unix::net::UnixListener;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("desktop.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let secret = localreview_protocol::InstallationSecret::from_bytes([9; 32]);
+        let server_secret = secret.clone();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: LocalRequest = read_frame(&mut stream).unwrap();
+            server_secret.verify(&request).unwrap();
+            assert_eq!(
+                request.command,
+                LocalCommand::OpenWorkspace {
+                    path: "/tmp/work".into(),
+                    base: Some("origin/main".into()),
+                    repository_bases: vec![RepositoryBaseOverride {
+                        relative_path: "services/api".into(),
+                        base: "origin/HOTFIX-1".into(),
+                    }],
+                }
+            );
+            write_frame(
+                &mut stream,
+                &LocalResponse::Opened {
+                    request_id: request.request_id,
+                    workspace: WorkspaceSummary {
+                        id: "workspace-1".into(),
+                        name: "work".into(),
+                        source_tags: vec![localreview_protocol::WorkspaceSourceTag::Local],
+                        available: true,
+                        location: Some("/tmp/work".into()),
+                    },
+                    created: true,
+                },
+            )
+            .unwrap();
+        });
+        let response = send_request(
+            &Endpoint {
+                record: RuntimeRecord::current(socket_path),
+                secret,
+            },
+            LocalCommand::OpenWorkspace {
+                path: "/tmp/work".into(),
+                base: Some("origin/main".into()),
+                repository_bases: vec![RepositoryBaseOverride {
+                    relative_path: "services/api".into(),
+                    base: "origin/HOTFIX-1".into(),
+                }],
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            response,
+            LocalResponse::Opened {
+                created: true,
+                workspace: WorkspaceSummary { ref id, .. },
+                ..
+            } if id == "workspace-1"
+        ));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn request_ids_remain_unique_within_one_process_and_timestamp() {
+        let first = next_request_id();
+        let second = next_request_id();
+        assert_ne!(first, second);
+        assert!(first.starts_with(&format!("cli-{}-", std::process::id())));
+    }
 
     #[test]
     fn repository_base_parser_preserves_path_and_ref() {

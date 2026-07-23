@@ -10,8 +10,10 @@ use crate::{GhCommand, GhError, GhExecutor, GitHubClient};
 
 pub const GITHUB_DOT_COM: &str = "github.com";
 
-/// A strict GitHub.com PR URL. Query strings, fragments, alternate hosts, and
-/// path variants are intentionally rejected at the provider boundary.
+/// A GitHub.com PR URL normalized to its canonical review identity. Common
+/// browser-copy variants such as `/files`, query strings, fragments, and a
+/// trailing slash are accepted, while alternate hosts and non-PR paths remain
+/// rejected at the provider boundary.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GitHubPullRequestUrl {
     pub owner: String,
@@ -54,11 +56,16 @@ impl FromStr for GitHubPullRequestUrl {
         if value.len() > 2_048 || value.contains('\0') {
             return Err(PullRequestError::InvalidUrl(value.to_owned()));
         }
+        let value = value.trim();
         let Some(path) = value.strip_prefix("https://github.com/") else {
             return Err(PullRequestError::InvalidUrl(value.to_owned()));
         };
+        let path = path
+            .split_once(['?', '#'])
+            .map_or(path, |(path, _)| path)
+            .trim_end_matches('/');
         let parts = path.split('/').collect::<Vec<_>>();
-        let [owner, repository, "pull", number] = parts.as_slice() else {
+        let [owner, repository, "pull", number, ..] = parts.as_slice() else {
             return Err(PullRequestError::InvalidUrl(value.to_owned()));
         };
         if !github_owner_segment(owner) || !github_repository_segment(repository) {
@@ -368,17 +375,27 @@ mod tests {
     }
 
     #[test]
-    fn strict_url_parser_accepts_only_canonical_github_dot_com_urls() {
+    fn url_parser_normalizes_common_github_browser_links() {
         let url = GitHubPullRequestUrl::from_str("https://github.com/octo/repo/pull/42").unwrap();
         assert_eq!(url.owner, "octo");
-        assert!(GitHubPullRequestUrl::from_str("https://github.com/octo/repo/pull/42/").is_err());
-        assert!(
-            GitHubPullRequestUrl::from_str("https://github.com/octo/repo/pull/42?x=1").is_err()
-        );
+        for pasted in [
+            "https://github.com/octo/repo/pull/42/",
+            " https://github.com/octo/repo/pull/42/files ",
+            "https://github.com/octo/repo/pull/42?diff=split",
+            "https://github.com/octo/repo/pull/42/files#discussion_r123",
+        ] {
+            assert_eq!(
+                GitHubPullRequestUrl::from_str(pasted)
+                    .unwrap()
+                    .canonical_url(),
+                url.canonical_url()
+            );
+        }
         assert!(GitHubPullRequestUrl::from_str("https://github.com/octo/repo/issues/42").is_err());
         assert!(
             GitHubPullRequestUrl::from_str("https://github.example/octo/repo/pull/42").is_err()
         );
+        assert!(GitHubPullRequestUrl::from_str("https://github.com/octo/repo/pull").is_err());
     }
 
     #[test]
