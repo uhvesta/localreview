@@ -79,6 +79,11 @@ enum Command {
     List,
     /// Report whether the desktop endpoint and its local authentication material are usable.
     Doctor,
+    /// Inspect LocalReview's read-only global defaults location.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Inspect or explicitly restore LocalReview application data after a corruption report.
     Recover {
         #[command(subcommand)]
@@ -103,6 +108,12 @@ enum RecoveryCommand {
         #[arg(long)]
         confirm: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Print the OS-specific global config.toml path.
+    Path,
 }
 
 fn main() -> ExitCode {
@@ -178,6 +189,24 @@ fn run(cli: Cli) -> Result<(), CliError> {
         }
         Command::List => emit_response(forward(LocalCommand::ListWorkspaces, true)?, cli.json),
         Command::Doctor => emit_response(run_doctor()?, cli.json),
+        Command::Config {
+            command: ConfigCommand::Path,
+        } => {
+            let path = AppPaths::discover()?.global_config_path();
+            let exists = path.is_file();
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "path": path,
+                        "exists": exists,
+                    })
+                );
+            } else {
+                println!("{}", path.display());
+            }
+            Ok(())
+        }
         Command::Recover { command } => run_recovery(command, cli.json),
     }
 }
@@ -3125,6 +3154,17 @@ mod tests {
                 Command::Workspace { ref name_or_id } if name_or_id == "My active workspace"
             ));
         }
+    }
+
+    #[test]
+    fn cli_exposes_global_config_path_without_desktop_forwarding() {
+        let parsed = Cli::try_parse_from(["localreview", "config", "path"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Config {
+                command: ConfigCommand::Path
+            }
+        ));
     }
 
     #[cfg(unix)]

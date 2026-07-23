@@ -296,12 +296,16 @@ Baseline resolution follows:
 temporary review override
   -> repository override
     -> workspace default
-      -> application default
+      -> global default
+        -> release default
 ```
 
-The initial application default is `origin/master`, but the setting is editable. Failure to resolve the default in one repository is isolated to that repository and does not hide changes from successful repositories.
+The release default is `origin/master`. Explicit CLI/GUI inputs and durable
+choices saved by the application remain higher priority than file-provided
+defaults. Failure to resolve the default in one repository is isolated to that
+repository and does not hide changes from successful repositories.
 
-### 8.3 Workspace configuration file
+### 8.3 Global and workspace configuration files
 
 An optional `.localreview.toml` at the workspace root can describe shareable discovery and baseline defaults. Application state remains usable without the file. The application never modifies it without a separate explicit feature.
 
@@ -321,6 +325,20 @@ enabled = false
 ```
 
 Repository keys are workspace-relative paths, not display names.
+
+The identical schema is accepted as a read-only per-user global file:
+
+- macOS: `~/Library/Application Support/LocalReview/config.toml`
+- Linux: `$XDG_CONFIG_HOME/localreview/config.toml`, falling back to
+  `~/.config/localreview/config.toml`
+
+`LOCALREVIEW_CONFIG_DIR` overrides the parent directory, and
+`localreview config path` reports the effective file. Configuration fields
+resolve as workspace file, then global file, then release defaults. A
+workspace repository table overlays matching global repository entries
+field-by-field. Workspace `exclude` replaces the global relative-prefix list
+when present, including when explicitly empty; built-in directory-name safety
+exclusions remain active. Explicit CLI/GUI inputs are above every file layer.
 
 ## 9. Review setup and baseline controls
 

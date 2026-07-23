@@ -116,6 +116,7 @@ localreview pr <github-pr-url>
 localreview ssh <host>:<absolute-path>
 localreview list
 localreview doctor
+localreview config path
 localreview recover status
 localreview recover restore <backup-file-name> --confirm
 localreview agent --stdio
@@ -162,7 +163,7 @@ corruption, `recover status` prints source-free diagnostics and the exact safe
 backup names; `recover restore` validates the selected backup and preserves the
 corrupt database and WAL sidecars before replacement.
 
-## Workspace configuration
+## Global and workspace configuration
 
 An optional read-only `.localreview.toml` at the workspace root can share
 discovery and baseline defaults:
@@ -180,7 +181,35 @@ base = "origin/HOTFIX-1"
 enabled = false
 ```
 
-Explicit CLI/GUI inputs take precedence. LocalReview never rewrites this file.
+The same schema can provide per-user global defaults at:
+
+- macOS: `~/Library/Application Support/LocalReview/config.toml`
+- Linux: `$XDG_CONFIG_HOME/localreview/config.toml`, or
+  `~/.config/localreview/config.toml` when `XDG_CONFIG_HOME` is unset
+
+`localreview config path` prints the exact location for the current
+environment. `LOCALREVIEW_CONFIG_DIR` overrides its parent directory; a
+`LOCALREVIEW_DATA_DIR` portable/test override also contains `config.toml`
+unless `LOCALREVIEW_CONFIG_DIR` is explicitly set.
+
+Initial defaults resolve in this order:
+
+```text
+explicit CLI/GUI input
+  -> workspace .localreview.toml
+    -> global config.toml
+      -> release defaults
+```
+
+Workspace and repository choices subsequently saved in the app remain
+explicit durable choices. A repository entry in the global file applies to a
+matching workspace-relative repository path in any newly opened workspace;
+the workspace file can override its `base` and `enabled` fields independently.
+An explicit workspace `exclude = []` clears the global relative-path exclusion
+list while retaining LocalReview's built-in safety exclusions.
+
+LocalReview reads these files when opening or reopening a local workspace and
+never creates, edits, or rewrites either file.
 
 ## Syntax highlighting
 

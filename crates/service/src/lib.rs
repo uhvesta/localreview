@@ -218,6 +218,10 @@ pub struct ChangedSincePreviousReview {
 #[derive(Clone, Debug)]
 pub struct ReviewService {
     state: StateStore,
+    /// Optional OS-level, read-only defaults shared by the desktop and CLI.
+    /// Tests and embedded callers opt in explicitly so they never read a
+    /// developer's real user configuration.
+    global_config_path: Option<PathBuf>,
     /// GitHub review submission is a single durable compare-and-submit
     /// boundary. Clones share this lock so concurrent Tauri/CLI invokes cannot
     /// race the same Previewed record into two provider POSTs.
@@ -343,6 +347,16 @@ impl ReviewService {
     pub fn new(state: StateStore) -> Self {
         Self {
             state,
+            global_config_path: None,
+            github_publication_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    #[must_use]
+    pub fn with_global_config_path(state: StateStore, global_config_path: PathBuf) -> Self {
+        Self {
+            state,
+            global_config_path: Some(global_config_path),
             github_publication_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -350,6 +364,15 @@ impl ReviewService {
     #[must_use]
     pub fn state(&self) -> &StateStore {
         &self.state
+    }
+
+    pub fn global_file_config(&self) -> Result<WorkspaceFileConfig, ServiceError> {
+        self.global_config_path
+            .as_deref()
+            .map(WorkspaceFileConfig::load_path)
+            .transpose()
+            .map_err(ServiceError::from)
+            .map(|config| config.flatten().unwrap_or_default())
     }
 
     /// Opens a durable local workspace and discovers Git worktrees. Opening the
@@ -364,7 +387,11 @@ impl ReviewService {
                 path: request.root.clone(),
                 source,
             })?;
-        let file_config = WorkspaceFileConfig::load(&root)?.unwrap_or_default();
+        let global_config = self.global_file_config()?;
+        let workspace_config = WorkspaceFileConfig::load(&root)?.unwrap_or_default();
+        // An explicit request is applied below; configuration layering is
+        // workspace > global > built-in release defaults.
+        let file_config = global_config.overlay(workspace_config);
         let mut discovery = request.discovery;
         file_config.apply_discovery(&mut discovery);
         // Discovery happens before any durable write. An unreadable or invalid
@@ -2988,6 +3015,114 @@ enabled = false
             })
             .unwrap();
         assert_eq!(opened.workspace.default_base.as_str(), "explicit-base");
+    }
+
+    #[test]
+    fn global_config_supplies_defaults_when_workspace_config_is_absent() {
+        let directory = TempDir::new().unwrap();
+        initialized_repository(&directory.path().join("a"));
+        initialized_repository(&directory.path().join("excluded"));
+        let global_directory = TempDir::new().unwrap();
+        let global_path = global_directory.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+[workspace]
+default_base = "origin/global"
+discovery_depth = 7
+exclude = ["excluded/**"]
+
+[repositories."a"]
+base = "origin/GLOBAL-A"
+enabled = false
+"#,
+        )
+        .unwrap();
+        let state_directory = TempDir::new().unwrap();
+        let service = ReviewService::with_global_config_path(
+            StateStore::open(state_directory.path()).unwrap(),
+            global_path,
+        );
+        let opened = service
+            .open_local_workspace(OpenLocalWorkspaceRequest {
+                root: directory.path().to_path_buf(),
+                display_name: None,
+                workspace_default_base: None,
+                discovery: DiscoveryConfig::default(),
+            })
+            .unwrap();
+        assert_eq!(opened.workspace.default_base.as_str(), "origin/global");
+        assert_eq!(opened.repositories.len(), 1);
+        assert_eq!(opened.repositories[0].relative_path.as_str(), "a");
+        assert!(!opened.repositories[0].enabled);
+        assert_eq!(
+            opened.repositories[0]
+                .base_override
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "origin/GLOBAL-A"
+        );
+    }
+
+    #[test]
+    fn explicit_and_workspace_layers_override_global_defaults_field_by_field() {
+        let directory = TempDir::new().unwrap();
+        initialized_repository(&directory.path().join("a"));
+        initialized_repository(&directory.path().join("globally-excluded"));
+        fs::write(
+            directory.path().join(".localreview.toml"),
+            r#"
+[workspace]
+default_base = "origin/workspace"
+exclude = []
+
+[repositories."a"]
+base = "origin/WORKSPACE-A"
+"#,
+        )
+        .unwrap();
+        let global_directory = TempDir::new().unwrap();
+        let global_path = global_directory.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+[workspace]
+default_base = "origin/global"
+discovery_depth = 7
+exclude = ["globally-excluded/**"]
+
+[repositories."a"]
+base = "origin/GLOBAL-A"
+enabled = false
+"#,
+        )
+        .unwrap();
+        let state_directory = TempDir::new().unwrap();
+        let service = ReviewService::with_global_config_path(
+            StateStore::open(state_directory.path()).unwrap(),
+            global_path,
+        );
+        let opened = service
+            .open_local_workspace(OpenLocalWorkspaceRequest {
+                root: directory.path().to_path_buf(),
+                display_name: None,
+                workspace_default_base: Some(BaseReference::new("explicit-base").unwrap()),
+                discovery: DiscoveryConfig::default(),
+            })
+            .unwrap();
+        assert_eq!(opened.workspace.default_base.as_str(), "explicit-base");
+        assert_eq!(opened.repositories.len(), 2);
+        let repository = opened
+            .repositories
+            .iter()
+            .find(|repository| repository.relative_path.as_str() == "a")
+            .unwrap();
+        assert!(!repository.enabled);
+        assert_eq!(
+            repository.base_override.as_ref().unwrap().as_str(),
+            "origin/WORKSPACE-A"
+        );
     }
 
     #[test]

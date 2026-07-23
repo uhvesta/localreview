@@ -167,6 +167,9 @@ describe('review components', () => {
     [...document.querySelectorAll<HTMLButtonElement>('.open-options button')]
       .find((button) => button.textContent?.includes('Open local folder'))?.click();
     await settle();
+    const baseInput = document.querySelector<HTMLInputElement>('[aria-label="Default base reference"]');
+    expect(baseInput?.value).toBe('');
+    expect(baseInput?.placeholder).toBe('Use workspace/global default');
     [...document.querySelectorAll<HTMLButtonElement>('.open-modal footer button')]
       .find((button) => button.textContent === 'Open local folder')?.click();
     await settle();

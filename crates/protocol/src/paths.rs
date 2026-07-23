@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppPaths {
     pub data_dir: PathBuf,
+    pub config_dir: PathBuf,
     pub runtime_dir: PathBuf,
 }
 
@@ -22,14 +23,29 @@ impl AppPaths {
         // Test and portable-install override shared by the desktop process,
         // forwarding CLI, and companion.  It is intentionally the data root,
         // not merely a database override, so IPC secrets cannot diverge.
-        let data_dir = if let Some(override_root) = env::var_os("LOCALREVIEW_DATA_DIR") {
-            PathBuf::from(override_root)
+        let data_override = env::var_os("LOCALREVIEW_DATA_DIR").map(PathBuf::from);
+        let data_dir = if let Some(override_root) = &data_override {
+            override_root.clone()
         } else if cfg!(target_os = "macos") {
             home.join("Library/Application Support/LocalReview")
         } else if let Some(xdg_data) = env::var_os("XDG_DATA_HOME") {
             PathBuf::from(xdg_data).join("localreview")
         } else {
             home.join(".local/share/localreview")
+        };
+        // A portable/test data override remains hermetic unless callers
+        // explicitly select a separate config root. Normal installations use
+        // each OS's conventional per-user configuration location.
+        let config_dir = if let Some(override_root) = env::var_os("LOCALREVIEW_CONFIG_DIR") {
+            PathBuf::from(override_root)
+        } else if data_override.is_some() {
+            data_dir.clone()
+        } else if cfg!(target_os = "macos") {
+            home.join("Library/Application Support/LocalReview")
+        } else if let Some(xdg_config) = env::var_os("XDG_CONFIG_HOME") {
+            PathBuf::from(xdg_config).join("localreview")
+        } else {
+            home.join(".config/localreview")
         };
 
         let runtime_base = env::var_os("XDG_RUNTIME_DIR")
@@ -43,15 +59,21 @@ impl AppPaths {
             runtime_base.join(format!("localreview-{:016x}", stable_path_hash(&data_dir)));
         Ok(Self {
             data_dir,
+            config_dir,
             runtime_dir,
         })
     }
 
     pub fn with_roots(data_dir: PathBuf, runtime_dir: PathBuf) -> Self {
         Self {
+            config_dir: data_dir.clone(),
             data_dir,
             runtime_dir,
         }
+    }
+
+    pub fn global_config_path(&self) -> PathBuf {
+        self.config_dir.join("config.toml")
     }
 
     pub fn secret_path(&self) -> PathBuf {
@@ -227,6 +249,10 @@ mod tests {
         let paths = AppPaths::with_roots(
             temporary.path().join("data"),
             temporary.path().join("runtime"),
+        );
+        assert_eq!(
+            paths.global_config_path(),
+            temporary.path().join("data/config.toml")
         );
         let secret = paths.load_or_create_secret(|| [9; 32]).unwrap();
         assert_eq!(secret, paths.load_secret().unwrap());

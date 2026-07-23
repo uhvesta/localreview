@@ -1456,9 +1456,21 @@ pub enum DispatchError {
 }
 
 impl DesktopController {
+    #[cfg(test)]
     pub fn new(store: StateStore) -> Self {
+        Self::from_service(ReviewService::new(store))
+    }
+
+    pub fn with_global_config_path(store: StateStore, global_config_path: PathBuf) -> Self {
+        Self::from_service(ReviewService::with_global_config_path(
+            store,
+            global_config_path,
+        ))
+    }
+
+    fn from_service(service: ReviewService) -> Self {
         Self {
-            service: ReviewService::new(store),
+            service,
             replay_guard: Mutex::new(ReplayGuard::default()),
             presentation_cache: Mutex::new(PresentationCache::default()),
             highlight: HighlightService::new(
@@ -5455,7 +5467,11 @@ impl DesktopController {
                 })?;
                 BaseReference::new(value).map_err(|error| DispatchError::Invalid(error.to_string()))
             }
-            None => Ok(BaseReference::default()),
+            None => Ok(self
+                .service
+                .global_file_config()?
+                .default_base
+                .unwrap_or_default()),
         }
     }
 
@@ -9685,6 +9701,26 @@ mod tests {
         let review = reopened.load_review(workspace_id).unwrap();
         assert_eq!(review.workspace.progress.total, 1);
         assert_eq!(review.repositories[0].base, "main");
+    }
+
+    #[test]
+    fn controller_uses_global_config_before_the_release_base_default() {
+        let state_directory = TempDir::new().unwrap();
+        let config_directory = TempDir::new().unwrap();
+        let config_path = config_directory.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[workspace]\ndefault_base = \"origin/global\"\n",
+        )
+        .unwrap();
+        let controller = DesktopController::with_global_config_path(
+            StateStore::open(state_directory.path()).unwrap(),
+            config_path,
+        );
+        assert_eq!(
+            controller.application_base().unwrap().as_str(),
+            "origin/global"
+        );
     }
 
     #[test]

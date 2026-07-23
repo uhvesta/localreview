@@ -38,8 +38,8 @@ pub(crate) struct AppState {
 }
 
 pub fn run() {
-    let state_root = match application_data_root() {
-        Ok(path) => path,
+    let app_paths = match application_paths() {
+        Ok(paths) => paths,
         Err(error) => {
             present_startup_error(
                 "LocalReview could not locate its application-data directory",
@@ -48,6 +48,7 @@ pub fn run() {
             return;
         }
     };
+    let state_root = app_paths.data_dir.clone();
     let state_store = match StateStore::open_for_startup(&state_root) {
         Ok(StartupState::Ready(store)) => store,
         Ok(StartupState::RequiresRecovery(report)) => {
@@ -82,7 +83,8 @@ pub fn run() {
             return;
         }
     };
-    let controller = DesktopController::new(state_store);
+    let controller =
+        DesktopController::with_global_config_path(state_store, app_paths.global_config_path());
     // Never remove a dirty checkout during startup. The repair routine only
     // fixes safe registry/orphan cases; failures stay non-fatal so an
     // unrelated Git issue cannot prevent the desktop from launching.
@@ -215,12 +217,11 @@ pub fn run() {
         .expect("error while running LocalReview desktop application");
 }
 
-fn application_data_root() -> Result<std::path::PathBuf, String> {
+fn application_paths() -> Result<localreview_protocol::AppPaths, String> {
     // The database, content store, forwarding secret, and desktop runtime
     // record must be one private OS-level root. AppPaths also honours
     // LOCALREVIEW_DATA_DIR for hermetic tests and portable installs.
     localreview_protocol::AppPaths::discover()
-        .map(|paths| paths.data_dir)
         .map_err(|error| {
             format!(
                 "The OS application-data location is unavailable: {error}. LocalReview will not fall back to a temporary directory because review history and forwarding credentials must survive restarts."
