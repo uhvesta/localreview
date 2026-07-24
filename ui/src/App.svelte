@@ -817,7 +817,7 @@
     }
   }
 
-  async function selectFile(fileId: string) {
+  async function selectFile(fileId: string, viewedAfterSelect = true) {
     await persistComposerDraftNow();
     activeFileId = fileId;
     activeReviewHunkId = undefined;
@@ -833,12 +833,18 @@
     await persistWorkspaceUiStateNow({ activeFileId: fileId, scrollTop: 0 });
     await loadPresentation(0, 220);
     await loadOutline();
-    if (review && canMutateReview && !review.files.find((file) => file.id === fileId)?.viewed) {
-      await api.setViewed(review.workspace.id, fileId, true);
+    if (review && canMutateReview && review.files.find((file) => file.id === fileId)?.viewed !== viewedAfterSelect) {
+      await api.setViewed(review.workspace.id, fileId, viewedAfterSelect);
       review = {
         ...review,
-        workspace: { ...review.workspace, progress: { viewed: review.files.filter((file) => file.id === fileId || file.viewed).length, total: review.files.length } },
-        files: review.files.map((file) => file.id === fileId ? { ...file, viewed: true } : file)
+        workspace: {
+          ...review.workspace,
+          progress: {
+            viewed: review.files.filter((file) => file.id === fileId ? viewedAfterSelect : file.viewed).length,
+            total: review.files.length
+          }
+        },
+        files: review.files.map((file) => file.id === fileId ? { ...file, viewed: viewedAfterSelect } : file)
       };
       syncActiveWorkspaceSummary();
     }
@@ -3082,7 +3088,7 @@
       <div id="right-panel-files" class="right-panel-body" role="tabpanel" aria-labelledby="right-panel-tab-files" data-right-panel-body="files" hidden={rightTab !== 'files'} aria-hidden={rightTab !== 'files'}>
         <div class="panel-filter"><label class="search-field"><span>⌕</span><input bind:value={fileSearch} placeholder="Fuzzy filter files" aria-label="Filter files" /></label><div class="file-filter-grid"><select bind:value={repositoryFilter} aria-label="Filter by repository"><option value="all">All repositories</option>{#each review?.repositories ?? [] as repository}<option value={repository.id}>{repository.name}</option>{/each}</select><select bind:value={viewedFilter} aria-label="Filter by viewed state"><option value="all">All viewed states</option><option value="unviewed">Unviewed</option><option value="viewed">Viewed</option></select><select bind:value={classificationFilter} aria-label="Filter by immutable file classification"><option value="all">All file classifications</option><option value="text">Text</option><option value="binary">Binary</option><option value="generated">Generated</option><option value="vendored">Vendored</option><option value="lockfile">Lockfiles</option><option value="lfs_pointer">Git LFS pointers</option><option value="submodule">Submodules</option></select><select bind:value={fileStatusFilter} aria-label="Filter by file status"><option value="all">All statuses</option><option value="modified">Modified</option><option value="added">Added</option><option value="deleted">Deleted</option><option value="renamed">Renamed</option><option value="untracked">Untracked</option></select><select bind:value={fileLanguageFilter} aria-label="Filter by file language"><option value="all">All languages</option>{#each fileLanguages as language}<option value={language}>{language}</option>{/each}</select><select bind:value={fileGrouping} aria-label="Group files"><option value="repository">Group: repository</option><option value="folder">Group: folder</option><option value="flat">Flat list</option></select><select bind:value={fileSort} aria-label="Sort files"><option value="review_order">Sort: review order</option><option value="path">Sort: path</option><option value="repository">Sort: repository</option><option value="change_size">Sort: change size</option><option value="annotations">Sort: annotations</option></select></div>{#if changedSincePreviousOnly}<div class="history-filter-notice"><span>Changed since prior review</span><button on:click={() => { changedSincePreviousOnly = false; changedSincePrevious = undefined; }}>Show all files</button></div>{/if}<div class="file-tree-actions"><button class="secondary-button" disabled={fileGrouping === 'flat'} on:click={() => collapseAllToken += 1}>Collapse tree</button><button class="secondary-button" disabled={fileGrouping === 'flat'} on:click={() => expandAllToken += 1}>Expand tree</button></div><button class="bulk-view-button" disabled={!canMutateReview} on:click={() => Promise.all(shownFiles.filter((file) => !file.viewed).map((file) => toggleViewed(file.id, true)))}>Mark filtered viewed</button></div>
         <div class="review-progress"><div><strong>{review?.workspace.progress.viewed ?? 0}/{review?.workspace.progress.total ?? 0}</strong><span> files viewed</span></div><div class="progress-track"><span style:width={`${((review?.workspace.progress.viewed ?? 0) / (review?.workspace.progress.total ?? 1)) * 100}%`}></span></div><div class="repository-progress" aria-label="Review progress by repository">{#each review?.repositories ?? [] as repository}{@const repositoryFiles = (review?.files ?? []).filter((file) => file.repositoryId === repository.id)}<span title={`${repository.name}: ${repositoryFiles.filter((file) => file.viewed).length} of ${repositoryFiles.length} viewed`}>{repository.name} {repositoryFiles.filter((file) => file.viewed).length}/{repositoryFiles.length}</span>{/each}</div></div>
-        <VirtualFileList files={shownFiles} repositories={review?.repositories ?? []} grouping={fileGrouping} {activeFileId} fontScale={settings.fontScale} {collapseAllToken} {expandAllToken} onSelect={selectFile} onToggleViewed={toggleViewed} />
+        <VirtualFileList files={shownFiles} repositories={review?.repositories ?? []} grouping={fileGrouping} {activeFileId} fontScale={settings.fontScale} {collapseAllToken} {expandAllToken} onSelect={selectFile} />
       </div>
       <div id="right-panel-comments" class="right-panel-body" role="tabpanel" aria-labelledby="right-panel-tab-comments" data-right-panel-body="comments" hidden={rightTab !== 'comments'} aria-hidden={rightTab !== 'comments'}>
         {#if githubReview}

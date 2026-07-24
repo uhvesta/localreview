@@ -1,6 +1,6 @@
 [package]
 name = "localreview-desktop"
-version = "0.1.7"
+version = "0.1.8"
 description = "LocalReview macOS desktop shell"
 authors = ["LocalReview contributors"]
 edition = "2021"

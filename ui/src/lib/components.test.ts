@@ -795,8 +795,7 @@ describe('review components', () => {
 
   it('compacts consecutive single-child folders without merging the repository row', async () => {
     const host = target();
-    const selections: string[] = [];
-    const viewedChanges: Array<[string, boolean]> = [];
+    const selections: Array<[string, boolean | undefined]> = [];
     const component = mount(VirtualFileList, { target: host, props: {
       files: [{
         id: 'ghostty-model',
@@ -812,8 +811,7 @@ describe('review components', () => {
       }],
       repositories: [{ id: 'mono', name: 'mono', path: '/tmp/mono', branch: 'feature', base: 'origin/main', mergeBase: 'a', head: 'b' }],
       grouping: 'repository',
-      onSelect: (fileId: string) => selections.push(fileId),
-      onToggleViewed: (fileId: string, viewed: boolean) => viewedChanges.push([fileId, viewed])
+      onSelect: (fileId: string, viewedAfterSelect?: boolean) => selections.push([fileId, viewedAfterSelect])
     } });
     await settle();
 
@@ -829,7 +827,7 @@ describe('review components', () => {
     expect(host.querySelectorAll('.file-row')).toHaveLength(1);
     const fileRow = host.querySelector<HTMLElement>('.file-row')!;
     expect(fileRow.getAttribute('aria-level')).toBe('3');
-    expect(fileRow.style.height).toBe('38px');
+    expect(fileRow.style.height).toBe('30px');
     expect(host.querySelector('.file-path')?.textContent).toBe('BossPaneModel.swift');
     expect(host.querySelector('.file-path')?.getAttribute('title')).toBe('tools/boss/app-macos/Sources/Ghostty/BossPaneModel.swift');
     expect(host.querySelector('.file-repo')).toBeNull();
@@ -838,9 +836,12 @@ describe('review components', () => {
     expect(host.querySelector('.file-select')?.getAttribute('aria-pressed')).toBe('false');
     expect(host.querySelector('.view-marker')?.classList.contains('viewed')).toBe(false);
     expect(host.querySelector('.view-toggle')).toBeNull();
+    expect(host.querySelector('.deletions')?.classList.contains('empty-stat')).toBe(false);
+    expect(host.querySelector('.deletions')?.getAttribute('aria-hidden')).toBe('false');
+    expect(host.querySelector('.annotation-count')?.classList.contains('empty-stat')).toBe(true);
+    expect(host.querySelector('.annotation-count')?.getAttribute('aria-hidden')).toBe('true');
     host.querySelector<HTMLButtonElement>('.file-select')?.click();
-    expect(selections).toEqual(['ghostty-model']);
-    expect(viewedChanges).toEqual([['ghostty-model', true]]);
+    expect(selections).toEqual([['ghostty-model', true]]);
 
     groups[1].click();
     await settle();
@@ -888,8 +889,7 @@ describe('review components', () => {
   });
 
   it('clicks a viewed filename to open it and mark it unviewed', async () => {
-    const viewedChanges: Array<[string, boolean]> = [];
-    const selections: string[] = [];
+    const selections: Array<[string, boolean | undefined]> = [];
     const host = target();
     const component = mount(VirtualFileList, { target: host, props: {
       files: [{
@@ -898,7 +898,7 @@ describe('review components', () => {
         path: 'src/already-reviewed.ts',
         status: 'modified',
         additions: 2,
-        deletions: 1,
+        deletions: 0,
         hunkCount: 1,
         language: 'TypeScript',
         viewed: true,
@@ -906,17 +906,18 @@ describe('review components', () => {
       }],
       repositories: [{ id: 'repo', name: 'repo', path: '/tmp/repo', branch: 'feature', base: 'origin/main', mergeBase: 'a', head: 'b' }],
       grouping: 'repository',
-      onSelect: (fileId: string) => selections.push(fileId),
-      onToggleViewed: (fileId: string, viewed: boolean) => viewedChanges.push([fileId, viewed])
+      onSelect: (fileId: string, viewedAfterSelect?: boolean) => selections.push([fileId, viewedAfterSelect])
     } });
     await settle();
 
     const filename = host.querySelector<HTMLButtonElement>('.file-select')!;
     expect(filename.getAttribute('aria-pressed')).toBe('true');
     expect(filename.querySelector('.view-marker')?.classList.contains('viewed')).toBe(true);
+    expect(host.querySelector('.deletions')?.classList.contains('empty-stat')).toBe(true);
+    expect(host.querySelector('.deletions')?.getAttribute('aria-hidden')).toBe('true');
+    expect(host.querySelector('.annotation-count')?.classList.contains('empty-stat')).toBe(true);
     filename.click();
-    expect(selections).toEqual(['viewed-file']);
-    expect(viewedChanges).toEqual([['viewed-file', false]]);
+    expect(selections).toEqual([['viewed-file', false]]);
     unmount(component);
   });
 

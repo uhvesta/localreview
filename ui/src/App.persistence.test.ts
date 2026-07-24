@@ -101,6 +101,7 @@ function installApi(workspaces: Workspace[], initialSettings: ReviewSettings = s
     startRequests: [] as Array<{ workspaceId: string; request?: Record<string, unknown> }>,
     refreshRequests: [] as Array<{ workspaceId: string; request?: Record<string, unknown> }>,
     settingsWrites: [] as Array<Partial<ReviewSettings>>,
+    viewedWrites: [] as Array<{ workspaceId: string; fileId: string; viewed: boolean }>,
     workspaceArchives: [] as string[],
     workspaceDeletes: [] as string[],
     operationOrder: [] as string[]
@@ -211,7 +212,16 @@ function installApi(workspaces: Workspace[], initialSettings: ReviewSettings = s
       calls.operationOrder.push(`draft:${draft.workspaceId}`);
       calls.drafts.push(structuredClone(draft));
     },
-    setViewed: async () => {}
+    setViewed: async (workspaceId: string, fileId: string, viewed: boolean) => {
+      calls.viewedWrites.push({ workspaceId, fileId, viewed });
+      const current = reviews.get(workspaceId);
+      if (!current) return;
+      current.files = current.files.map((file) => file.id === fileId ? { ...file, viewed } : file);
+      current.workspace.progress = {
+        viewed: current.files.filter((file) => file.viewed).length,
+        total: current.files.length
+      };
+    }
   };
   return calls;
 }
@@ -294,6 +304,43 @@ describe('App review-session persistence boundaries', () => {
 
     expect(calls.settingsWrites.at(-1)).toEqual({ lastWorkspaceId: first.id });
     expect(tabs.find((tab) => tab.textContent?.includes('First'))?.getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('toggles viewed state exactly once when the filename opens an already selected file', async () => {
+    const local = workspace('workspace-localreview', 'LocalReview');
+    const calls = installApi([local]);
+    const initial = review(local);
+    initial.files[0].viewed = true;
+    initial.workspace.progress = { viewed: 1, total: 1 };
+    harness.state.implementation.loadReview = async () => structuredClone(initial);
+    components.push(mount(App, { target: target() }));
+    await waitForUi(
+      () => document.querySelector('.statusbar')?.textContent?.includes('Opened LocalReview.') === true,
+      'workspace open completion'
+    );
+
+    expect(calls.viewedWrites).toEqual([]);
+    const filename = document.querySelector<HTMLButtonElement>('.file-select')!;
+    expect(filename.getAttribute('aria-pressed')).toBe('true');
+    filename.click();
+    await waitForUi(() => calls.viewedWrites.length === 1, 'single unview write');
+    expect(calls.viewedWrites).toEqual([{
+      workspaceId: local.id,
+      fileId: 'file-localreview',
+      viewed: false
+    }]);
+    expect(document.querySelector<HTMLButtonElement>('.file-select')?.getAttribute('aria-pressed')).toBe('false');
+    expect(document.querySelector('.review-progress strong')?.textContent).toBe('0/1');
+
+    document.querySelector<HTMLButtonElement>('.file-select')?.click();
+    await waitForUi(() => calls.viewedWrites.length === 2, 'single re-view write');
+    expect(calls.viewedWrites.at(-1)).toEqual({
+      workspaceId: local.id,
+      fileId: 'file-localreview',
+      viewed: true
+    });
+    expect(document.querySelector<HTMLButtonElement>('.file-select')?.getAttribute('aria-pressed')).toBe('true');
+    expect(document.querySelector('.review-progress strong')?.textContent).toBe('1/1');
   });
 
   it('keeps the selected tab and visible stable panel identical through asynchronous hydration', async () => {

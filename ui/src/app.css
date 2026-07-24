@@ -368,11 +368,16 @@ button.split-divider { cursor: col-resize; border: 0; padding: 0; min-width: 7px
 .virtual-file-list { overflow: auto; contain: strict; }
 .virtual-file-spacer { position: relative; min-width: 0; }
 .virtual-file-window { min-width: 0; }
-.virtual-file-list .file-row { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto; align-content: start; gap: 0; padding: 0; }
-.file-select { grid-column: 1; grid-row: 1; width: 100%; min-width: 0; display: flex; align-items: flex-start; gap: 5px; padding: 4px 8px 1px 1px; border: 0; color: inherit; background: transparent; text-align: left; }
+.virtual-file-list .file-row { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 0; padding: 0; }
+.file-select { grid-column: 1; grid-row: 1; width: 100%; min-width: 0; display: flex; align-items: flex-start; gap: 5px; padding: 4px 4px 4px 1px; border: 0; color: inherit; background: transparent; text-align: left; }
 .file-select:hover, .file-select:focus-visible { background: #18212e; outline-offset: -2px; }
 .file-select:hover .view-marker, .file-select:focus-visible .view-marker { border-color: #9fc7fb; box-shadow: 0 0 0 2px #527caf55; }
-.virtual-file-list .file-row-stats { grid-column: 1; grid-row: 2; min-width: 0; justify-content: flex-end; padding: 1px 8px 4px 13px; }
+.virtual-file-list .file-row-stats { grid-column: 2; grid-row: 1; min-width: 0; display: grid; grid-template-columns: 1.6em 4ch 3.5ch 3ch; justify-content: end; column-gap: 4px; padding: 4px 8px 4px 2px; }
+.virtual-file-list .file-row-stats .status-chip { width: 1.6em; text-align: center; }
+.virtual-file-list .file-row-stats .additions { min-width: 4ch; text-align: right; }
+.virtual-file-list .file-row-stats .deletions { min-width: 3.5ch; text-align: right; }
+.virtual-file-list .file-row-stats .annotation-count { min-width: 3ch; text-align: right; }
+.virtual-file-list .file-row-stats .empty-stat { visibility: hidden; }
 .virtual-group { display: flex; align-items: center; }
 
 .modal-backdrop { padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left)); }

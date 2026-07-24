@@ -10,8 +10,7 @@
   /** Monotonic parent actions keep bulk tree controls keyboard-accessible. */
   export let collapseAllToken = 0;
   export let expandAllToken = 0;
-  export let onSelect: (fileId: string) => void = () => {};
-  export let onToggleViewed: (fileId: string, viewed: boolean) => void = () => {};
+  export let onSelect: (fileId: string, viewedAfterSelect?: boolean) => void = () => {};
 
   type Entry =
     | {
@@ -104,7 +103,7 @@
         + Number(mode !== 'repository')
         + Number(classificationBadges(file).length > 0);
       const visibleTextLines = 1 + metadataLines;
-      return Math.max(38, Math.ceil(8 + (visibleTextLines * 13 + 14) * scale));
+      return Math.max(30, Math.ceil(8 + visibleTextLines * 13 * scale));
     };
     if (mode === 'flat') return source.map((file) => ({ kind: 'file', id: file.id, file, depth: 0, height: fileHeight(file) }));
 
@@ -216,8 +215,7 @@
   }
   function activate(fileId: string) { onSelect(fileId); }
   function openFile(file: ReviewFile) {
-    activate(file.id);
-    onToggleViewed(file.id, !file.viewed);
+    onSelect(file.id, !file.viewed);
   }
   function toggleGroup(id: string) {
     const next = new Set(collapsedGroups);
@@ -317,7 +315,7 @@
               <span class:viewed={file.viewed} class="view-marker" aria-hidden="true"></span>
               <span class="file-info"><span class="file-path" title={file.path}>{displayPath}</span>{#if file.previousPath}<span class="old-path" title={file.previousPath}>{displayedFilePath(file.previousPath)}</span>{/if}{#if grouping !== 'repository'}<span class="file-repo">{repositoryName}</span>{/if}{#if badges.length}<span class="classification-badges" aria-label="Capture-time file classifications">{#each badges as badge (badge[0])}<span class={`classification-badge ${badge[0]}`}>{badge[1]}</span>{/each}</span>{/if}</span>
             </button>
-            <div class="file-row-stats"><span class="status-chip {file.status}" aria-label={file.status}>{file.status[0].toUpperCase()}</span><span class="additions">+{file.additions}</span>{#if file.deletions}<span class="deletions">−{file.deletions}</span>{/if}{#if file.annotationCount}<span class="annotation-count">● {file.annotationCount}</span>{/if}</div>
+            <div class="file-row-stats"><span class="status-chip {file.status}" aria-label={file.status}>{file.status[0].toUpperCase()}</span><span class="additions">+{file.additions}</span><span class:empty-stat={!file.deletions} class="deletions" aria-hidden={!file.deletions}>{file.deletions ? `−${file.deletions}` : '−0'}</span><span class:empty-stat={!file.annotationCount} class="annotation-count" aria-hidden={!file.annotationCount}>{file.annotationCount ? `● ${file.annotationCount}` : '● 0'}</span></div>
           </div>
         {/if}
       {/each}
