@@ -1658,7 +1658,7 @@
     requestRowJump(hunk.rowIndex);
     // Persist a safe restart anchor immediately; VirtualDiff follows with its
     // exact centered scroll position after applying the row jump.
-    restoredScrollTop = Math.max(0, hunk.rowIndex * Math.round(24 * settings.fontScale));
+    restoredScrollTop = Math.max(0, hunk.rowIndex * Math.round(20 * settings.fontScale));
     void persistWorkspaceUiStateNow({
       activeFileId,
       nearestSourceLine: line,
@@ -1756,7 +1756,7 @@
       const location = await api.resolvePresentationLocation(fileId, targetMode, side, line, review?.files.find((file) => file.id === fileId)?.comparisonId);
       await loadPresentation(Math.max(0, location.rowIndex - 100), location.rowIndex + 120);
       requestRowJump(location.rowIndex);
-      restoredScrollTop = Math.max(0, location.rowIndex * Math.round(24 * settings.fontScale));
+      restoredScrollTop = Math.max(0, location.rowIndex * Math.round(20 * settings.fontScale));
       persistWorkspaceUiState({ activeFileId: fileId, nearestSourceLine: line, nearestSourceSide: side, scrollTop: restoredScrollTop });
     } catch (error) {
       statusMessage = `Could not locate the captured source line: ${error instanceof Error ? error.message : 'native location command failed'}`;

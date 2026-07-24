@@ -568,8 +568,12 @@ pub struct CopyReviewItemRequest {
 
 #[derive(Clone, Debug, Default)]
 struct PresentationCache {
-    canonical: BTreeMap<String, CachedCanonicalPresentation>,
+    documents: BTreeMap<String, Arc<PersistedReviewDocument>>,
+    document_order: VecDeque<String>,
+    document_bytes: usize,
+    canonical: BTreeMap<String, Arc<CachedCanonicalPresentation>>,
     canonical_order: VecDeque<String>,
+    canonical_rows: usize,
     structural: BTreeMap<String, NativeDifftasticPresentation>,
     structural_order: VecDeque<String>,
     verified_sidecars: BTreeSet<PathBuf>,
@@ -761,6 +765,7 @@ impl Drop for PresentationWorkPermit<'_> {
 struct CachedCanonicalPresentation {
     rows: Vec<DiffRowView>,
     hunks: Vec<HunkLocationView>,
+    deletion_blocks: Vec<FullFileDeletionBlockView>,
 }
 
 type HighlightWindow = (
@@ -2562,8 +2567,8 @@ impl DesktopController {
         self.ensure_remote_file_materialized_for_comparison(file_id, comparison_id)?;
         let job = self.acquire_presentation_job(file_id, request.generation)?;
         self.ensure_presentation_job_current(&job)?;
-        let persisted = self.persisted_review_document(file_id, comparison_id)?;
-        let document = persisted.document;
+        let persisted = self.cached_persisted_review_document(file_id, comparison_id)?;
+        let document = &persisted.document;
         let session = self
             .session_for_comparison(document.comparison_id)?
             .ok_or_else(|| {
@@ -2598,7 +2603,7 @@ impl DesktopController {
         if mode == "difftastic" {
             return self.difftastic_window(
                 request,
-                &document,
+                document,
                 &ui_state,
                 &settings,
                 DifftasticWindowExecution {
@@ -2611,7 +2616,7 @@ impl DesktopController {
         if mode == "full" {
             return self.full_file_window(
                 request,
-                &document,
+                document,
                 full_file_side,
                 &ui_state,
                 FullFileWindowExecution {
@@ -2621,10 +2626,10 @@ impl DesktopController {
                 },
             );
         }
-        let language_attribute = self.highlight_language_attribute(&document, session.id);
+        let language_attribute = self.highlight_language_attribute(document, session.id);
 
-        let (all_rows, hunks) =
-            self.cached_canonical_rows(&document, mode, full_file_side, &ui_state)?;
+        let canonical = self.cached_canonical_rows(document, mode, full_file_side, &ui_state)?;
+        let all_rows = &canonical.rows;
         let (start, end) = bounded_window(
             request.start_row,
             request.end_row,
@@ -2632,9 +2637,9 @@ impl DesktopController {
             MAX_WINDOW_ROWS,
         );
         let mut rows = all_rows[start..end].to_vec();
-        self.mark_annotation_rows(&document, &mut rows)?;
+        self.mark_annotation_rows(document, &mut rows)?;
         let (old_tokens, new_tokens, highlight_status, highlight_reason) = self.highlight_window(
-            &document,
+            document,
             &rows,
             &settings,
             language_attribute.as_deref(),
@@ -2648,7 +2653,7 @@ impl DesktopController {
             start_row: u32::try_from(start).unwrap_or(u32::MAX),
             total_rows: u32::try_from(all_rows.len()).unwrap_or(u32::MAX),
             rows,
-            hunks,
+            hunks: canonical.hunks.clone(),
             deletion_blocks: Vec::new(),
             old_tokens,
             new_tokens,
@@ -2721,8 +2726,8 @@ impl DesktopController {
                 nearest_full_file_row(&projection, side, line)
             }
             "unified" | "split" => {
-                let (rows, _) = self.cached_canonical_rows(&document, mode, side, &ui_state)?;
-                nearest_canonical_row(&rows, side, line)
+                let canonical = self.cached_canonical_rows(&document, mode, side, &ui_state)?;
+                nearest_canonical_row(&canonical.rows, side, line)
             }
             "difftastic" => {
                 // Materialise/cache the *complete* normalized structural
@@ -2766,9 +2771,9 @@ impl DesktopController {
                     // canonical fallback. Its locations must still be
                     // authoritative and must not depend on the one-row
                     // virtual response above.
-                    let (rows, _) =
+                    let canonical =
                         self.cached_canonical_rows(&document, "unified", side, &ui_state)?;
-                    nearest_canonical_row(&rows, side, line)
+                    nearest_canonical_row(&canonical.rows, side, line)
                 }
             }
             _ => unreachable!("validate_diff_mode admits only the matched modes"),
@@ -2938,6 +2943,7 @@ impl DesktopController {
             .map_err(|_| DispatchError::Internal)?;
         let prefix = format!("{}:", file_id);
         cache.canonical.retain(|key, _| !key.starts_with(&prefix));
+        cache.canonical_rows = cache.canonical.values().map(|entry| entry.rows.len()).sum();
         cache
             .canonical_order
             .retain(|key| !key.starts_with(&prefix));
@@ -5748,6 +5754,74 @@ impl DesktopController {
         document.ok_or_else(|| DispatchError::NotFound(file_id.to_string()))
     }
 
+    fn cached_persisted_review_document(
+        &self,
+        file_id: ReviewFileId,
+        comparison_id: Option<ComparisonId>,
+    ) -> Result<Arc<PersistedReviewDocument>, DispatchError> {
+        const MAX_DOCUMENT_ENTRIES: usize = 16;
+        const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
+        let key = format!(
+            "{}:{}",
+            comparison_id.map_or_else(|| "latest".into(), |value| value.to_string()),
+            file_id
+        );
+        {
+            let mut cache = self
+                .presentation_cache
+                .lock()
+                .map_err(|_| DispatchError::Internal)?;
+            if let Some(cached) = cache.documents.get(&key).cloned() {
+                cache.document_order.retain(|candidate| candidate != &key);
+                cache.document_order.push_back(key);
+                return Ok(cached);
+            }
+        }
+        let document = Arc::new(self.persisted_review_document(file_id, comparison_id)?);
+        let bytes = document
+            .document
+            .old
+            .content
+            .len()
+            .saturating_add(document.document.new.content.len());
+        if bytes <= MAX_DOCUMENT_BYTES {
+            let mut cache = self
+                .presentation_cache
+                .lock()
+                .map_err(|_| DispatchError::Internal)?;
+            if let Some(previous) = cache.documents.insert(key.clone(), Arc::clone(&document)) {
+                cache.document_bytes = cache.document_bytes.saturating_sub(
+                    previous
+                        .document
+                        .old
+                        .content
+                        .len()
+                        .saturating_add(previous.document.new.content.len()),
+                );
+            }
+            cache.document_bytes = cache.document_bytes.saturating_add(bytes);
+            cache.document_order.retain(|candidate| candidate != &key);
+            cache.document_order.push_back(key);
+            while cache.document_order.len() > MAX_DOCUMENT_ENTRIES
+                || cache.document_bytes > MAX_DOCUMENT_BYTES
+            {
+                if let Some(expired) = cache.document_order.pop_front() {
+                    if let Some(removed) = cache.documents.remove(&expired) {
+                        cache.document_bytes = cache.document_bytes.saturating_sub(
+                            removed
+                                .document
+                                .old
+                                .content
+                                .len()
+                                .saturating_add(removed.document.new.content.len()),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(document)
+    }
+
     fn remote_file_binding(
         &self,
         file_id: ReviewFileId,
@@ -5930,7 +6004,27 @@ impl DesktopController {
             .lock()
             .map_err(|_| DispatchError::Internal)?;
         let prefix = format!("{}:", file_id);
+        let document_suffix = format!(":{file_id}");
+        cache
+            .documents
+            .retain(|key, _| !key.ends_with(&document_suffix));
+        cache
+            .document_order
+            .retain(|key| !key.ends_with(&document_suffix));
+        cache.document_bytes = cache
+            .documents
+            .values()
+            .map(|entry| {
+                entry
+                    .document
+                    .old
+                    .content
+                    .len()
+                    .saturating_add(entry.document.new.content.len())
+            })
+            .sum();
         cache.canonical.retain(|key, _| !key.starts_with(&prefix));
+        cache.canonical_rows = cache.canonical.values().map(|entry| entry.rows.len()).sum();
         cache
             .canonical_order
             .retain(|key| !key.starts_with(&prefix));
@@ -6288,7 +6382,9 @@ impl DesktopController {
         mode: &str,
         full_file_side: DiffSide,
         state: &ReviewUiState,
-    ) -> Result<(Vec<DiffRowView>, Vec<HunkLocationView>), DispatchError> {
+    ) -> Result<Arc<CachedCanonicalPresentation>, DispatchError> {
+        const MAX_CANONICAL_ENTRIES: usize = 16;
+        const MAX_CANONICAL_ROWS: usize = 100_000;
         let expansion_key = serde_json::to_string(&(
             &state.hunk_context_lines,
             &state.expanded_full_file_deletion_blocks,
@@ -6310,28 +6406,42 @@ impl DesktopController {
             if let Some(cached) = cache.canonical.get(&key).cloned() {
                 cache.canonical_order.retain(|candidate| candidate != &key);
                 cache.canonical_order.push_back(key);
-                return Ok((cached.rows, cached.hunks));
+                return Ok(cached);
             }
         }
-        let cached = build_canonical_presentation(document, mode, full_file_side, state)?;
-        // Do not retain huge Full File row vectors. They are cheap to project
-        // from immutable source and retaining them would defeat virtualized
-        // memory bounds for a large workspace.
-        if cached.rows.len() <= 12_000 {
+        let cached = Arc::new(build_canonical_presentation(
+            document,
+            mode,
+            full_file_side,
+            state,
+        )?);
+        // A row-budgeted LRU keeps a handful of large full-file projections
+        // fast without allowing many huge files or expansion states to remain
+        // resident. Responses share the immutable cache entry and clone only
+        // their bounded visible window.
+        if cached.rows.len() <= MAX_CANONICAL_ROWS {
             let mut cache = self
                 .presentation_cache
                 .lock()
                 .map_err(|_| DispatchError::Internal)?;
-            cache.canonical.insert(key.clone(), cached.clone());
+            if let Some(previous) = cache.canonical.insert(key.clone(), Arc::clone(&cached)) {
+                cache.canonical_rows = cache.canonical_rows.saturating_sub(previous.rows.len());
+            }
+            cache.canonical_rows = cache.canonical_rows.saturating_add(cached.rows.len());
             cache.canonical_order.retain(|candidate| candidate != &key);
             cache.canonical_order.push_back(key);
-            while cache.canonical_order.len() > 16 {
+            while cache.canonical_order.len() > MAX_CANONICAL_ENTRIES
+                || cache.canonical_rows > MAX_CANONICAL_ROWS
+            {
                 if let Some(expired) = cache.canonical_order.pop_front() {
-                    cache.canonical.remove(&expired);
+                    if let Some(removed) = cache.canonical.remove(&expired) {
+                        cache.canonical_rows =
+                            cache.canonical_rows.saturating_sub(removed.rows.len());
+                    }
                 }
             }
         }
-        Ok((cached.rows, cached.hunks))
+        Ok(cached)
     }
 
     fn mark_annotation_rows(
@@ -6485,26 +6595,12 @@ impl DesktopController {
         } else {
             requested_side
         };
-        let (projection, deletion_blocks) =
-            full_file_projection(document, side, &ui_state.expanded_full_file_deletion_blocks);
-        let total = projection.len();
+        let canonical = self.cached_canonical_rows(document, "full", side, ui_state)?;
+        let total = canonical.rows.len();
         let (start, end) =
             bounded_window(request.start_row, request.end_row, total, max_window_rows);
-        let old_offsets = source_line_offsets(&document.old.content);
-        let new_offsets = source_line_offsets(&document.new.content);
-        let mut rows = projection
-            .iter()
-            .skip(start)
-            .take(end.saturating_sub(start))
-            .map(|row| full_file_row_view(row, &old_offsets, &new_offsets))
-            .collect::<Vec<_>>();
+        let mut rows = canonical.rows[start..end].to_vec();
         self.mark_annotation_rows(document, &mut rows)?;
-        let hunks = full_file_hunk_locations(document, side, &projection);
-        let deletion_blocks = full_file_deletion_block_views(
-            &deletion_blocks,
-            &projection,
-            &ui_state.expanded_full_file_deletion_blocks,
-        );
         let session = self
             .session_for_comparison(document.comparison_id)?
             .ok_or_else(|| {
@@ -6528,8 +6624,8 @@ impl DesktopController {
             start_row: u32::try_from(start).unwrap_or(u32::MAX),
             total_rows: u32::try_from(total).unwrap_or(u32::MAX),
             rows,
-            hunks,
-            deletion_blocks,
+            hunks: canonical.hunks.clone(),
+            deletion_blocks: canonical.deletion_blocks.clone(),
             old_tokens,
             new_tokens,
             highlight_status,
@@ -6728,8 +6824,9 @@ impl DesktopController {
         detail: String,
         max_window_rows: usize,
     ) -> Result<PresentationWindow, DispatchError> {
-        let (all_rows, hunks) =
+        let canonical =
             self.cached_canonical_rows(document, "unified", full_file_side, ui_state)?;
+        let all_rows = &canonical.rows;
         let (start, end) = bounded_window(
             request.start_row,
             request.end_row,
@@ -6748,7 +6845,7 @@ impl DesktopController {
             start_row: u32::try_from(start).unwrap_or(u32::MAX),
             total_rows: u32::try_from(all_rows.len()).unwrap_or(u32::MAX),
             rows,
-            hunks,
+            hunks: canonical.hunks.clone(),
             deletion_blocks: Vec::new(),
             old_tokens: Vec::new(),
             new_tokens: Vec::new(),
@@ -7346,7 +7443,11 @@ fn build_canonical_presentation(
                     false,
                 ));
             }
-            Ok(CachedCanonicalPresentation { rows, hunks })
+            Ok(CachedCanonicalPresentation {
+                rows,
+                hunks,
+                deletion_blocks: Vec::new(),
+            })
         }
         "full" => {
             let side = if document.file.status == localreview_diff::ReviewFileStatus::Deleted {
@@ -7356,14 +7457,23 @@ fn build_canonical_presentation(
             };
             let old_offsets = source_line_offsets(&document.old.content);
             let new_offsets = source_line_offsets(&document.new.content);
-            let (projection, _) =
+            let (projection, blocks) =
                 full_file_projection(document, side, &state.expanded_full_file_deletion_blocks);
             let rows = projection
                 .iter()
                 .map(|row| full_file_row_view(row, &old_offsets, &new_offsets))
                 .collect::<Vec<_>>();
             let hunks = full_file_hunk_locations(document, side, &projection);
-            Ok(CachedCanonicalPresentation { rows, hunks })
+            let deletion_blocks = full_file_deletion_block_views(
+                &blocks,
+                &projection,
+                &state.expanded_full_file_deletion_blocks,
+            );
+            Ok(CachedCanonicalPresentation {
+                rows,
+                hunks,
+                deletion_blocks,
+            })
         }
         _ => Err(DispatchError::Invalid(
             "unsupported canonical diff mode".into(),
@@ -11185,6 +11295,50 @@ mod tests {
         let cache = fixture.controller.presentation_cache.lock().unwrap();
         assert!(cache.canonical.len() <= 16);
         assert!(cache.canonical_order.len() <= 16);
+        assert!(cache.canonical_rows <= 100_000);
+    }
+
+    #[test]
+    fn large_full_file_presentations_reuse_one_shared_projection() {
+        let unchanged = "let cached = true;\n".repeat(12_100);
+        let old_source = format!("let version = 1;\n{unchanged}");
+        let new_source = format!("let version = 2;\n{unchanged}");
+        let fixture = review_fixture(&old_source, &new_source);
+        let document = fixture
+            .controller
+            .state()
+            .review_file_payload::<PersistedReviewDocument>(fixture.file_id)
+            .unwrap()
+            .unwrap()
+            .document;
+        let state = ReviewUiState::default();
+        let first_document = fixture
+            .controller
+            .cached_persisted_review_document(fixture.file_id, Some(document.comparison_id))
+            .unwrap();
+        let second_document = fixture
+            .controller
+            .cached_persisted_review_document(fixture.file_id, Some(document.comparison_id))
+            .unwrap();
+
+        let first = fixture
+            .controller
+            .cached_canonical_rows(&document, "full", DiffSide::New, &state)
+            .unwrap();
+        let second = fixture
+            .controller
+            .cached_canonical_rows(&document, "full", DiffSide::New, &state)
+            .unwrap();
+
+        assert!(first.rows.len() > 12_000);
+        assert!(
+            Arc::ptr_eq(&first_document, &second_document),
+            "viewport requests must not reread and deserialize the immutable document"
+        );
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "viewport requests must share the cached full-file projection"
+        );
     }
 
     #[test]

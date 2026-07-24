@@ -27,6 +27,24 @@ describe('safeSyntaxSegments', () => {
     expect(segments).toEqual([{ text: source, class: 'comment' }]);
   });
 
+  it('finds a visible token without scanning earlier rows and preserves astral UTF-8 boundaries', () => {
+    const earlier = Array.from({ length: 10_000 }, (_, index) => ({
+      startByte: index * 2,
+      endByte: index * 2 + 1,
+      class: 'variable' as const
+    }));
+    const source = '🚀 launch';
+    const startByte = 25_000;
+    const segments = safeSyntaxSegments(source, startByte, [
+      ...earlier,
+      { startByte, endByte: startByte + 4, class: 'string' }
+    ]);
+    expect(segments).toEqual([
+      { text: '🚀', class: 'string' },
+      { text: ' launch' }
+    ]);
+  });
+
   it('preserves every native semantic class as escaped renderer data', () => {
     const classes = [
       'attribute', 'boolean', 'comment', 'constant', 'constructor', 'embedded',

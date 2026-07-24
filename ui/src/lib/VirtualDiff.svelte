@@ -109,7 +109,7 @@
   $: localStart = Math.max(0, globalRange.start - effectiveWindowStart);
   $: localEnd = Math.max(localStart, Math.min(displayRows.length, globalRange.end - effectiveWindowStart));
   $: visibleRows = displayRows.slice(localStart, localEnd);
-  $: rowMeasurementSignature = `${wrapLines}:${globalRange.start}:${globalRange.end}:${visibleRows.map((row) => row.id).join('|')}:${Math.round(viewportWidth)}:${rowHeight}`;
+  $: rowMeasurementSignature = `${wrapLines}:${globalRange.start}:${globalRange.end}:${visibleRows.map((row) => row.id).join('|')}:${annotationRevision}:${expandedThreadKey ?? ''}:${Math.round(viewportWidth)}:${rowHeight}`;
   $: if (rowMeasurementSignature && virtualWindow) queueRowMeasurement();
   $: renderedWidth = wrapLines ? Math.max(0, viewportWidth) : Math.max(viewportWidth, contentWidth);
   $: if (viewport && focusedLocation && document.activeElement === viewport) {
@@ -152,7 +152,7 @@
   // never carry a stale virtual-row selection into Full File or Split.
   $: if (selectionMode !== mode) { selectionMode = mode; rangeAnchor = undefined; }
   $: {
-    const nextWrapContext = `${wrapLines ? 'wrap' : 'nowrap'}:${restorationKey}:${filePath}:${mode}:${fullFileSide}:${fontScale}:${splitRatio}:${Math.round(viewportWidth)}`;
+    const nextWrapContext = `${wrapLines ? 'wrap' : 'nowrap'}:${annotationContextKey}:${annotationRevision}:${expandedThreadKey ?? ''}:${restorationKey}:${filePath}:${mode}:${fullFileSide}:${fontScale}:${splitRatio}:${Math.round(viewportWidth)}`;
     if (nextWrapContext !== wrapContext) {
       const anchorRow = wrappedHeights.size ? rowAtOffset(scrollTop + height / 3) : Math.floor((scrollTop + height / 3) / Math.max(1, rowHeight));
       wrapContext = nextWrapContext;
@@ -264,6 +264,7 @@
     for (const element of virtualWindow.querySelectorAll<HTMLElement>('[data-virtual-row]')) {
       const index = Number(element.dataset.virtualRow);
       if (!Number.isFinite(index)) continue;
+      if (next.has(index)) continue;
       const measured = Math.max(rowHeight, Math.ceil(element.getBoundingClientRect().height));
       const previous = next.get(index) ?? rowHeight;
       if (Math.abs(measured - previous) < 1) continue;
@@ -296,7 +297,6 @@
     const focusedLine = Number(focused?.dataset.line);
     if ((focusedSide === 'old' || focusedSide === 'new') && Number.isFinite(focusedLine)) focusedLocation = { side: focusedSide, line: focusedLine };
     scrollTop = viewport.scrollTop;
-    requestWindow(globalRange.start, globalRange.end);
     const representative = visibleRows.find((row) => row.newLine || row.oldLine);
     onLocationChange({ line: representative?.newLine ?? representative?.oldLine, side: representative?.newLine ? 'new' : representative?.oldLine ? 'old' : undefined, scrollTop });
     void tick().then(() => {

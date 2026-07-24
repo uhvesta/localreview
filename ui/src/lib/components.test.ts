@@ -695,6 +695,29 @@ describe('review components', () => {
     unmount(component);
   });
 
+  it('reuses the loaded presentation window while scrolling inside it', async () => {
+    const requests: Array<{ startRow: number; endRow: number }> = [];
+    const rows: DiffRow[] = Array.from({ length: 300 }, (_, index) => ({
+      id: `cached-row-${index}`, kind: 'context', newLine: index + 1, newText: `const line${index} = true;`
+    }));
+    const host = target();
+    const component = mount(VirtualDiff, {
+      target: host,
+      props: {
+        rows, windowStart: 0, totalRows: 50_000, mode: 'unified',
+        onViewportRequest: (request: { startRow: number; endRow: number }) => requests.push(request)
+      }
+    });
+    await settle();
+    requests.length = 0;
+    const viewport = host.querySelector<HTMLElement>('.diff-viewport')!;
+    viewport.scrollTop = 200;
+    viewport.dispatchEvent(new Event('scroll'));
+    await settle();
+    expect(requests).toEqual([]);
+    unmount(component);
+  });
+
   it('uses a collapsible repository/folder tree with scaled variable rows', async () => {
     const files = Array.from({ length: 100 }, (_, index) => ({
       id: `tree-${index}`, repositoryId: 'repo', path: `src/features/area-${index % 5}/a-very-long-review-file-name-${index}.ts`, status: 'modified' as const,
