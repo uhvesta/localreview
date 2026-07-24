@@ -28,9 +28,14 @@ export function safeSyntaxSegments(
   }
   const byteToIndex = new Map<number, number>();
   bytesAtIndex.forEach((byte, index) => byteToIndex.set(byte, index));
+  const sourceEndByte = sourceStartByte + total;
   const relevant = spans
-    .filter((span) => span.startByte >= sourceStartByte && span.endByte <= sourceStartByte + total && span.startByte < span.endByte)
-    .map((span) => ({ ...span, start: byteToIndex.get(span.startByte - sourceStartByte), end: byteToIndex.get(span.endByte - sourceStartByte) }))
+    .filter((span) => span.endByte > sourceStartByte && span.startByte < sourceEndByte && span.startByte < span.endByte)
+    .map((span) => {
+      const clippedStart = Math.max(span.startByte, sourceStartByte) - sourceStartByte;
+      const clippedEnd = Math.min(span.endByte, sourceEndByte) - sourceStartByte;
+      return { ...span, start: byteToIndex.get(clippedStart), end: byteToIndex.get(clippedEnd) };
+    })
     .filter((span): span is SyntaxTokenSpan & { start: number; end: number } => span.start !== undefined && span.end !== undefined)
     .sort((a, b) => a.start - b.start || a.end - b.end);
   const output: SafeSyntaxSegment[] = [];

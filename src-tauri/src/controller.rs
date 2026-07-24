@@ -54,6 +54,7 @@ use localreview_ssh::{
     RemoteAgentProgram, ReverseForwardError, ReverseForwardListener, ReverseTunnel,
     SshCancellation, SshConnectionConfig, SshConnectionState, SshDestination, SshSession,
 };
+use localreview_tools::git_executable;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -8097,7 +8098,7 @@ fn git_reports_all_paths_ignored(
     if paths.is_empty() {
         return Ok(true);
     }
-    let mut child = Command::new("git")
+    let mut child = Command::new(git_executable())
         .arg("-C")
         .arg(repository_root)
         .args(["check-ignore", "--stdin", "-z"])

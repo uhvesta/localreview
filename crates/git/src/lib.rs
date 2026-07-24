@@ -18,6 +18,7 @@ use localreview_domain::{
     ContentFingerprint, GitSha, HeadState, RepositoryComparison, RepositoryId,
     ReviewFileClassification, StoredPath, UntrackedFile,
 };
+use localreview_tools::git_executable;
 use thiserror::Error;
 
 mod pool;
@@ -198,7 +199,7 @@ pub struct ProcessGitExecutor;
 
 impl GitExecutor for ProcessGitExecutor {
     fn execute(&self, command: &GitCommand) -> Result<GitOutput, GitError> {
-        let output = Command::new("git")
+        let output = Command::new(git_executable())
             .current_dir(&command.working_directory)
             // Read-only status/diff commands otherwise may refresh the index
             // stat cache. A recursive worktree watcher can mistake that

@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use localreview_tools::gh_executable;
 use thiserror::Error;
 
 /// A shell-free invocation of the GitHub CLI. Mutating requests carry JSON in
@@ -86,7 +87,7 @@ pub struct ProcessGhExecutor;
 
 impl GhExecutor for ProcessGhExecutor {
     fn execute(&self, command: &GhCommand) -> Result<GhOutput, GhError> {
-        let mut process = Command::new("gh");
+        let mut process = Command::new(gh_executable());
         process
             .args(&command.arguments)
             .stdout(Stdio::piped())

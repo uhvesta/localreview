@@ -16,6 +16,7 @@ localreview-protocol = { path = "../protocol" }
 localreview-domain = { path = "../domain" }
 localreview-git = { path = "../git" }
 localreview-persistence = { path = "../persistence" }
+localreview-tools = { path = "../tools" }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"

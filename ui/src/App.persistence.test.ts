@@ -780,34 +780,34 @@ describe('App review-session persistence boundaries', () => {
 
     await clickNavigation('Next');
     expectLastWindowToContain(100);
-    expect(viewport.scrollTop).toBe(2_200);
+    expect(viewport.scrollTop).toBe(1_800);
     expect(document.querySelector<HTMLButtonElement>('.mode-picker [role="tab"][aria-selected="true"]')?.textContent).toBe('Full File');
 
     await clickNavigation('Next');
     expectLastWindowToContain(700);
-    expect(viewport.scrollTop).toBe(16_600);
+    expect(viewport.scrollTop).toBe(13_800);
 
     await clickNavigation('Next');
     expectLastWindowToContain(100);
-    expect(viewport.scrollTop).toBe(2_200);
+    expect(viewport.scrollTop).toBe(1_800);
 
     await clickNavigation('Previous');
     expectLastWindowToContain(700);
-    expect(viewport.scrollTop).toBe(16_600);
+    expect(viewport.scrollTop).toBe(13_800);
 
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', altKey: true, bubbles: true }));
     await settle(5);
     expectLastWindowToContain(100);
-    expect(viewport.scrollTop).toBe(2_200);
+    expect(viewport.scrollTop).toBe(1_800);
     expect(document.querySelector<HTMLButtonElement>('.mode-picker [role="tab"][aria-selected="true"]')?.textContent).toBe('Full File');
 
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', altKey: true, bubbles: true }));
     await settle(5);
     expectLastWindowToContain(700);
-    expect(viewport.scrollTop).toBe(16_600);
+    expect(viewport.scrollTop).toBe(13_800);
     await new Promise((resolve) => window.setTimeout(resolve, 160));
     await settle(3);
-    expect(calls.uiStates.some((call) => call.state.mode === 'full' && call.state.fullFileSide === 'new' && call.state.nearestSourceLine === 651 && call.state.nearestSourceSide === 'old' && call.state.scrollTop === 16_600)).toBe(true);
+    expect(calls.uiStates.some((call) => call.state.mode === 'full' && call.state.fullFileSide === 'new' && call.state.nearestSourceLine === 651 && call.state.nearestSourceSide === 'old' && call.state.scrollTop === 13_800)).toBe(true);
 
     document.querySelector<HTMLButtonElement>('[aria-label="Full-file source side"] button:last-child')?.click();
     await settle(5);
@@ -816,7 +816,7 @@ describe('App review-session persistence boundaries', () => {
     expectLastWindowToContain(100);
     await new Promise((resolve) => window.setTimeout(resolve, 160));
     await settle(3);
-    expect(calls.uiStates.some((call) => call.state.mode === 'full' && call.state.fullFileSide === 'old' && call.state.nearestSourceLine === 91 && call.state.nearestSourceSide === 'old' && call.state.scrollTop === 2_200)).toBe(true);
+    expect(calls.uiStates.some((call) => call.state.mode === 'full' && call.state.fullFileSide === 'old' && call.state.nearestSourceLine === 91 && call.state.nearestSourceSide === 'old' && call.state.scrollTop === 1_800)).toBe(true);
 
     document.querySelector<HTMLButtonElement>('[aria-label="Next file"]')?.click();
     await settle(6);

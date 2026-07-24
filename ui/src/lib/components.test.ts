@@ -500,7 +500,7 @@ describe('review components', () => {
     expect(panel.querySelector('.inline-thread-kind.question')?.textContent).toBe('Question');
     expect(panel.textContent).toContain('new lines 10–12');
     expect(panel.textContent).toContain('Should this be awaited?');
-    expect(host.querySelector<HTMLElement>('.virtual-spacer')?.style.height).toBe('72px');
+    expect(host.querySelector<HTMLElement>('.virtual-spacer')?.style.height).toBe('60px');
     expect(additions).toHaveLength(0);
     expect(edits).toHaveLength(0);
 
@@ -822,7 +822,7 @@ describe('review components', () => {
     const nowrap = mount(VirtualDiff, { target: nowrapHost, props: { rows, totalRows: 1, mode: 'unified' } });
     await settle();
     expect(nowrapHost.querySelector('.diff-viewport')?.classList.contains('wrap-lines')).toBe(false);
-    expect(nowrapHost.querySelector<HTMLElement>('.diff-row')?.style.height).toBe('24px');
+    expect(nowrapHost.querySelector<HTMLElement>('.diff-row')?.style.height).toBe('20px');
     expect(nowrapHost.querySelector('.diff-row')?.classList.contains('added')).toBe(true);
     unmount(nowrap);
 
@@ -831,7 +831,7 @@ describe('review components', () => {
     await settle();
     expect(wrapHost.querySelector('.diff-viewport')?.classList.contains('wrap-lines')).toBe(true);
     expect(wrapHost.querySelector<HTMLElement>('.diff-row')?.style.height).toBe('');
-    expect(wrapHost.querySelector<HTMLElement>('.diff-row')?.style.minHeight).toBe('24px');
+    expect(wrapHost.querySelector<HTMLElement>('.diff-row')?.style.minHeight).toBe('20px');
     expect(wrapHost.querySelector('.diff-row')?.getAttribute('data-virtual-row')).toBe('0');
     unmount(wrapped);
   });

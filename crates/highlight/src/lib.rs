@@ -19,7 +19,7 @@ use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter}
 
 /// Pinned grammar/query bundle. Bump this whenever any grammar/query changes
 /// so old cache entries cannot be reused against different token semantics.
-pub const GRAMMAR_BUNDLE_VERSION: &str = "tree-sitter-2026-07-22-v3";
+pub const GRAMMAR_BUNDLE_VERSION: &str = "tree-sitter-2026-07-23-v4";
 
 const HIGHLIGHT_NAMES: &[&str] = &[
     "attribute",
@@ -44,6 +44,11 @@ const HIGHLIGHT_NAMES: &[&str] = &[
     "string",
     "string.escape",
     "tag",
+    "text",
+    "text.literal",
+    "text.reference",
+    "text.title",
+    "text.uri",
     "type",
     "variable",
     "variable.builtin",
@@ -257,7 +262,7 @@ impl SyntaxClass {
             Self::Embedded
         } else if name.starts_with("escape") {
             Self::Escape
-        } else if name.starts_with("markup") {
+        } else if name.starts_with("markup") || name.starts_with("text") {
             Self::Markup
         } else if name.starts_with("module") {
             Self::Module
@@ -368,8 +373,12 @@ pub struct HighlightPolicy {
 impl Default for HighlightPolicy {
     fn default() -> Self {
         Self {
-            max_bytes: 512 * 1024,
-            max_lines: 10_000,
+            // Keep ordinary large source files highlighted. Full-file reviews
+            // are virtualized and highlighting runs off the UI thread, so the
+            // old 512 KiB / 10k-line cutoff was both invisible to the user and
+            // unnecessarily low for real monorepo files.
+            max_bytes: 5 * 1024 * 1024,
+            max_lines: 100_000,
             highlight_generated: false,
         }
     }
@@ -1752,6 +1761,35 @@ mod tests {
             assert_eq!(result.status, HighlightStatus::Highlighted, "{path}");
             assert!(!result.tokens.is_empty(), "{path}");
         }
+    }
+
+    #[test]
+    fn markdown_block_captures_map_to_visible_markup_tokens() {
+        let source = "# Highlighted heading\n\nA [link](https://example.com) and `code`.\n";
+        let service = HighlightService::default();
+        let result = service.highlight(&request("example.md", source, DiffSide::New), None);
+        assert_eq!(result.status, HighlightStatus::Highlighted);
+        assert!(
+            result
+                .tokens
+                .iter()
+                .any(|token| token.class == SyntaxClass::Markup),
+            "Markdown text.* captures must not silently disappear"
+        );
+    }
+
+    #[test]
+    fn default_policy_keeps_large_reviewable_source_eligible() {
+        let source =
+            "//! A reviewable source line with enough text to model a large file.\n".repeat(17_500);
+        let service = HighlightService::default();
+        assert!(source.len() > 512 * 1024);
+        let result = service.highlight(&request("large.rs", &source, DiffSide::New), None);
+        assert_eq!(result.status, HighlightStatus::Highlighted);
+        assert!(result
+            .tokens
+            .iter()
+            .any(|token| token.class == SyntaxClass::Comment && token.start_byte == 0));
     }
 
     #[test]

@@ -18,6 +18,7 @@ use localreview_protocol::{
     RemoteSourceWindow, RepositoryBaseOverride, RuntimeRecord, WorkspaceSummary,
     MAX_REMOTE_CAPTURE_FILES, MAX_REMOTE_SOURCE_WINDOW_BYTES, PROTOCOL_VERSION,
 };
+use localreview_tools::git_executable;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
@@ -1965,7 +1966,7 @@ impl AgentServer {
 }
 
 fn watched_head_sha(root: &Path) -> Result<Vec<u8>, GitError> {
-    let output = ProcessCommand::new("git")
+    let output = ProcessCommand::new(git_executable())
         .current_dir(root)
         .args(["rev-parse", "--verify", "HEAD"])
         .stdin(Stdio::null())
@@ -2367,7 +2368,7 @@ fn run_git_metadata(
         .collect::<Vec<_>>()
         .join(" ");
     let command_display = format!("git -C {} {display}", root.display());
-    let mut child = ProcessCommand::new("git")
+    let mut child = ProcessCommand::new(git_executable())
         .current_dir(root)
         .args(&arguments)
         .stdin(Stdio::null())
@@ -2652,7 +2653,7 @@ fn read_git_source_window(
     cancellation: &AtomicBool,
 ) -> Result<StreamedSourceWindow, RemoteSourceReadError> {
     let object = git_object_spec(revision, path).map_err(RemoteSourceReadError::Git)?;
-    let exists = ProcessCommand::new("git")
+    let exists = ProcessCommand::new(git_executable())
         .current_dir(root)
         .args(["cat-file", "-e", object.as_str()])
         .stdin(Stdio::null())
@@ -2668,7 +2669,7 @@ fn read_git_source_window(
     if !exists.success() {
         return Err(RemoteSourceReadError::NotFound);
     }
-    let mut child = ProcessCommand::new("git")
+    let mut child = ProcessCommand::new(git_executable())
         .current_dir(root)
         .args(["cat-file", "blob", object.as_str()])
         .stdin(Stdio::null())
@@ -2738,7 +2739,7 @@ fn read_git_object_prefix(
         Err(GitError::CommandFailed { .. }) => return Ok(None),
         Err(error) => return Err(error),
     };
-    let mut child = ProcessCommand::new("git")
+    let mut child = ProcessCommand::new(git_executable())
         .current_dir(root)
         .args(["cat-file", "blob", object.as_str()])
         .stdin(Stdio::null())

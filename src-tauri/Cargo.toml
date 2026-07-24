@@ -32,6 +32,7 @@ localreview-persistence = { path = "../crates/persistence" }
 localreview-protocol = { path = "../crates/protocol" }
 localreview-service = { path = "../crates/service" }
 localreview-ssh = { path = "../crates/ssh" }
+localreview-tools = { path = "../crates/tools" }
 notify.workspace = true
 rand = "0.9"
 rfd = "0.15"

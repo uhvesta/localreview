@@ -18,6 +18,13 @@ Prerequisites:
 - `gh`, authenticated with `gh auth login`, for GitHub PR reviews
 - macOS 11 or newer for the desktop app
 
+LocalReview resolves `git` and `gh` from the inherited `PATH` first, then from
+well-known Homebrew, MacPorts, Linux package-manager, Snap, Linuxbrew, and Nix
+locations. This keeps Finder-launched macOS builds working even though Launch
+Services does not inherit the user's shell `PATH`. `LOCALREVIEW_GIT_PATH` and
+`LOCALREVIEW_GH_PATH` are authoritative executable overrides for unusual
+installations and diagnostics.
+
 Run the browser development fixture:
 
 ```sh

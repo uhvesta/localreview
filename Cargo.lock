@@ -2436,6 +2436,7 @@ dependencies = [
  "localreview-persistence",
  "localreview-protocol",
  "localreview-ssh",
+ "localreview-tools",
  "serde_cbor",
  "serde_json",
  "sha2",
@@ -2460,6 +2461,7 @@ dependencies = [
  "localreview-protocol",
  "localreview-service",
  "localreview-ssh",
+ "localreview-tools",
  "notify",
  "rand",
  "rfd",
@@ -2517,6 +2519,7 @@ dependencies = [
  "blake3",
  "chrono",
  "localreview-domain",
+ "localreview-tools",
  "serde",
  "serde_json",
  "tempfile",
@@ -2530,6 +2533,7 @@ dependencies = [
  "chrono",
  "localreview-domain",
  "localreview-git",
+ "localreview-tools",
  "serde",
  "serde_json",
  "sha2",
@@ -2640,6 +2644,13 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "localreview-tools"
+version = "0.1.5"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]

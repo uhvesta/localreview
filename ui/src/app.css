@@ -440,13 +440,13 @@ button.split-divider { cursor: col-resize; border: 0; padding: 0; min-width: 7px
 
 /* Scaled row geometry keeps virtual offsets, line-number gutters and file
    tree estimates in agreement through the full 75–200% font zoom range. */
-.diff-row { grid-template-columns: calc(28px * var(--font-scale)) calc(50px * var(--font-scale)) calc(50px * var(--font-scale)) calc(20px * var(--font-scale)) minmax(0, 1fr); }
+.diff-row { grid-template-columns: calc(28px * var(--font-scale)) calc(50px * var(--font-scale)) calc(50px * var(--font-scale)) calc(20px * var(--font-scale)) minmax(0, 1fr); border-bottom: 0; }
 .diff-row.split-row { grid-template-columns: calc(27px * var(--font-scale)) calc(44px * var(--font-scale)) calc(19px * var(--font-scale)) minmax(160px, var(--split-old-width, 320px)) 7px calc(27px * var(--font-scale)) calc(44px * var(--font-scale)) calc(19px * var(--font-scale)) minmax(160px, var(--split-new-width, 320px)); }
 .diff-row.deletion-gate-row { grid-template-columns: calc(28px * var(--font-scale)) minmax(0, 1fr); }
 .diff-viewport.wrap-lines .virtual-spacer, .diff-viewport.wrap-lines .virtual-window { width: 100%; min-width: 100%; }
 .diff-viewport.wrap-lines .diff-row, .diff-viewport.wrap-lines .hunk-row { width: 100%; min-width: 0; height: auto; align-items: start; white-space: pre-wrap; }
-.diff-viewport.wrap-lines .diff-row code { min-width: 0; padding-block: calc(4px * var(--font-scale)); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-all; }
-.diff-viewport.wrap-lines .diff-row > :is(.annotation-gutter, .line-number, .marker) { padding-top: calc(4px * var(--font-scale)); }
+.diff-viewport.wrap-lines .diff-row code { min-width: 0; padding-block: calc(2px * var(--font-scale)); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-all; }
+.diff-viewport.wrap-lines .diff-row > :is(.annotation-gutter, .line-number, .marker) { padding-top: calc(2px * var(--font-scale)); }
 .diff-viewport.wrap-lines .diff-row.split-row { grid-template-columns: calc(27px * var(--font-scale)) calc(44px * var(--font-scale)) calc(19px * var(--font-scale)) minmax(0, var(--split-old-width)) 7px calc(27px * var(--font-scale)) calc(44px * var(--font-scale)) calc(19px * var(--font-scale)) minmax(0, var(--split-new-width)); }
 .diff-viewport.wrap-lines .hunk-row > span { padding-block: calc(4px * var(--font-scale)); white-space: normal; overflow-wrap: anywhere; }
 .diff-viewport.wrap-lines .diff-row.deletion-gate-row { align-items: center; white-space: nowrap; }

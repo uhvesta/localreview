@@ -79,7 +79,7 @@
   let lastRequested = '';
   let handledJumpGeneration = -1;
   let handledRestorationKey: string | undefined;
-  let previousRowHeight = Math.round(24 * fontScale);
+  let previousRowHeight = Math.round(20 * fontScale);
   let rangeDrag: { side: DiffSide; anchor: number; current: number; row: DiffRow } | undefined;
   let suppressSyntheticClick = false;
   let focusedLocation: { side: DiffSide; line: number } | undefined;
@@ -102,7 +102,7 @@
   $: displayRows = (mode === 'difftastic' && structuralRows.length ? structuralRows : rows) as DiffRow[];
   $: effectiveWindowStart = mode === 'difftastic' && structuralRows.length ? (difftastic?.startRow ?? windowStart) : windowStart;
   $: effectiveTotal = mode === 'difftastic' && structuralRows.length ? (difftastic?.totalRows ?? structuralRows.length) : totalRows || rows.length;
-  $: rowHeight = Math.round(24 * fontScale);
+  $: rowHeight = Math.round(20 * fontScale);
   $: globalRange = wrapLines ? getWrappedRange(effectiveTotal, scrollTop, height, wrappedOffsets) : getVirtualRange(effectiveTotal, scrollTop, height, rowHeight, 16);
   $: virtualHeight = wrapLines ? offsetForRow(effectiveTotal, wrappedOffsets) : effectiveTotal * rowHeight;
   $: virtualOffset = wrapLines ? offsetForRow(globalRange.start, wrappedOffsets) : globalRange.offset;

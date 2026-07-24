@@ -19,6 +19,14 @@ describe('safeSyntaxSegments', () => {
     expect(segments).toEqual([{ text: source }]);
   });
 
+  it('clips multi-line tokens to the visible source row', () => {
+    const source = '//! second line';
+    const segments = safeSyntaxSegments(source, 15, [
+      { startByte: 0, endByte: 30, class: 'comment' }
+    ]);
+    expect(segments).toEqual([{ text: source, class: 'comment' }]);
+  });
+
   it('preserves every native semantic class as escaped renderer data', () => {
     const classes = [
       'attribute', 'boolean', 'comment', 'constant', 'constructor', 'embedded',
