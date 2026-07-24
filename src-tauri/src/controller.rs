@@ -8142,6 +8142,14 @@ fn full_file_omitted_blocks(
         FullFileView::Old => full_file_base_rows(document),
         FullFileView::New | FullFileView::Both => full_file_current_rows(document),
     };
+    full_file_omitted_blocks_from_rows(document, view, &rows)
+}
+
+fn full_file_omitted_blocks_from_rows(
+    document: &ReviewDiffDocument,
+    view: FullFileView,
+    rows: &[FullFileRow],
+) -> Vec<FullFileOmittedBlock> {
     let is_omitted = |row: &FullFileRow| match view {
         FullFileView::Old => row.side == DiffSide::New,
         FullFileView::New => row.side == DiffSide::Old,
@@ -8206,7 +8214,10 @@ fn full_file_projection(
         FullFileView::Old => full_file_base_rows(document),
         FullFileView::New | FullFileView::Both => full_file_current_rows(document),
     };
-    let blocks = full_file_omitted_blocks(document, view);
+    // Projection and block discovery operate on the same complete row set.
+    // Rebuilding all Full File rows here used to duplicate the dominant work
+    // on every disclosure click, even though the result is immutable.
+    let blocks = full_file_omitted_blocks_from_rows(document, view, &rows);
     let mut blocks_by_start = blocks
         .iter()
         .cloned()

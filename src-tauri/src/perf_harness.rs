@@ -247,6 +247,7 @@ pub(crate) fn run(output: &Path) -> Result<(), String> {
             controller.query_symbol_navigation(SymbolNavigationQuery {
                 workspace_id: workspace_id.to_string(),
                 repository_id: repository_id.to_string(),
+                comparison_id: None,
                 symbol: "target_symbol".into(),
                 kind: "all".into(),
                 limit: Some(100),

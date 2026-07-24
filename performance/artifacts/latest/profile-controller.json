@@ -2,35 +2,35 @@
   "schemaVersion": 1,
   "profile": "release",
   "fixtureLines": 25000,
-  "iterations": 40,
+  "iterations": 160,
   "operations": [
     {
       "name": "individual_disclosure",
-      "samples": 40,
+      "samples": 160,
       "viewportRowsRequested": 220,
       "wallMicros": {
-        "min": 26417,
-        "median": 32266,
-        "p95": 41060,
-        "max": 278330
+        "min": 24853,
+        "median": 25383,
+        "p95": 26956,
+        "max": 270372
       },
       "nativeMicros": {
-        "min": 26117,
-        "median": 31955,
-        "p95": 40698,
-        "max": 278033
+        "min": 24552,
+        "median": 25078,
+        "p95": 26649,
+        "max": 270071
       },
       "serializationMicros": {
-        "min": 292,
-        "median": 312,
-        "p95": 463,
-        "max": 658
+        "min": 294,
+        "median": 304,
+        "p95": 440,
+        "max": 504
       },
       "responseBytes": {
-        "min": 335205,
-        "median": 335206,
-        "p95": 335936,
-        "max": 335936
+        "min": 343166,
+        "median": 343168,
+        "p95": 343898,
+        "max": 343898
       },
       "responseRows": {
         "min": 220,
@@ -53,31 +53,31 @@
     },
     {
       "name": "expand_collapse_all",
-      "samples": 40,
+      "samples": 160,
       "viewportRowsRequested": 220,
       "wallMicros": {
-        "min": 26167,
-        "median": 27168,
-        "p95": 31001,
-        "max": 68962
+        "min": 24969,
+        "median": 25450,
+        "p95": 25881,
+        "max": 65196
       },
       "nativeMicros": {
-        "min": 25874,
-        "median": 26816,
-        "p95": 30531,
-        "max": 68625
+        "min": 24667,
+        "median": 25143,
+        "p95": 25576,
+        "max": 64892
       },
       "serializationMicros": {
-        "min": 291,
-        "median": 298,
-        "p95": 427,
-        "max": 469
+        "min": 292,
+        "median": 300,
+        "p95": 316,
+        "max": 493
       },
       "responseBytes": {
-        "min": 335232,
-        "median": 335232,
-        "p95": 335742,
-        "max": 335742
+        "min": 343194,
+        "median": 343194,
+        "p95": 343704,
+        "max": 343704
       },
       "responseRows": {
         "min": 220,
@@ -103,28 +103,28 @@
       "samples": 1,
       "viewportRowsRequested": 220,
       "wallMicros": {
-        "min": 718990,
-        "median": 718990,
-        "p95": 718990,
-        "max": 718990
+        "min": 436703,
+        "median": 436703,
+        "p95": 436703,
+        "max": 436703
       },
       "nativeMicros": {
-        "min": 718698,
-        "median": 718698,
-        "p95": 718698,
-        "max": 718698
+        "min": 436443,
+        "median": 436443,
+        "p95": 436443,
+        "max": 436443
       },
       "serializationMicros": {
-        "min": 291,
-        "median": 291,
-        "p95": 291,
-        "max": 291
+        "min": 259,
+        "median": 259,
+        "p95": 259,
+        "max": 259
       },
       "responseBytes": {
-        "min": 295179,
-        "median": 295179,
-        "p95": 295179,
-        "max": 295179
+        "min": 295180,
+        "median": 295180,
+        "p95": 295180,
+        "max": 295180
       },
       "responseRows": {
         "min": 220,
@@ -147,28 +147,28 @@
     },
     {
       "name": "highlight_cached_viewport",
-      "samples": 40,
+      "samples": 160,
       "viewportRowsRequested": 220,
       "wallMicros": {
-        "min": 2974,
-        "median": 3313,
-        "p95": 3627,
-        "max": 5394
+        "min": 2972,
+        "median": 3169,
+        "p95": 3298,
+        "max": 3368
       },
       "nativeMicros": {
-        "min": 2726,
-        "median": 3032,
-        "p95": 3354,
-        "max": 5123
+        "min": 2718,
+        "median": 2899,
+        "p95": 3040,
+        "max": 3108
       },
       "serializationMicros": {
-        "min": 243,
-        "median": 261,
-        "p95": 418,
-        "max": 430
+        "min": 248,
+        "median": 256,
+        "p95": 281,
+        "max": 395
       },
       "responseBytes": {
-        "min": 295179,
+        "min": 295180,
         "median": 295180,
         "p95": 295180,
         "max": 295180
@@ -194,30 +194,30 @@
     },
     {
       "name": "refresh",
-      "samples": 10,
+      "samples": 40,
       "viewportRowsRequested": null,
       "wallMicros": {
-        "min": 258094,
-        "median": 267021,
-        "p95": 338689,
-        "max": 339707
+        "min": 244903,
+        "median": 249421,
+        "p95": 260490,
+        "max": 278809
       },
       "nativeMicros": {
-        "min": 258085,
-        "median": 267014,
-        "p95": 338677,
-        "max": 339696
+        "min": 244895,
+        "median": 249413,
+        "p95": 260479,
+        "max": 278798
       },
       "serializationMicros": {
         "min": 7,
-        "median": 8,
+        "median": 7,
         "p95": 10,
         "max": 11
       },
       "responseBytes": {
         "min": 1310,
-        "median": 1310,
-        "p95": 1310,
+        "median": 1311,
+        "p95": 1311,
         "max": 1311
       },
       "responseRows": {
@@ -241,25 +241,25 @@
     },
     {
       "name": "symbol_navigation",
-      "samples": 40,
+      "samples": 160,
       "viewportRowsRequested": null,
       "wallMicros": {
-        "min": 141095,
-        "median": 146642,
-        "p95": 157115,
-        "max": 178047
+        "min": 136444,
+        "median": 138440,
+        "p95": 139834,
+        "max": 142936
       },
       "nativeMicros": {
-        "min": 141059,
-        "median": 146605,
-        "p95": 157078,
-        "max": 178005
+        "min": 136406,
+        "median": 138402,
+        "p95": 139793,
+        "max": 142898
       },
       "serializationMicros": {
-        "min": 35,
+        "min": 36,
         "median": 38,
-        "p95": 47,
-        "max": 83
+        "p95": 44,
+        "max": 50
       },
       "responseBytes": {
         "min": 43554,

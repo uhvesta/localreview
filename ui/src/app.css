@@ -371,7 +371,7 @@ button.split-divider { cursor: col-resize; border: 0; padding: 0; min-width: 7px
 .virtual-file-spacer { position: relative; min-width: 0; }
 .virtual-file-window { min-width: 0; }
 .virtual-file-list .file-row { display: flex; min-width: 0; align-items: stretch; padding: 0; }
-.file-select { min-width: 0; flex: 1 1 58%; display: flex; align-items: flex-start; gap: 7px; padding: 8px 4px 8px 10px; border: 0; color: inherit; background: transparent; text-align: left; }
+.file-select { min-width: 0; flex: 1 1 0; display: flex; align-items: flex-start; gap: 7px; padding: 8px 4px 8px 10px; border: 0; color: inherit; background: transparent; text-align: left; }
 .file-select:hover, .file-select:focus-visible { background: #18212e; outline-offset: -2px; }
 .virtual-file-list .file-row-stats { min-width: max-content; padding: 8px 10px 8px 3px; }
 .virtual-group { display: flex; align-items: center; }

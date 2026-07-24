@@ -37,6 +37,7 @@
   let observer: ResizeObserver | undefined;
   let collapsedGroups = new Set<string>();
   let focusedFileId: string | undefined;
+  let scrollFocusFrame: number | undefined;
   let appliedCollapseAllToken = 0;
   let appliedExpandAllToken = 0;
 
@@ -95,10 +96,16 @@
   function buildEntries(source: ReviewFile[], mode: FileGrouping, names: Map<string, string>, collapsed: Set<string>, scale: number): Entry[] {
     const result: Entry[] = [];
     const fileHeight = (file: ReviewFile) => {
-      // Long paths and large text need a second visual line. Keeping this
-      // estimate in the offset table prevents the virtual list from drifting.
-      const pathLines = Math.max(1, Math.ceil(file.path.length / Math.max(24, Math.floor(42 / scale))));
-      return Math.ceil((58 + Math.min(2, pathLines - 1) * 16) * scale);
+      // Repository grouping already renders the directory and repository
+      // ancestry. Size its virtual row from what is actually visible, not the
+      // hidden fully-qualified path retained only for title/ARIA.
+      const displayedPath = mode === 'flat' ? file.path : basename(file.path);
+      const pathLines = Math.max(1, Math.ceil(displayedPath.length / Math.max(24, Math.floor(42 / scale))));
+      const metadataLines =
+        Number(Boolean(file.previousPath))
+        + Number(mode !== 'repository')
+        + Number(classificationBadges(file).length > 0);
+      return Math.ceil((42 + Math.min(2, pathLines - 1 + metadataLines) * 16) * scale);
     };
     if (mode === 'flat') return source.map((file) => ({ kind: 'file', id: file.id, file, depth: 0, height: fileHeight(file) }));
 
@@ -156,12 +163,35 @@
 
   function visibleRange(source: number[], top: number, viewportHeight: number, overscan: number) {
     const entryCount = Math.max(0, source.length - 1);
-    let start = 0;
-    while (start < entryCount && source[start + 1] <= top) start += 1;
-    let end = start;
+    // The file explorer can contain tens of thousands of entries. Resolve the
+    // viewport bounds with binary searches instead of walking from the root on
+    // every scroll event.
+    const start = Math.min(entryCount, Math.max(0, upperBound(source, top) - 1));
     const bottom = top + viewportHeight;
-    while (end < entryCount && source[end] < bottom) end += 1;
+    const end = Math.min(entryCount, Math.max(start, lowerBound(source, bottom)));
     return { start: Math.max(0, start - overscan), end: Math.min(entryCount, end + overscan) };
+  }
+
+  function lowerBound(source: number[], value: number) {
+    let low = 0;
+    let high = source.length;
+    while (low < high) {
+      const middle = low + Math.floor((high - low) / 2);
+      if (source[middle] < value) low = middle + 1;
+      else high = middle;
+    }
+    return low;
+  }
+
+  function upperBound(source: number[], value: number) {
+    let low = 0;
+    let high = source.length;
+    while (low < high) {
+      const middle = low + Math.floor((high - low) / 2);
+      if (source[middle] <= value) low = middle + 1;
+      else high = middle;
+    }
+    return low;
   }
 
   function observe(node: HTMLDivElement) {
@@ -174,9 +204,14 @@
 
   function onScroll() {
     const focused = document.activeElement instanceof HTMLElement ? document.activeElement.dataset.fileId : undefined;
-    if (focused) focusedFileId = focused;
     scrollTop = viewport.scrollTop;
-    void tick().then(() => {
+    // Pointer/trackpad scrolling is the dominant path and needs no focus
+    // repair. Only schedule one frame when virtualization is about to remove
+    // the file row that actually owns keyboard focus.
+    if (!focused || scrollFocusFrame !== undefined) return;
+    focusedFileId = focused;
+    scrollFocusFrame = requestAnimationFrame(() => {
+      scrollFocusFrame = undefined;
       if (focusedFileId && !viewport.querySelector(`[data-file-id="${CSS.escape(focusedFileId)}"]`)) viewport.focus({ preventScroll: true });
     });
   }
@@ -234,7 +269,10 @@
     return grouping === 'flat' ? path : basename(path);
   }
 
-  onDestroy(() => observer?.disconnect());
+  onDestroy(() => {
+    observer?.disconnect();
+    if (scrollFocusFrame !== undefined) cancelAnimationFrame(scrollFocusFrame);
+  });
 </script>
 
 <!-- svelte-ignore a11y_no_noninteractive_tabindex -- scroll container is keyboard reachable. -->
@@ -274,7 +312,7 @@
           <div class:active={file.id === activeFileId} class="file-row" role="treeitem" aria-level={entry.depth + 1} aria-selected={file.id === activeFileId} style:height={`${entry.height}px`} style:padding-left={`${entry.depth * 14}px`}>
             <button class="file-select" data-file-id={file.id} title={file.path} aria-label={`${file.path}, ${repositoryName}, ${file.status}, ${file.viewed ? 'viewed' : 'unviewed'}, ${file.annotationCount} annotations${badges.length ? `, ${badges.map((badge) => badge[1]).join(', ')}` : ''}`} on:focus={() => focusedFileId = file.id} on:click={() => activate(file.id)} on:keydown={(event) => onKeydown(event, file.id)}>
               <span class:viewed={file.viewed} class="view-marker" aria-hidden="true"></span>
-              <span class="file-info"><span class="file-path" title={file.path}>{displayPath}</span>{#if file.previousPath}<span class="old-path" title={file.previousPath}>{displayedFilePath(file.previousPath)}</span>{/if}<span class="file-repo">{repositoryName}</span>{#if badges.length}<span class="classification-badges" aria-label="Capture-time file classifications">{#each badges as badge (badge[0])}<span class={`classification-badge ${badge[0]}`}>{badge[1]}</span>{/each}</span>{/if}</span>
+              <span class="file-info"><span class="file-path" title={file.path}>{displayPath}</span>{#if file.previousPath}<span class="old-path" title={file.previousPath}>{displayedFilePath(file.previousPath)}</span>{/if}{#if grouping !== 'repository'}<span class="file-repo">{repositoryName}</span>{/if}{#if badges.length}<span class="classification-badges" aria-label="Capture-time file classifications">{#each badges as badge (badge[0])}<span class={`classification-badge ${badge[0]}`}>{badge[1]}</span>{/each}</span>{/if}</span>
             </button>
             <div class="file-row-stats"><button class="view-toggle" aria-label={`Mark ${file.path} ${file.viewed ? 'unviewed' : 'viewed'}`} aria-pressed={file.viewed} on:click={() => onToggleViewed(file.id, !file.viewed)}>{file.viewed ? 'Viewed' : 'Mark viewed'}</button><span class="status-chip {file.status}" aria-label={file.status}>{file.status[0].toUpperCase()}</span><span class="additions">+{file.additions}</span>{#if file.deletions}<span class="deletions">−{file.deletions}</span>{/if}{#if file.annotationCount}<span class="annotation-count">● {file.annotationCount}</span>{/if}</div>
           </div>

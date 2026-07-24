@@ -823,15 +823,55 @@ describe('review components', () => {
     expect(groups[1].dataset.chainLength).toBe('5');
     expect(groups[1].textContent?.replace(/\s/g, '')).toContain('tools/boss/app-macos/Sources/Ghostty');
     expect(host.querySelectorAll('.file-row')).toHaveLength(1);
-    expect(host.querySelector('.file-row')?.getAttribute('aria-level')).toBe('3');
+    const fileRow = host.querySelector<HTMLElement>('.file-row')!;
+    expect(fileRow.getAttribute('aria-level')).toBe('3');
+    expect(fileRow.style.height).toBe('42px');
     expect(host.querySelector('.file-path')?.textContent).toBe('BossPaneModel.swift');
     expect(host.querySelector('.file-path')?.getAttribute('title')).toBe('tools/boss/app-macos/Sources/Ghostty/BossPaneModel.swift');
+    expect(host.querySelector('.file-repo')).toBeNull();
     expect(host.querySelector('.file-select')?.getAttribute('aria-label')).toContain('tools/boss/app-macos/Sources/Ghostty/BossPaneModel.swift, mono, modified');
 
     groups[1].click();
     await settle();
     expect(host.querySelector('[aria-label="tools/boss/app-macos/Sources/Ghostty, folder"]')?.getAttribute('aria-expanded')).toBe('false');
     expect(host.querySelectorAll('.file-row')).toHaveLength(0);
+    unmount(component);
+  });
+
+  it('jumps directly into deep file trees and leaves pointer scrolling off the animation queue', async () => {
+    const files = Array.from({ length: 10_000 }, (_, index) => ({
+      id: `deep-${index}`,
+      repositoryId: 'repo',
+      path: `src/generated/file-${String(index).padStart(5, '0')}.ts`,
+      status: 'modified' as const,
+      additions: 1,
+      deletions: 0,
+      hunkCount: 1,
+      language: 'TypeScript',
+      viewed: false,
+      annotationCount: 0
+    }));
+    const host = target();
+    const component = mount(VirtualFileList, { target: host, props: {
+      files,
+      repositories: [{ id: 'repo', name: 'API', path: '/tmp/api', branch: 'feature', base: 'origin/main', mergeBase: 'a', head: 'b' }],
+      grouping: 'flat'
+    } });
+    await settle();
+
+    const animationFrame = vi.spyOn(window, 'requestAnimationFrame');
+    animationFrame.mockClear();
+    const viewport = host.querySelector<HTMLElement>('.virtual-file-list')!;
+    viewport.scrollTop = 400_000;
+    for (let index = 0; index < 30; index += 1) viewport.dispatchEvent(new Event('scroll'));
+    await settle();
+
+    expect(animationFrame).not.toHaveBeenCalled();
+    expect(host.querySelectorAll('.file-row').length).toBeLessThan(40);
+    const visiblePaths = [...host.querySelectorAll<HTMLElement>('.file-path')].map((node) => node.textContent ?? '');
+    expect(visiblePaths.some((path) => path.includes('file-068'))).toBe(true);
+    expect(visiblePaths.some((path) => path.includes('file-000'))).toBe(false);
+    animationFrame.mockRestore();
     unmount(component);
   });
 
