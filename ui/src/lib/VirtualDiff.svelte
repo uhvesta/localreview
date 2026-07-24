@@ -29,6 +29,8 @@
   export let jumpToRow: number | undefined = undefined;
   /** Distinguishes repeated jumps to the same row after wrapping or manual scrolling. */
   export let jumpGeneration = 0;
+  /** Optional row-top offset captured before a projection swap. */
+  export let jumpViewportOffset: number | undefined = undefined;
   /** Persisted pixel position for this workspace/file/mode. Applied once per
    * restoration key after the viewport exists. */
   export let initialScrollTop = 0;
@@ -52,12 +54,12 @@
   export let annotationsEditable = true;
   /** Deletion disclosure changes presentation only and remains available in
    * otherwise read-only archived reviews. */
-  export let deletionBlocksExpandable = true;
+  export let omittedBlocksExpandable = true;
   export let onAnnotate: (row: DiffRow, selection: DiffSelection) => void = () => {};
   export let onEditAnnotation: (annotation: Annotation) => void = () => {};
   export let onViewportRequest: (request: Pick<ViewportRequest, 'startRow' | 'endRow'>) => void = () => {};
   export let onExpandHunk: (hunk: HunkLocation) => void = () => {};
-  export let onToggleDeletionBlock: (blockId: string) => void = () => {};
+  export let onToggleOmittedBlock: (blockId: string) => void = () => {};
   export let onSplitRatio: (ratio: number) => void = () => {};
   export let onCanonicalMode: (mode: Exclude<DiffMode, 'difftastic'>, location?: { side: DiffSide; line: number }) => void = () => {};
   export let onLocationChange: (location: { line?: number; side?: DiffSide; scrollTop: number }) => void = () => {};
@@ -120,11 +122,16 @@
   $: if (viewport && !windowCoversVisible) requestWindow(globalRange.start, globalRange.end);
   $: if (viewport && jumpToRow !== undefined && jumpGeneration !== handledJumpGeneration) {
     handledJumpGeneration = jumpGeneration;
-    viewport.scrollTop = Math.max(0, (wrapLines ? offsetForRow(jumpToRow) : jumpToRow * rowHeight) - Math.floor(height / 3));
+    const offset = jumpViewportOffset === undefined
+      ? Math.floor(height / 3)
+      : Math.max(0, Math.min(height - rowHeight, jumpViewportOffset));
+    viewport.scrollTop = Math.max(0, (wrapLines ? offsetForRow(jumpToRow) : jumpToRow * rowHeight) - offset);
     scrollTop = viewport.scrollTop;
     onLocationChange({
       line: activeLine,
-      side: mode === 'full' && activeLine ? (activeSide ?? fullFileSide) : undefined,
+      side: mode === 'full' && activeLine
+        ? (activeSide ?? (fullFileSide === 'old' ? 'old' : 'new'))
+        : undefined,
       scrollTop
     });
     requestWindow(Math.max(0, jumpToRow - 20), jumpToRow + 20);
@@ -194,6 +201,42 @@
     if (key === lastRequested) return;
     lastRequested = key;
     onViewportRequest({ startRow: paddedStart, endRow: paddedEnd });
+  }
+
+  export function viewportAnchor(): { side: DiffSide; line: number; viewportOffset: number } | undefined {
+    if (!viewport || !virtualWindow) return undefined;
+    const viewportRect = viewport.getBoundingClientRect();
+    const focalY = viewportRect.top + viewportRect.height / 2;
+    let closest: { element: HTMLElement; distance: number } | undefined;
+    for (const element of virtualWindow.querySelectorAll<HTMLElement>('[data-virtual-row]')) {
+      const rect = element.getBoundingClientRect();
+      const distance = Math.abs((rect.top + rect.bottom) / 2 - focalY);
+      if (!closest || distance < closest.distance) closest = { element, distance };
+    }
+    if (!closest) return undefined;
+    const rowIndex = Number(closest.element.dataset.virtualRow);
+    if (!Number.isSafeInteger(rowIndex)) return undefined;
+    const row = displayRows[rowIndex - effectiveWindowStart];
+    if (!row) return undefined;
+    const viewportOffset = closest.element.getBoundingClientRect().top - viewportRect.top;
+    if ((row.kind === 'deletion_gate' || row.kind === 'addition_gate') && row.omittedSide) {
+      const start = row.omittedSide === 'old' ? row.oldLine : row.newLine;
+      if (!start) return undefined;
+      const end = row.omittedEndLine ?? start;
+      return {
+        side: row.omittedSide,
+        line: start + Math.floor((end - start) / 2),
+        viewportOffset
+      };
+    }
+    const preferred: DiffSide = mode === 'full'
+      ? (fullFileSide === 'old' ? 'old' : fullFileSide === 'both' && row.oldLine && !row.newLine ? 'old' : 'new')
+      : (row.newLine ? 'new' : 'old');
+    const preferredLine = preferred === 'old' ? row.oldLine : row.newLine;
+    if (preferredLine) return { side: preferred, line: preferredLine, viewportOffset };
+    if (row.newLine) return { side: 'new', line: row.newLine, viewportOffset };
+    if (row.oldLine) return { side: 'old', line: row.oldLine, viewportOffset };
+    return undefined;
   }
 
   function offsetForRow(index: number, offsets = wrappedOffsets) {
@@ -612,10 +655,14 @@
         {#if row.kind === 'header'}
           {@const hunk = hunks.find((entry) => entry.id === row.hunkId || entry.id === row.id)}
           <div class="hunk-row" data-virtual-row={virtualRowIndex} role="group" aria-label={`Repository ${repositoryName}, file ${filePath}, collapsed hunk ${row.hunk ?? ''}`} style={rowStyle()}><span>{row.hunk}</span><button aria-label={`Expand context for ${row.hunk ?? 'hunk'}`} on:click={() => hunk && onExpandHunk(hunk)}>⋯ <span class="visually-hidden">Expand context</span></button></div>
-        {:else if mode === 'full' && row.kind === 'deletion_gate' && row.deletionBlockId}
-          <div class="diff-row deletion-gate-row" data-virtual-row={virtualRowIndex} class:has-annotation={row.hasAnnotation} class:expanded={row.deletionExpanded} role="group" aria-label={`Repository ${repositoryName}, file ${filePath}, Full File Current diff. ${row.deletionCount ?? 0} deleted Base ${(row.deletionCount ?? 0) === 1 ? 'line' : 'lines'}, lines ${row.oldLine ?? ''}${row.oldEndLine && row.oldEndLine !== row.oldLine ? `–${row.oldEndLine}` : ''}, ${row.deletionExpanded ? 'expanded' : 'collapsed'}.${row.hasAnnotation ? ' Contains annotations.' : ''}`} style={rowStyle()}>
-            <span class="annotation-gutter deletion-gate-annotation" aria-hidden="true">{row.hasAnnotation ? '●' : ''}</span>
-            <button class="deletion-gate-toggle" aria-expanded={row.deletionExpanded ?? false} aria-label={`${row.deletionExpanded ? 'Hide' : 'Show'} ${row.deletionCount ?? 0} deleted ${(row.deletionCount ?? 0) === 1 ? 'line' : 'lines'}, Base lines ${row.oldLine ?? ''}${row.oldEndLine && row.oldEndLine !== row.oldLine ? `–${row.oldEndLine}` : ''}${row.hasAnnotation ? (row.deletionExpanded ? ', contains annotations' : ', annotations hidden in this collapsed range') : ''}`} disabled={!deletionBlocksExpandable} on:click={() => onToggleDeletionBlock(row.deletionBlockId!)}>{row.deletionExpanded ? '⌄' : '›'} {row.deletionCount ?? 0} deleted {(row.deletionCount ?? 0) === 1 ? 'line' : 'lines'} · Base {row.oldLine ?? ''}{row.oldEndLine && row.oldEndLine !== row.oldLine ? `–${row.oldEndLine}` : ''}{row.hasAnnotation ? (row.deletionExpanded ? ' · contains annotations' : ' · annotations hidden') : ''}</button>
+        {:else if mode === 'full' && (row.kind === 'deletion_gate' || row.kind === 'addition_gate') && row.omittedBlockId && row.omittedSide}
+          {@const omittedStart = row.omittedSide === 'old' ? row.oldLine : row.newLine}
+          {@const omittedEnd = row.omittedEndLine ?? omittedStart}
+          {@const omittedAction = row.omittedSide === 'old' ? 'deleted' : 'added'}
+          {@const omittedSource = row.omittedSide === 'old' ? 'Base' : 'Current'}
+          <div class="diff-row" class:deletion-gate-row={row.omittedSide === 'old'} class:addition-gate-row={row.omittedSide === 'new'} data-virtual-row={virtualRowIndex} class:has-annotation={row.hasAnnotation} class:expanded={row.omittedExpanded} role="group" aria-label={`Repository ${repositoryName}, file ${filePath}, Full File ${fullFileSide === 'old' ? 'Base' : fullFileSide === 'new' ? 'Current' : 'Both'} diff. ${row.omittedCount ?? 0} ${omittedAction} ${omittedSource} ${(row.omittedCount ?? 0) === 1 ? 'line' : 'lines'}, lines ${omittedStart ?? ''}${omittedEnd && omittedEnd !== omittedStart ? `–${omittedEnd}` : ''}, ${row.omittedExpanded ? 'expanded' : 'collapsed'}.${row.hasAnnotation ? ' Contains annotations.' : ''}`} style={rowStyle()}>
+            <span class="annotation-gutter omitted-gate-annotation" aria-hidden="true">{row.hasAnnotation ? '●' : ''}</span>
+            <button class:deletion-gate-toggle={row.omittedSide === 'old'} class:addition-gate-toggle={row.omittedSide === 'new'} aria-expanded={row.omittedExpanded ?? false} aria-label={`${row.omittedExpanded ? 'Hide' : 'Show'} ${row.omittedCount ?? 0} ${omittedAction} ${(row.omittedCount ?? 0) === 1 ? 'line' : 'lines'}, ${omittedSource} lines ${omittedStart ?? ''}${omittedEnd && omittedEnd !== omittedStart ? `–${omittedEnd}` : ''}${row.hasAnnotation ? (row.omittedExpanded ? ', contains annotations' : ', annotations hidden in this collapsed range') : ''}`} disabled={!omittedBlocksExpandable} on:click={() => onToggleOmittedBlock(row.omittedBlockId!)}>{row.omittedExpanded ? '⌄' : '›'} {row.omittedCount ?? 0} {omittedAction} {(row.omittedCount ?? 0) === 1 ? 'line' : 'lines'} · {omittedSource} {omittedStart ?? ''}{omittedEnd && omittedEnd !== omittedStart ? `–${omittedEnd}` : ''}{row.hasAnnotation ? (row.omittedExpanded ? ' · contains annotations' : ' · annotations hidden') : ''}</button>
           </div>
         {:else if mode === 'split'}
           {@const oldCovered = currentAnnotations(row, 'old', annotationRevision)}
@@ -655,7 +702,9 @@
             <button class="annotation-gutter" aria-label={`Annotation disabled for structural old line ${row.oldLine ?? ''}`} disabled>•</button><span class="line-number">{row.oldLine ?? ''}</span><span class="marker">{row.kind === 'deletion' ? '−' : ''}</span><code>{#each structuralSegments(code(row, 'old'), oldCell?.changedSpans) as segment}<span class={segment.class}>{segment.text}</span>{/each}</code><span class="split-divider"></span><button class="annotation-gutter" aria-label={`Annotation disabled for structural new line ${row.newLine ?? ''}`} disabled>•</button><span class="line-number">{row.newLine ?? ''}</span><span class="marker">{row.kind === 'addition' ? '+' : ''}</span><code>{#each structuralSegments(code(row, 'new'), newCell?.changedSpans) as segment}<span class={segment.class}>{segment.text}</span>{/each}</code>
           </div>
         {:else}
-          {@const displaySide = mode === 'full' ? (fullFileSide === 'new' && !row.newLine ? 'old' : fullFileSide === 'old' && !row.oldLine ? 'new' : fullFileSide) : (row.kind === 'deletion' ? 'old' : 'new')}
+          {@const displaySide: DiffSide = mode === 'full'
+            ? (row.oldLine && !row.newLine ? 'old' : 'new')
+            : (row.kind === 'deletion' ? 'old' : 'new')}
           {@const covered = currentAnnotations(row, displaySide, annotationRevision)}
           {@const threads = anchoredAnnotations(row, displaySide, covered)}
           <div class:active={lineFor(row) === activeLine} class:composer-range={isComposerRange(row, displaySide, displayedSelection)} class:annotation-range={covered.length > 0} class:question-annotation-range={includesKind(covered, 'question')} class:thread-expanded={expandedThreadKey === threadKey(row, displaySide)} class:added={row.kind === 'addition'} class:removed={row.kind === 'deletion'} class="diff-row" data-virtual-row={virtualRowIndex} role="group" aria-label={rowLabel(row, [displaySide], annotationRevision)} style={rowStyle()}>

@@ -87,12 +87,13 @@ function installApi(workspaces: Workspace[], initialSettings: ReviewSettings = s
   const deletedWorkspaceIds = new Set<string>();
   let savedSettings = structuredClone(initialSettings);
   const durableUiStates = new Map<string, Record<string, unknown>>();
-  const defaultUiState = { mode: 'unified', fullFileSide: 'new', scrollTop: 0, splitRatio: .5, rightTab: 'files' };
+  const defaultUiState = { mode: 'unified', fullFileSide: 'both', scrollTop: 0, splitRatio: .5, rightTab: 'files' };
   const calls = {
     drafts: [] as Array<Record<string, unknown>>,
     uiStates: [] as Array<{ workspaceId: string; state: Record<string, unknown> }>,
     sessionReads: [] as string[],
     presentationRequests: [] as ViewportRequest[],
+    locationRequests: [] as Array<{ fileId: string; mode: string; side: 'old' | 'new'; line: number }>,
     setupReads: [] as string[],
     inclusionWrites: [] as Array<{ workspaceId: string; repositoryIds: string[]; enabled: boolean }>,
     baselineWrites: [] as Array<{ workspaceId: string; defaultBase?: string; repositoryBases?: unknown[] }>,
@@ -156,6 +157,10 @@ function installApi(workspaces: Workspace[], initialSettings: ReviewSettings = s
         startRow: 0, endRow: 1, totalRows: 1, rows: [{ id: `${request.fileId}:1`, kind: 'context', oldLine: 1, newLine: 1, oldText: 'old', newText: 'new' }],
         hunks: [], oldTokens: [], newTokens: []
       };
+    },
+    resolvePresentationLocation: async (fileId: string, mode: string, side: 'old' | 'new', line: number) => {
+      calls.locationRequests.push({ fileId, mode, side, line });
+      return { rowIndex: Math.max(0, line - 1), side, line };
     },
     getOutline: async (fileId: string) => {
       calls.sessionReads.push(`outline:${fileId}`);
@@ -412,10 +417,11 @@ describe('App review-session persistence boundaries', () => {
         id: 'historical-gate',
         kind: 'deletion_gate',
         oldLine: 4,
-        oldEndLine: 5,
-        deletionBlockId: blockId,
-        deletionCount: 2,
-        deletionExpanded: expanded,
+        omittedEndLine: 5,
+        omittedBlockId: blockId,
+        omittedCount: 2,
+        omittedSide: 'old',
+        omittedExpanded: expanded,
         hasAnnotation: false
       };
       return {
@@ -428,7 +434,7 @@ describe('App review-session persistence boundaries', () => {
           ? [gate, { id: 'old-4', kind: 'deletion', oldLine: 4, oldText: 'removed four' }, { id: 'old-5', kind: 'deletion', oldLine: 5, oldText: 'removed five' }]
           : [gate],
         hunks: [{ id: 'historical-hunk', rowIndex: 0, oldLine: 4, header: '@@ -4,2 +4,0 @@' }],
-        deletionBlocks: [{ id: blockId, startLine: 4, endLine: 5, count: 2, expanded, rowIndex: 0 }],
+        omittedBlocks: [{ id: blockId, side: 'old', startLine: 4, endLine: 5, count: 2, expanded, rowIndex: 0 }],
         oldTokens: [],
         newTokens: [],
         highlightStatus: 'highlighted'
@@ -666,18 +672,20 @@ describe('App review-session persistence boundaries', () => {
     harness.state.implementation.loadReview = async (workspaceId: string) => {
       const loaded = await loadReview(workspaceId) as ReviewData;
       loaded.files[0].deletions = 3;
+      loaded.files[0].additions = 2;
       return loaded;
     };
     const getPresentationWindow = harness.state.implementation.getPresentationWindow;
     harness.state.implementation.getPresentationWindow = async (request: Record<string, unknown>) => {
       const result = await getPresentationWindow(request);
-      return request.mode === 'full' && request.fullFileSide !== 'old'
-        ? { ...result, totalRows: result.totalRows + 1, deletionBlocks: [{ id: 'removed-1', startLine: 2, endLine: 4, count: 3, expanded: false, rowIndex: 1 }] }
-        : result;
+      if (request.mode !== 'full') return result;
+      return request.fullFileSide === 'old'
+        ? { ...result, totalRows: result.totalRows + 1, rows: [{ id: 'added-gate', kind: 'addition_gate', newLine: 2, omittedEndLine: 3, omittedSide: 'new', omittedBlockId: 'added-1', omittedCount: 2 }], omittedBlocks: [{ id: 'added-1', side: 'new', startLine: 2, endLine: 3, count: 2, expanded: false, rowIndex: 1 }] }
+        : { ...result, totalRows: result.totalRows + 1, rows: [{ id: 'removed-gate', kind: 'deletion_gate', oldLine: 2, omittedEndLine: 4, omittedSide: 'old', omittedBlockId: 'removed-1', omittedCount: 3 }], omittedBlocks: [{ id: 'removed-1', side: 'old', startLine: 2, endLine: 4, count: 3, expanded: false, rowIndex: 1 }] };
     };
     const readUiState = harness.state.implementation.getWorkspaceUiState;
     harness.state.implementation.getWorkspaceUiState = async (workspaceId: string) => ({
-      ...(await readUiState(workspaceId)), nearestSourceLine: 80, nearestSourceSide: 'new', scrollTop: 1800
+      ...(await readUiState(workspaceId)), fullFileSide: 'new', nearestSourceLine: 80, nearestSourceSide: 'new', scrollTop: 1800
     });
     components.push(mount(App, { target: target() }));
     await settle(5);
@@ -695,8 +703,86 @@ describe('App review-session persistence boundaries', () => {
     document.querySelector<HTMLButtonElement>('[aria-label="Full-file source side"] button:last-child')?.click();
     await settle(5);
 
-    expect(calls.presentationRequests.at(-1)).toMatchObject({ mode: 'full', fullFileSide: 'old' });
-    expect(document.querySelector('.full-file-extent')?.textContent).toContain('3 removed lines highlighted');
+    expect(calls.presentationRequests.some((request) => request.mode === 'full' && request.fullFileSide === 'old')).toBe(true);
+    expect(calls.locationRequests.at(-1)).toMatchObject({ mode: 'full', side: 'old', line: 3 });
+    expect(document.querySelector('.full-file-extent')?.textContent).toContain('2 added lines in 1 block');
+  });
+
+  it('defaults Full File to Both and exposes independent addition and deletion disclosure controls', async () => {
+    const local = workspace('workspace-localreview', 'LocalReview');
+    const calls = installApi([local]);
+    const getPresentationWindow = harness.state.implementation.getPresentationWindow;
+    harness.state.implementation.getPresentationWindow = async (request: ViewportRequest) => {
+      const result = await getPresentationWindow(request);
+      if (request.mode !== 'full') return result;
+      const deletionExpanded = (request.ephemeralExpandedFullFileDeletionBlocks ?? []).includes('removed-1');
+      const additionExpanded = !(request.ephemeralCollapsedFullFileAdditionBlocks ?? []).includes('added-1');
+      const rows = [
+        { id: 'removed-gate', kind: 'deletion_gate', oldLine: 4, omittedEndLine: 5, omittedSide: 'old', omittedBlockId: 'removed-1', omittedCount: 2, omittedExpanded: deletionExpanded },
+        ...(deletionExpanded ? [
+          { id: 'removed-4', kind: 'deletion', oldLine: 4, oldText: 'const previous = false;' },
+          { id: 'removed-5', kind: 'deletion', oldLine: 5, oldText: 'return previous;' }
+        ] : []),
+        { id: 'added-gate', kind: 'addition_gate', newLine: 4, omittedEndLine: 6, omittedSide: 'new', omittedBlockId: 'added-1', omittedCount: 3, omittedExpanded: additionExpanded },
+        ...(additionExpanded ? [
+          { id: 'added-4', kind: 'addition', newLine: 4, newText: 'const replacement = true;' }
+        ] : [])
+      ];
+      return {
+        ...result,
+        totalRows: rows.length,
+        rows,
+        omittedBlocks: [
+          { id: 'removed-1', side: 'old', startLine: 4, endLine: 5, count: 2, expanded: deletionExpanded, rowIndex: 0 },
+          { id: 'added-1', side: 'new', startLine: 4, endLine: 6, count: 3, expanded: additionExpanded, rowIndex: deletionExpanded ? 3 : 1 }
+        ]
+      };
+    };
+    components.push(mount(App, { target: target() }));
+    await settle(5);
+
+    [...document.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
+      .find((button) => button.textContent === 'Full File')?.click();
+    await settle(6);
+
+    expect(calls.presentationRequests.at(-1)).toMatchObject({ mode: 'full', fullFileSide: 'both' });
+    expect(document.querySelector<HTMLButtonElement>('[aria-label="Full-file source side"] button[aria-pressed="true"]')?.textContent).toBe('Both');
+    const additionControls = document.querySelector('[aria-label="Full-file addition blocks"]');
+    const deletionControls = document.querySelector('[aria-label="Full-file deletion blocks"]');
+    expect(additionControls?.textContent).toContain('Show all additions');
+    expect(additionControls?.textContent).toContain('Hide all additions');
+    expect(deletionControls?.textContent).toContain('Show all deletions');
+    expect(deletionControls?.textContent).toContain('Hide all deletions');
+
+    const savesBeforeDisclosure = calls.uiStates.length;
+    [...additionControls!.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent === 'Hide all additions')?.click();
+    await settle(4);
+    expect(calls.presentationRequests.at(-1)?.ephemeralCollapsedFullFileAdditionBlocks).toEqual(['added-1']);
+    expect(document.querySelector<HTMLButtonElement>('.addition-gate-toggle')?.ariaExpanded).toBe('false');
+    expect(calls.uiStates).toHaveLength(savesBeforeDisclosure);
+
+    [...deletionControls!.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent === 'Show all deletions')?.click();
+    await settle(4);
+    expect(calls.presentationRequests.at(-1)?.ephemeralExpandedFullFileDeletionBlocks).toEqual(['removed-1']);
+    expect(calls.presentationRequests.at(-1)?.ephemeralCollapsedFullFileAdditionBlocks).toEqual(['added-1']);
+
+    // A bulk show followed by an individual collapse must use the current
+    // in-memory state, even though the durable write remains debounced.
+    [...additionControls!.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent === 'Show all additions')?.click();
+    await settle(4);
+    expect(document.querySelector<HTMLButtonElement>('.addition-gate-toggle')?.ariaExpanded).toBe('true');
+    document.querySelector<HTMLButtonElement>('.addition-gate-toggle')?.click();
+    await settle(4);
+    expect(calls.presentationRequests.at(-1)?.ephemeralCollapsedFullFileAdditionBlocks).toEqual(['added-1']);
+    expect(document.querySelector<HTMLButtonElement>('.addition-gate-toggle')?.ariaExpanded).toBe('false');
+
+    await new Promise((resolve) => window.setTimeout(resolve, 140));
+    await settle();
+    expect(calls.uiStates.at(-1)?.state.expandedFullFileDeletionBlocks).toContain('removed-1');
+    expect(calls.uiStates.at(-1)?.state.collapsedFullFileAdditionBlocks).toContain('added-1');
   });
 
   it('shows a deleted file only as a clearly labelled base snapshot', async () => {
@@ -807,7 +893,7 @@ describe('App review-session persistence boundaries', () => {
     expect(viewport.scrollTop).toBe(13_800);
     await new Promise((resolve) => window.setTimeout(resolve, 160));
     await settle(3);
-    expect(calls.uiStates.some((call) => call.state.mode === 'full' && call.state.fullFileSide === 'new' && call.state.nearestSourceLine === 651 && call.state.nearestSourceSide === 'old' && call.state.scrollTop === 13_800)).toBe(true);
+    expect(calls.uiStates.some((call) => call.state.mode === 'full' && call.state.fullFileSide === 'both' && call.state.nearestSourceLine === 651 && call.state.nearestSourceSide === 'old' && call.state.scrollTop === 13_800)).toBe(true);
 
     document.querySelector<HTMLButtonElement>('[aria-label="Full-file source side"] button:last-child')?.click();
     await settle(5);

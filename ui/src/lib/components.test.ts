@@ -365,30 +365,31 @@ describe('review components', () => {
       target: host,
       props: {
         rows: [{
-          id: 'gate-4-8', kind: 'deletion_gate', oldLine: 4, oldEndLine: 8,
-          deletionBlockId: 'block-4-8', deletionCount: 5, text: '5 deleted lines', hasAnnotation: true
+          id: 'gate-4-8', kind: 'deletion_gate', oldLine: 4, omittedEndLine: 8, omittedSide: 'old',
+          omittedBlockId: 'block-4-8', omittedCount: 5, text: '5 deleted lines', hasAnnotation: true
         }],
         totalRows: 1,
         mode: 'full',
         fullFileSide: 'new',
         wrapLines: true,
-        onToggleDeletionBlock: (id: string) => toggles.push(id)
+        onToggleOmittedBlock: (id: string) => toggles.push(id)
       }
     });
     await settle();
 
     const gate = host.querySelector<HTMLElement>('.deletion-gate-row')!;
+    expect(component.viewportAnchor()).toEqual({ side: 'old', line: 6, viewportOffset: 0 });
     expect(gate.getAttribute('aria-label')).toContain('5 deleted Base lines, lines 4–8, collapsed');
     expect(gate.getAttribute('aria-label')).toContain('Contains annotations');
     const toggle = gate.querySelector<HTMLButtonElement>('.deletion-gate-toggle')!;
     expect(toggle.textContent).toContain('› 5 deleted lines · Base 4–8 · annotations hidden');
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
     const appCss = readFileSync('src/app.css', 'utf8');
-    const gateColumns = appCss.match(/^\.diff-row\.deletion-gate-row\s*\{[^}]+\}/gm)?.at(-1) ?? '';
+    const gateColumns = appCss.match(/^\.diff-row\.deletion-gate-row,\s*\.diff-row\.addition-gate-row\s*\{[^}]+\}/gm)?.at(-1) ?? '';
     expect(gateColumns).toContain('minmax(0, 1fr)');
-    const wrappedGate = appCss.match(/\.diff-viewport\.wrap-lines \.diff-row\.deletion-gate-row\s*\{[^}]+\}/g)?.at(-1) ?? '';
+    const wrappedGate = appCss.match(/\.diff-viewport\.wrap-lines \.diff-row\.deletion-gate-row,\s*\.diff-viewport\.wrap-lines \.diff-row\.addition-gate-row\s*\{[^}]+\}/g)?.at(-1) ?? '';
     expect(wrappedGate).toContain('white-space: nowrap');
-    const wrappedToggle = appCss.match(/\.diff-viewport\.wrap-lines \.deletion-gate-toggle\s*\{[^}]+\}/g)?.at(-1) ?? '';
+    const wrappedToggle = appCss.match(/\.diff-viewport\.wrap-lines \.deletion-gate-toggle,\s*\.diff-viewport\.wrap-lines \.addition-gate-toggle\s*\{[^}]+\}/g)?.at(-1) ?? '';
     expect(wrappedToggle).toContain('min-width: 0');
     expect(wrappedToggle).toContain('overflow: hidden');
     expect(wrappedToggle).toContain('text-overflow: ellipsis');
@@ -404,14 +405,14 @@ describe('review components', () => {
       target: host,
       props: {
         rows: [{
-          id: 'gate-4-8', kind: 'deletion_gate', oldLine: 4, oldEndLine: 8,
-          deletionBlockId: 'block-4-8', deletionCount: 5, deletionExpanded: true,
+          id: 'gate-4-8', kind: 'deletion_gate', oldLine: 4, omittedEndLine: 8, omittedSide: 'old',
+          omittedBlockId: 'block-4-8', omittedCount: 5, omittedExpanded: true,
           text: '5 deleted lines'
         }],
         totalRows: 1,
         mode: 'full',
         fullFileSide: 'new',
-        onToggleDeletionBlock: (id: string) => toggles.push(id)
+        onToggleOmittedBlock: (id: string) => toggles.push(id)
       }
     });
     await settle();
@@ -625,6 +626,34 @@ describe('review components', () => {
     unmount(component);
   });
 
+  it('renders Base-view additions as symmetric multi-line disclosure gates', async () => {
+    const toggles: string[] = [];
+    const host = target();
+    const component = mount(VirtualDiff, {
+      target: host,
+      props: {
+        rows: [{
+          id: 'gate-20-22', kind: 'addition_gate', newLine: 20, omittedEndLine: 22, omittedSide: 'new',
+          omittedBlockId: 'block-20-22', omittedCount: 3, text: '3 added lines'
+        }],
+        totalRows: 1,
+        mode: 'full',
+        fullFileSide: 'old',
+        onToggleOmittedBlock: (id: string) => toggles.push(id)
+      }
+    });
+    await settle();
+
+    const gate = host.querySelector<HTMLElement>('.addition-gate-row')!;
+    expect(gate.getAttribute('aria-label')).toContain('3 added Current lines, lines 20–22, collapsed');
+    expect(component.viewportAnchor()).toEqual({ side: 'new', line: 21, viewportOffset: 0 });
+    const toggle = gate.querySelector<HTMLButtonElement>('.addition-gate-toggle')!;
+    expect(toggle.textContent).toContain('› 3 added lines · Current 20–22');
+    toggle.click();
+    expect(toggles).toEqual(['block-20-22']);
+    unmount(component);
+  });
+
   it('exposes complete row context to assistive technology without rendering every changed file', async () => {
     const rows: DiffRow[] = [{ id: 'new-8', kind: 'addition', newLine: 8, newText: 'after eight' }];
     let component = mount(VirtualDiff, {
@@ -641,7 +670,7 @@ describe('review components', () => {
       additions: index, deletions: 0, hunkCount: 0, language: 'TypeScript', viewed: false, annotationCount: 0
     }));
     const fileTarget = target();
-    component = mount(VirtualFileList, {
+    const fileComponent = mount(VirtualFileList, {
       target: fileTarget,
       props: {
         files,
@@ -654,7 +683,7 @@ describe('review components', () => {
     expect(fileTarget.querySelectorAll('.file-row').length).toBeLessThan(40);
     expect(fileTarget.querySelectorAll('.file-row[role=treeitem]').length).toBeGreaterThan(0);
     expect(fileTarget.querySelector('.file-row .file-select')?.getAttribute('aria-label')).toContain('src/0.ts, API, modified');
-    unmount(component);
+    unmount(fileComponent);
   });
 
   it('moves focus into a dialog and restores the launcher after Escape', async () => {

@@ -495,7 +495,12 @@ Invariants:
 
 ### 13.3 Full File
 
-- Shows the complete current file with changed new-side lines highlighted.
+- Shows the complete selected side: Current shows the complete new file and Base shows the complete baseline file.
+- Defaults to a review-oriented Both projection that keeps complete file context while representing each changed-side block independently.
+- In Both, Current additions are expanded by default and Base deletions are collapsed by default. Separate show/hide-all controls exist for additions and deletions, and every block retains its own chevron.
+- Current represents baseline-only deletions as inline, collapsible red gates; Base represents current-only additions as inline, collapsible green gates.
+- Each gate labels the omitted side and full line range, supports individual expansion, and participates in global show/hide-all controls.
+- Switching Current and Base preserves the closest canonical line at the same viewport offset. Multi-line gates anchor at their midpoint so either version stays visually aligned around the block being inspected.
 - Deleted files show the complete baseline file and a clear deleted-file banner.
 - Renames display old and new paths.
 - A side toggle is available when viewing both versions is meaningful.
@@ -1021,7 +1026,7 @@ Errors include a human explanation, affected scope, retry action, and diagnostic
 - Split alignment for 1:1, 1:N, N:1, addition-only, and deletion-only changes.
 - Stable hunk and row identity across equivalent refreshes.
 - Repeated-line and missing-final-newline behavior.
-- Full File deletion and rename behavior.
+- Full File symmetric addition/deletion gates, multi-line midpoint alignment, side switching, and rename behavior.
 - Annotation anchor creation and re-anchoring.
 - Outdated and ambiguous anchors.
 

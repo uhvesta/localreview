@@ -57,7 +57,10 @@
   let viewportGeneration = 0;
   let jumpToRow: number | undefined;
   let jumpGeneration = 0;
-  let fullFileSide: FullFileSide = 'new';
+  let jumpViewportOffset: number | undefined;
+  let virtualDiff: { viewportAnchor: () => { side: DiffSide; line: number; viewportOffset: number } | undefined } | undefined;
+  let fullFileSide: FullFileSide = 'both';
+  let fullFilePrimarySide: DiffSide = 'new';
   let splitRatio = .5;
   let nearestSourceLine: number | undefined;
   let nearestSourceSide: DiffSide | undefined;
@@ -172,6 +175,7 @@
   let undoCheckpoint: { annotations: Annotation[]; files: ReviewData['files'] } | undefined;
   let selectedAnnotationIds = new Set<string>();
   let expandedFullFileDeletionBlocks = new Set<string>();
+  let collapsedFullFileAdditionBlocks = new Set<string>();
   let activeAnnotationId: string | undefined;
   let editingAnnotationId: string | undefined;
   let showCommandPalette = false;
@@ -199,7 +203,7 @@
   // twice from the first result instead of racing two stale file snapshots.
   let hunkNavigationChain: Promise<void> = Promise.resolve();
   let pendingHunkNavigationCount = 0;
-  let queuedHunkCursor: { fileId: string; line: number; side: DiffSide; mode: DiffMode; fullFileSide: DiffSide } | undefined;
+  let queuedHunkCursor: { fileId: string; line: number; side: DiffSide; mode: DiffMode; fullFileSide: FullFileSide } | undefined;
   let settingsRevision = 0;
   let finishPreviewGeneration = 0;
   const commandItems: Array<{ label: string; shortcut: string; run: () => void }> = [
@@ -232,14 +236,22 @@
   // A deleted file has no current-side source. Keep the user's persisted side
   // preference for the next file, but never ask the renderer to label the
   // controller's old-side fallback as "Current".
-  $: fullFileDisplaySide = activeFile?.status === 'deleted' ? 'old' : fullFileSide;
+  $: fullFileDisplaySide = activeFile?.status === 'deleted'
+    ? 'old'
+    : activeFile?.status === 'added' || activeFile?.status === 'untracked'
+      ? 'new'
+      : fullFileSide;
+  $: fullFilePrimarySide = fullFileDisplaySide === 'old' ? 'old' : 'new';
   $: fullFileExtent = formatFullFileExtent(
     fullFileDisplaySide,
     presentation?.mode === 'full' ? presentation.totalRows : undefined,
     activeFile?.status,
     activeFile?.deletions ?? 0,
-    presentation?.deletionBlocks ?? []
+    activeFile?.additions ?? 0,
+    presentation?.omittedBlocks ?? []
   );
+  $: fullFileAdditionBlocks = (presentation?.omittedBlocks ?? []).filter((block) => block.side === 'new');
+  $: fullFileDeletionBlocks = (presentation?.omittedBlocks ?? []).filter((block) => block.side === 'old');
   $: shownFiles = sortFiles((review?.files ?? []).filter((file) =>
     (repositoryFilter === 'all' || file.repositoryId === repositoryFilter) &&
     (viewedFilter === 'all' || (viewedFilter === 'viewed' ? file.viewed : !file.viewed)) &&
@@ -319,6 +331,10 @@
     return Boolean(annotation.fileId && annotation.startLine > 0 && annotation.endLine >= annotation.startLine);
   }
 
+  function safeScrollTop(value: number) {
+    return Number.isFinite(value) ? Math.max(0, Math.min(100_000_000, value)) : 0;
+  }
+
   function fuzzyMatch(value: string, query: string) {
     const needle = query.trim().toLowerCase();
     if (!needle) return true;
@@ -332,16 +348,22 @@
     return true;
   }
 
-  function formatFullFileExtent(side: FullFileSide, total: number | undefined, status: ReviewData['files'][number]['status'] | undefined, removed: number, blocks: NonNullable<DiffPresentationWindow['deletionBlocks']>) {
-    // Every deletion block retains one inline gate at its Current-file
-    // anchor; expanded blocks additionally contribute their Base rows.
-    const visibleDeletionRows = blocks.reduce((sum, block) => sum + 1 + (block.expanded ? block.count : 0), 0);
-    const sourceTotal = side === 'new' && total !== undefined ? Math.max(0, total - visibleDeletionRows) : total;
-    const extent = `Entire ${side === 'old' ? 'base' : 'current'} file · ${sourceTotal === undefined ? '…' : sourceTotal.toLocaleString()} ${sourceTotal === 1 ? 'line' : 'lines'}`;
+  function formatFullFileExtent(side: FullFileSide, total: number | undefined, status: ReviewData['files'][number]['status'] | undefined, removed: number, added: number, blocks: NonNullable<DiffPresentationWindow['omittedBlocks']>) {
+    // Each opposite-side block retains one inline gate; expanded gates add
+    // their omitted source rows without changing the complete-file count.
+    const visibleOmittedRows = blocks.reduce((sum, block) => sum + 1 + (block.expanded ? block.count : 0), 0);
+    const sourceTotal = total === undefined ? undefined : Math.max(0, total - visibleOmittedRows);
+    const sourceLabel = side === 'old' ? 'base file' : side === 'new' ? 'current file' : 'file context';
+    const extent = `Entire ${sourceLabel} · ${sourceTotal === undefined ? '…' : sourceTotal.toLocaleString()} ${sourceTotal === 1 ? 'line' : 'lines'}`;
     if (status === 'deleted') return `${extent} · file deleted; Current has no content`;
-    if (!removed) return extent;
-    const lines = `${removed.toLocaleString()} removed ${removed === 1 ? 'line' : 'lines'}`;
-    return `${extent} · ${side === 'old' ? `${lines} highlighted` : `${lines} in ${blocks.length.toLocaleString()} ${blocks.length === 1 ? 'block' : 'blocks'}`}`;
+    if (side === 'both') {
+      return `${extent} · ${added.toLocaleString()} added and ${removed.toLocaleString()} removed lines in ${blocks.length.toLocaleString()} ${blocks.length === 1 ? 'block' : 'blocks'}`;
+    }
+    const omitted = side === 'old' ? added : removed;
+    if (!omitted) return extent;
+    const action = side === 'old' ? 'added' : 'removed';
+    const lines = `${omitted.toLocaleString()} ${action} ${omitted === 1 ? 'line' : 'lines'}`;
+    return `${extent} · ${lines} in ${blocks.length.toLocaleString()} ${blocks.length === 1 ? 'block' : 'blocks'}`;
   }
 
   function classificationMatches(file: ReviewData['files'][number], filter: Exclude<FileClassificationFilter, 'all'>) {
@@ -543,6 +565,7 @@
       activeSelection = undefined;
       selectedAnnotationIds = new Set();
       expandedFullFileDeletionBlocks = new Set();
+      collapsedFullFileAdditionBlocks = new Set();
       prompt = undefined;
       promptHistoryId = undefined;
       showCopyMenu = false;
@@ -590,7 +613,7 @@
       const state = await api.getWorkspaceUiState(id);
       if (selectionGeneration !== workspaceSelectionGeneration || review?.workspace.id !== id) return;
       mode = state.mode ?? 'unified';
-      fullFileSide = state.fullFileSide ?? 'new';
+      fullFileSide = state.fullFileSide ?? 'both';
       splitRatio = state.splitRatio ?? .5;
       await hydrateRightPanelTab(state.rightTab ?? 'files', false);
       nearestSourceLine = state.nearestSourceLine;
@@ -602,6 +625,7 @@
         ? selectableAnnotationIds
         : new Set(state.selectedAnnotationIds.filter((id) => selectableAnnotationIds.has(id)));
       expandedFullFileDeletionBlocks = new Set(state.expandedFullFileDeletionBlocks ?? []);
+      collapsedFullFileAdditionBlocks = new Set(state.collapsedFullFileAdditionBlocks ?? []);
       repositoryFilter = 'all';
       fileSearch = '';
       try {
@@ -731,9 +755,9 @@
     }
   }
 
-  async function loadPresentation(startRow = 0, endRow = 220) {
+  async function loadPresentation(startRow = 0, endRow = 220, quiet = false) {
     if (!activeFileId) return;
-    busy = true;
+    if (!quiet) busy = true;
     const generation = ++viewportGeneration;
     try {
       const next = await api.getPresentationWindow({
@@ -745,15 +769,23 @@
         generation,
         fullFileSide: fullFileDisplaySide,
         splitRatio,
-        ephemeralExpandedFullFileDeletionBlocks: review?.historical && mode === 'full'
+        // Full-file disclosure is presentation state. Send the current
+        // in-memory snapshot on every request so rendering never waits for,
+        // or races with, the debounced durable UI-state write.
+        ephemeralExpandedFullFileDeletionBlocks: mode === 'full'
           ? [...expandedFullFileDeletionBlocks]
+          : undefined,
+        ephemeralCollapsedFullFileAdditionBlocks: mode === 'full'
+          ? [...collapsedFullFileAdditionBlocks]
           : undefined
       });
       if (next.generation !== viewportGeneration || next.fileId !== activeFileId || next.mode !== mode) return;
       presentation = next;
       rows = next.rows;
     }
-    finally { busy = false; }
+    finally {
+      if (!quiet) busy = false;
+    }
   }
 
   async function selectFile(fileId: string) {
@@ -880,9 +912,10 @@
     if (!review || review.historical || review.workspace.reviewReady === false) return undefined;
     const state: WorkspaceUiState = {
       mode, fullFileSide, nearestSourceLine, nearestSourceSide,
-      scrollTop: restoredScrollTop, splitRatio, rightTab,
+      scrollTop: safeScrollTop(restoredScrollTop), splitRatio, rightTab,
       selectedAnnotationIds: [...selectedAnnotationIds],
       expandedFullFileDeletionBlocks: [...expandedFullFileDeletionBlocks],
+      collapsedFullFileAdditionBlocks: [...collapsedFullFileAdditionBlocks],
       ...partial
     };
     if (activeFileId) state.activeFileId = activeFileId;
@@ -1516,8 +1549,9 @@
     const index = list.findIndex((file) => file.id === activeFileId);
     if (list.length) void selectFile(list[index < 0 ? list.length - 1 : (index - 1 + list.length) % list.length].id);
   }
-  function requestRowJump(rowIndex: number) {
+  function requestRowJump(rowIndex: number, viewportOffset?: number) {
     jumpToRow = rowIndex;
+    jumpViewportOffset = viewportOffset;
     // The row can be the same after wrapping (or when a file has one hunk).
     // Keep each explicit navigation as a distinct request so the viewport is
     // re-centered even if the reviewer scrolled away in between clicks.
@@ -1554,7 +1588,9 @@
     const originFullFileSide = fullFileDisplaySide;
     const navigationContextChanged = () => mode !== originMode
       || (originMode === 'full' && fullFileDisplaySide !== originFullFileSide);
-    const originSide: DiffSide = originMode === 'full' ? originFullFileSide : 'new';
+    const originSide: DiffSide = originMode === 'full'
+      ? (originFullFileSide === 'old' ? 'old' : 'new')
+      : 'new';
     const locations = await hunkLocationsFor(originFileId, originSide);
     // A direct file selection that happened during the native read owns the
     // visible state; do not pull the reviewer back to an obsolete origin.
@@ -1591,7 +1627,7 @@
       if (candidate.id !== activeFileId) await selectFile(candidate.id);
       if (activeFileId !== candidate.id || navigationContextChanged()) return;
       const candidateSide: DiffSide = originMode === 'full'
-        ? (candidate.status === 'deleted' ? 'old' : fullFileSide)
+        ? (candidate.status === 'deleted' ? 'old' : 'new')
         : 'new';
       const candidateHunks = await hunkLocationsFor(candidate.id, candidateSide);
       if (activeFileId !== candidate.id || navigationContextChanged()) return;
@@ -1619,8 +1655,11 @@
       generation,
       fullFileSide: side,
       splitRatio,
-      ephemeralExpandedFullFileDeletionBlocks: review?.historical && locationMode === 'full'
+      ephemeralExpandedFullFileDeletionBlocks: locationMode === 'full'
         ? [...expandedFullFileDeletionBlocks]
+        : undefined,
+      ephemeralCollapsedFullFileAdditionBlocks: locationMode === 'full'
+        ? [...collapsedFullFileAdditionBlocks]
         : undefined
     });
     return result.fileId === fileId ? result.hunks : [];
@@ -1658,7 +1697,7 @@
     requestRowJump(hunk.rowIndex);
     // Persist a safe restart anchor immediately; VirtualDiff follows with its
     // exact centered scroll position after applying the row jump.
-    restoredScrollTop = Math.max(0, hunk.rowIndex * Math.round(20 * settings.fontScale));
+    restoredScrollTop = safeScrollTop(hunk.rowIndex * Math.round(20 * settings.fontScale));
     void persistWorkspaceUiStateNow({
       activeFileId,
       nearestSourceLine: line,
@@ -1673,7 +1712,7 @@
     requestRowJump(hunk.rowIndex);
     activeLine = line ?? activeLine;
     nearestSourceLine = activeLine;
-    nearestSourceSide = fullFileDisplaySide;
+    nearestSourceSide = fullFilePrimarySide;
     persistWorkspaceUiState({ nearestSourceLine, nearestSourceSide });
   }
   async function navigateAnnotation(direction: 1 | -1) {
@@ -1699,8 +1738,8 @@
   function saveLocation(location: { line?: number; side?: DiffSide; scrollTop: number }) {
     nearestSourceLine = location.line ?? nearestSourceLine;
     nearestSourceSide = location.side ?? nearestSourceSide;
-    restoredScrollTop = location.scrollTop;
-    persistWorkspaceUiState({ nearestSourceLine, nearestSourceSide, scrollTop: location.scrollTop });
+    restoredScrollTop = safeScrollTop(location.scrollTop);
+    persistWorkspaceUiState({ nearestSourceLine, nearestSourceSide, scrollTop: restoredScrollTop });
   }
   function updateSplitRatio(value: number) {
     splitRatio = value;
@@ -1708,46 +1747,80 @@
   }
   async function loadOutline() {
     if (!activeFileId) { outline = []; return; }
-    try { outline = await api.getOutline(activeFileId, fullFileDisplaySide, activeFile?.comparisonId); }
+    try { outline = await api.getOutline(activeFileId, fullFilePrimarySide, activeFile?.comparisonId); }
     catch { outline = []; }
   }
   async function setFullFileSide(side: FullFileSide) {
+    if (side === fullFileSide) return;
+    const anchor = virtualDiff?.viewportAnchor()
+      ?? (nearestSourceLine ? {
+        side: nearestSourceSide ?? fullFilePrimarySide,
+        line: nearestSourceLine,
+        viewportOffset: undefined
+      } : undefined);
     fullFileSide = side;
     // Persist this discrete presentation choice before loading the selected
-    // side and its outline for the same shutdown-safety guarantee as mode.
+    // side so native source alignment resolves against the target projection.
     await persistWorkspaceUiStateNow({ fullFileSide: side });
-    await loadPresentation(presentation?.startRow ?? 0, (presentation?.startRow ?? 0) + 220);
+    if (anchor && activeFileId) {
+      await jumpToSource(activeFileId, anchor.side, anchor.line, 'full', anchor.viewportOffset);
+    } else {
+      await loadPresentation(presentation?.startRow ?? 0, (presentation?.startRow ?? 0) + 220);
+    }
     await loadOutline();
   }
-  async function updateFullFileDeletionBlocks(next: Set<string>) {
-    expandedFullFileDeletionBlocks = next;
-    // A frozen review remains semantically immutable, but its disclosure
-    // controls are still useful for inspection. Historical expansion is sent
-    // only with the next presentation read and is never written into either
-    // the active or archived session UI-state record.
+  async function updateFullFileOmittedBlocks(expanded: Set<string>, collapsedAdditions: Set<string>) {
+    expandedFullFileDeletionBlocks = expanded;
+    collapsedFullFileAdditionBlocks = collapsedAdditions;
+    // Disclosure is interactive presentation state: redraw from the exact
+    // in-memory snapshot immediately and persist active reviews in the
+    // background. Waiting for SQLite here made each chevron feel stuck and
+    // let rapid bulk/individual clicks reason from an older presentation.
     if (!review?.historical) {
-      await persistWorkspaceUiStateNow({ expandedFullFileDeletionBlocks: [...next] });
+      persistWorkspaceUiState({
+        expandedFullFileDeletionBlocks: [...expanded],
+        collapsedFullFileAdditionBlocks: [...collapsedAdditions]
+      });
     }
-    await loadPresentation(presentation?.startRow ?? 0, (presentation?.startRow ?? 0) + 220);
+    await loadPresentation(presentation?.startRow ?? 0, (presentation?.startRow ?? 0) + 220, true);
   }
-  async function toggleFullFileDeletionBlock(blockId: string) {
-    const next = new Set(expandedFullFileDeletionBlocks);
-    if (next.has(blockId)) next.delete(blockId);
-    else next.add(blockId);
-    await updateFullFileDeletionBlocks(next);
+  async function toggleFullFileOmittedBlock(blockId: string) {
+    const block = presentation?.omittedBlocks?.find((candidate) => candidate.id === blockId);
+    if (!block) return;
+    const expanded = new Set(expandedFullFileDeletionBlocks);
+    const collapsedAdditions = new Set(collapsedFullFileAdditionBlocks);
+    if (fullFileDisplaySide === 'both' && block.side === 'new') {
+      const isExpanded = !collapsedFullFileAdditionBlocks.has(blockId);
+      if (isExpanded) collapsedAdditions.add(blockId);
+      else collapsedAdditions.delete(blockId);
+    } else {
+      const isExpanded = expandedFullFileDeletionBlocks.has(blockId);
+      if (isExpanded) expanded.delete(blockId);
+      else expanded.add(blockId);
+    }
+    await updateFullFileOmittedBlocks(expanded, collapsedAdditions);
   }
-  async function showAllFullFileDeletions() {
-    const next = new Set(expandedFullFileDeletionBlocks);
-    for (const block of presentation?.deletionBlocks ?? []) next.add(block.id);
-    await updateFullFileDeletionBlocks(next);
+  async function showAllFullFileOmittedBlocks(side?: DiffSide) {
+    const expanded = new Set(expandedFullFileDeletionBlocks);
+    const collapsedAdditions = new Set(collapsedFullFileAdditionBlocks);
+    for (const block of presentation?.omittedBlocks ?? []) {
+      if (side && block.side !== side) continue;
+      if (fullFileDisplaySide === 'both' && block.side === 'new') collapsedAdditions.delete(block.id);
+      else expanded.add(block.id);
+    }
+    await updateFullFileOmittedBlocks(expanded, collapsedAdditions);
   }
-  async function hideAllFullFileDeletions() {
-    const active = new Set((presentation?.deletionBlocks ?? []).map((block) => block.id));
-    await updateFullFileDeletionBlocks(new Set(
-      [...expandedFullFileDeletionBlocks].filter((id) => !active.has(id))
-    ));
+  async function hideAllFullFileOmittedBlocks(side?: DiffSide) {
+    const expanded = new Set(expandedFullFileDeletionBlocks);
+    const collapsedAdditions = new Set(collapsedFullFileAdditionBlocks);
+    for (const block of presentation?.omittedBlocks ?? []) {
+      if (side && block.side !== side) continue;
+      expanded.delete(block.id);
+      if (fullFileDisplaySide === 'both' && block.side === 'new') collapsedAdditions.add(block.id);
+    }
+    await updateFullFileOmittedBlocks(expanded, collapsedAdditions);
   }
-  async function jumpToSource(fileId: string, side: DiffSide, line: number, targetMode: DiffMode = mode) {
+  async function jumpToSource(fileId: string, side: DiffSide, line: number, targetMode: DiffMode = mode, viewportOffset?: number) {
     activeFileId = fileId;
     activeLine = line;
     nearestSourceLine = line;
@@ -1755,8 +1828,8 @@
     try {
       const location = await api.resolvePresentationLocation(fileId, targetMode, side, line, review?.files.find((file) => file.id === fileId)?.comparisonId);
       await loadPresentation(Math.max(0, location.rowIndex - 100), location.rowIndex + 120);
-      requestRowJump(location.rowIndex);
-      restoredScrollTop = Math.max(0, location.rowIndex * Math.round(20 * settings.fontScale));
+      requestRowJump(location.rowIndex, viewportOffset);
+      restoredScrollTop = safeScrollTop(location.rowIndex * Math.round(20 * settings.fontScale) - (viewportOffset ?? 0));
       persistWorkspaceUiState({ activeFileId: fileId, nearestSourceLine: line, nearestSourceSide: side, scrollTop: restoredScrollTop });
     } catch (error) {
       statusMessage = `Could not locate the captured source line: ${error instanceof Error ? error.message : 'native location command failed'}`;
@@ -1968,7 +2041,7 @@
           fullFileSide: targetSide,
           splitRatio
         }),
-        api.getOutline(target.file.id, targetSide, target.file.comparisonId).catch(() => [] as OutlineSymbol[])
+        api.getOutline(target.file.id, targetSide === 'old' ? 'old' : 'new', target.file.comparisonId).catch(() => [] as OutlineSymbol[])
       ]);
       if (!refreshStateMatches(workspaceId, operationId) || workspaceSelectionGeneration !== selectionGeneration || review?.workspace.id !== workspaceId) return undefined;
       if (generation !== viewportGeneration || signature !== refreshNavigationSignature()) continue;
@@ -2087,6 +2160,7 @@
       rows = preparedDisplay.rows;
       outline = preparedDisplay.outline;
       expandedFullFileDeletionBlocks = new Set(refreshedState.expandedFullFileDeletionBlocks ?? []);
+      collapsedFullFileAdditionBlocks = new Set(refreshedState.collapsedFullFileAdditionBlocks ?? []);
       changedSincePrevious = undefined;
       changedSincePreviousOnly = false;
       composer = undefined;
@@ -2146,7 +2220,7 @@
       prompt = undefined;
       promptHistoryId = undefined;
       mode = state.mode ?? 'unified';
-      fullFileSide = state.fullFileSide ?? 'new';
+      fullFileSide = state.fullFileSide ?? 'both';
       splitRatio = state.splitRatio ?? .5;
       await hydrateRightPanelTab(state.rightTab ?? 'files', false);
       nearestSourceLine = state.nearestSourceLine;
@@ -2158,6 +2232,7 @@
         ? selectableAnnotationIds
         : new Set(state.selectedAnnotationIds.filter((id) => selectableAnnotationIds.has(id)));
       expandedFullFileDeletionBlocks = new Set(state.expandedFullFileDeletionBlocks ?? []);
+      collapsedFullFileAdditionBlocks = new Set(state.collapsedFullFileAdditionBlocks ?? []);
       await loadPresentation(0, 220);
       await loadOutline();
       showNewReview = false;
@@ -2595,8 +2670,9 @@
       activeFileId = snapshot.files[0]?.id ?? '';
       selectedAnnotationIds = new Set();
       expandedFullFileDeletionBlocks = new Set();
+      collapsedFullFileAdditionBlocks = new Set();
       mode = 'unified';
-      fullFileSide = 'new';
+      fullFileSide = 'both';
       await loadPresentation(0, 220);
       await loadOutline();
       showHistory = false;
@@ -2688,7 +2764,39 @@
           <button role="tab" aria-selected={mode === item.id} class:active={mode === item.id} on:click={() => setMode(item.id)}>{item.label}</button>
         {/each}
       </div>
-      <div class="diff-stats"><span class="additions">+{activeFile?.additions ?? 0}</span><span class="deletions">−{activeFile?.deletions ?? 0}</span>{#if mode === 'full'}<span class="full-file-extent">{fullFileExtent}</span>{/if}{#if mode === 'full' && activeFile?.status !== 'added' && activeFile?.status !== 'untracked' && activeFile?.status !== 'deleted'}<span class="full-side-toggle" role="group" aria-label="Full-file source side"><button class:active={fullFileSide === 'new'} aria-pressed={fullFileSide === 'new'} title="Complete current file with removed Base lines shown inline" on:click={() => setFullFileSide('new')}>Current</button><button class:active={fullFileSide === 'old'} aria-pressed={fullFileSide === 'old'} title="File before the reviewed changes; removed lines are highlighted" on:click={() => setFullFileSide('old')}>Base</button></span>{/if}{#if mode === 'full' && fullFileDisplaySide === 'new' && (presentation?.deletionBlocks?.length ?? 0) > 0}<span class="full-deletion-controls" role="group" aria-label="Full-file deletion blocks"><button disabled={refreshLocksReview || presentation?.deletionBlocks?.every((block) => block.expanded)} on:click={showAllFullFileDeletions}>Show all deletions</button><button disabled={refreshLocksReview || presentation?.deletionBlocks?.every((block) => !block.expanded)} on:click={hideAllFullFileDeletions}>Hide all deletions</button></span>{/if}<button class="wrap-toggle" class:active={settings.wrapLines} aria-pressed={settings.wrapLines} title="Wrap long code lines instead of scrolling horizontally" on:click={() => setSettings({ wrapLines: !settings.wrapLines })}>Wrap</button><button class="icon-button small" title="Copy review content" aria-label="Copy review content" disabled={!canExportReview} aria-expanded={showCopyMenu} on:click={() => showCopyMenu = !showCopyMenu}>⧉</button><button class="icon-button small" title="Focus diff" aria-label="Focus diff" on:click={focusDiff}>⛶</button></div>
+      <div class="diff-stats">
+        <span class="additions">+{activeFile?.additions ?? 0}</span><span class="deletions">−{activeFile?.deletions ?? 0}</span>
+        {#if mode === 'full'}<span class="full-file-extent">{fullFileExtent}</span>{/if}
+        {#if mode === 'full' && activeFile?.status !== 'added' && activeFile?.status !== 'untracked' && activeFile?.status !== 'deleted'}
+          <span class="full-side-toggle" role="group" aria-label="Full-file source side">
+            <button class:active={fullFileSide === 'new'} aria-pressed={fullFileSide === 'new'} title="Complete Current file with Base-only deletions collapsed inline" on:click={() => setFullFileSide('new')}>Current</button>
+            <button class:active={fullFileSide === 'both'} aria-pressed={fullFileSide === 'both'} title="Complete file context with independently collapsible Current additions and Base deletions" on:click={() => setFullFileSide('both')}>Both</button>
+            <button class:active={fullFileSide === 'old'} aria-pressed={fullFileSide === 'old'} title="Complete Base file with Current-only additions collapsed inline" on:click={() => setFullFileSide('old')}>Base</button>
+          </span>
+        {/if}
+        {#if mode === 'full' && (presentation?.omittedBlocks?.length ?? 0) > 0}
+          {#if fullFileDisplaySide === 'both'}
+            {#if fullFileAdditionBlocks.length}
+              <span class="full-deletion-controls" role="group" aria-label="Full-file addition blocks">
+                <button disabled={refreshLocksReview || fullFileAdditionBlocks.every((block) => block.expanded)} on:click={() => showAllFullFileOmittedBlocks('new')}>Show all additions</button>
+                <button disabled={refreshLocksReview || fullFileAdditionBlocks.every((block) => !block.expanded)} on:click={() => hideAllFullFileOmittedBlocks('new')}>Hide all additions</button>
+              </span>
+            {/if}
+            {#if fullFileDeletionBlocks.length}
+              <span class="full-deletion-controls" role="group" aria-label="Full-file deletion blocks">
+                <button disabled={refreshLocksReview || fullFileDeletionBlocks.every((block) => block.expanded)} on:click={() => showAllFullFileOmittedBlocks('old')}>Show all deletions</button>
+                <button disabled={refreshLocksReview || fullFileDeletionBlocks.every((block) => !block.expanded)} on:click={() => hideAllFullFileOmittedBlocks('old')}>Hide all deletions</button>
+              </span>
+            {/if}
+          {:else}
+            <span class="full-deletion-controls" role="group" aria-label={`Full-file ${fullFileDisplaySide === 'new' ? 'deletion' : 'addition'} blocks`}>
+              <button disabled={refreshLocksReview || presentation?.omittedBlocks?.every((block) => block.expanded)} on:click={() => showAllFullFileOmittedBlocks()}>Show all {fullFileDisplaySide === 'new' ? 'deletions' : 'additions'}</button>
+              <button disabled={refreshLocksReview || presentation?.omittedBlocks?.every((block) => !block.expanded)} on:click={() => hideAllFullFileOmittedBlocks()}>Hide all {fullFileDisplaySide === 'new' ? 'deletions' : 'additions'}</button>
+            </span>
+          {/if}
+        {/if}
+        <button class="wrap-toggle" class:active={settings.wrapLines} aria-pressed={settings.wrapLines} title="Wrap long code lines instead of scrolling horizontally" on:click={() => setSettings({ wrapLines: !settings.wrapLines })}>Wrap</button><button class="icon-button small" title="Copy review content" aria-label="Copy review content" disabled={!canExportReview} aria-expanded={showCopyMenu} on:click={() => showCopyMenu = !showCopyMenu}>⧉</button><button class="icon-button small" title="Focus diff" aria-label="Focus diff" on:click={focusDiff}>⛶</button>
+      </div>
     </div>
 
     {#if refreshLocksReview}
@@ -2726,7 +2834,7 @@
         <small>LocalReview refreshes only when you ask.</small>
       </section>
     {:else}
-      <VirtualDiff {rows} windowStart={presentation?.startRow ?? 0} totalRows={presentation?.totalRows ?? rows.length} hunks={presentation?.hunks ?? []} oldTokens={presentation?.oldTokens ?? []} newTokens={presentation?.newTokens ?? []} difftastic={presentation?.difftastic} {mode} fontScale={settings.fontScale} wrapLines={settings.wrapLines} {activeLine} activeSide={nearestSourceSide} composerSelection={composer?.selection} composerKind={composer?.kind ?? 'comment'} {splitRatio} fullFileSide={fullFileDisplaySide} {jumpToRow} {jumpGeneration} initialScrollTop={restoredScrollTop} restorationKey={`${activeWorkspaceId}:${activeFileId}:${mode}`} repositoryName={activeRepo?.name ?? 'repository'} filePath={activeFile?.path ?? 'file'} annotationCountAt={annotationsAt} annotationsForRow={inlineAnnotationsAt} {annotationRevision} {annotationContextKey} annotationsEditable={canMutateReview} deletionBlocksExpandable={!refreshLocksReview} onAnnotate={annotate} onEditAnnotation={editAnnotation} onViewportRequest={requestViewport} onExpandHunk={expandHunk} onToggleDeletionBlock={toggleFullFileDeletionBlock} onSplitRatio={updateSplitRatio} onCanonicalMode={setMode} onLocationChange={saveLocation} />
+      <VirtualDiff bind:this={virtualDiff} {rows} windowStart={presentation?.startRow ?? 0} totalRows={presentation?.totalRows ?? rows.length} hunks={presentation?.hunks ?? []} oldTokens={presentation?.oldTokens ?? []} newTokens={presentation?.newTokens ?? []} difftastic={presentation?.difftastic} {mode} fontScale={settings.fontScale} wrapLines={settings.wrapLines} {activeLine} activeSide={nearestSourceSide} composerSelection={composer?.selection} composerKind={composer?.kind ?? 'comment'} {splitRatio} fullFileSide={fullFileDisplaySide} {jumpToRow} {jumpGeneration} {jumpViewportOffset} initialScrollTop={restoredScrollTop} restorationKey={`${activeWorkspaceId}:${activeFileId}:${mode}`} repositoryName={activeRepo?.name ?? 'repository'} filePath={activeFile?.path ?? 'file'} annotationCountAt={annotationsAt} annotationsForRow={inlineAnnotationsAt} {annotationRevision} {annotationContextKey} annotationsEditable={canMutateReview} omittedBlocksExpandable={!refreshLocksReview} onAnnotate={annotate} onEditAnnotation={editAnnotation} onViewportRequest={requestViewport} onExpandHunk={expandHunk} onToggleOmittedBlock={toggleFullFileOmittedBlock} onSplitRatio={updateSplitRatio} onCanonicalMode={setMode} onLocationChange={saveLocation} />
       {#if mode === 'full'}
       <nav class="full-minimap" aria-label="Changed-line and annotation minimap">{#each presentation?.hunks ?? [] as hunk (hunk.id)}<button title={`Jump to ${hunk.header}`} aria-label={`Jump to ${hunk.header}`} style:top={`${Math.min(94, Math.max(2, ((hunk.rowIndex / Math.max(1, presentation?.totalRows ?? 1)) * 92) + 2))}%`} on:click={() => jumpToFullFileHunk(hunk)}></button>{/each}{#each (review?.annotations ?? []).filter((annotation) => annotation.fileId === activeFileId && annotation.startLine > 0) as annotation (annotation.id)}<button class="annotation-marker" title={`${annotation.kind} at ${annotation.side} line ${annotation.startLine}`} aria-label={`Jump to ${annotation.kind} at ${annotation.side} line ${annotation.startLine}`} style:top={`${Math.min(96, Math.max(1, (annotation.startLine / Math.max(1, presentation?.totalRows ?? 1)) * 96))}%`} on:click={() => void jumpToAnnotation(annotation)}></button>{/each}</nav>
       {/if}

@@ -176,7 +176,7 @@ describe('browser fallback API', () => {
     expect(reopenedSecond.files.every((file) => !file.viewed)).toBe(true);
     expect(await secondProcess.getAnnotationDraft(first.workspace.id)).toBeUndefined();
     expect(await secondProcess.getWorkspaceUiState(first.workspace.id)).toMatchObject({
-      mode: 'unified', fullFileSide: 'new', scrollTop: 0, splitRatio: .5, rightTab: 'files'
+      mode: 'unified', fullFileSide: 'both', scrollTop: 0, splitRatio: .5, rightTab: 'files'
     });
     expect(await secondProcess.generatePrompt(first.workspace.id, { scope: 'feedback', historyId: `export:${firstExport.exportId}` })).toEqual(firstExport);
 
@@ -324,12 +324,12 @@ describe('browser fallback API', () => {
       fileId: 'file-app', mode: 'full', fullFileSide: 'new',
       startRow: 0, endRow: 500, generation: 1
     });
-    expect(collapsed.deletionBlocks?.length).toBeGreaterThan(0);
-    expect(collapsed.rows.filter((row) => row.kind === 'deletion_gate')).toHaveLength(collapsed.deletionBlocks!.length);
+    expect(collapsed.omittedBlocks?.length).toBeGreaterThan(0);
+    expect(collapsed.rows.filter((row) => row.kind === 'deletion_gate')).toHaveLength(collapsed.omittedBlocks!.length);
     expect(collapsed.rows.some((row) => row.kind === 'deletion')).toBe(false);
     expect(collapsed.hunks.every((hunk) => hunk.oldLine || hunk.newLine)).toBe(true);
 
-    const firstBlock = collapsed.deletionBlocks![0]!;
+    const firstBlock = collapsed.omittedBlocks![0]!;
     await expect(api.resolvePresentationLocation('file-app', 'full', 'old', firstBlock.startLine))
       .resolves.toMatchObject({ rowIndex: firstBlock.rowIndex, side: 'old', line: firstBlock.startLine });
     await api.saveWorkspaceUiState('workspace-localreview', { expandedFullFileDeletionBlocks: [firstBlock.id] });
@@ -337,8 +337,65 @@ describe('browser fallback API', () => {
       fileId: 'file-app', mode: 'full', fullFileSide: 'new',
       startRow: 0, endRow: 500, generation: 2
     });
-    expect(expanded.deletionBlocks?.find((block) => block.id === firstBlock.id)?.expanded).toBe(true);
+    expect(expanded.omittedBlocks?.find((block) => block.id === firstBlock.id)?.expanded).toBe(true);
     expect(expanded.rows.some((row) => row.kind === 'deletion' && row.oldLine === firstBlock.startLine)).toBe(true);
+  });
+
+  it('models Full File Base additions as symmetric collapsed, expandable gates', async () => {
+    const api = makeMockApi();
+    const collapsed = await api.getPresentationWindow({
+      fileId: 'file-app', mode: 'full', fullFileSide: 'old',
+      startRow: 0, endRow: 500, generation: 1
+    });
+    expect(collapsed.omittedBlocks?.length).toBeGreaterThan(0);
+    expect(collapsed.omittedBlocks?.every((block) => block.side === 'new')).toBe(true);
+    expect(collapsed.rows.filter((row) => row.kind === 'addition_gate')).toHaveLength(collapsed.omittedBlocks!.length);
+    expect(collapsed.rows.some((row) => row.kind === 'addition')).toBe(false);
+
+    const firstBlock = collapsed.omittedBlocks![0]!;
+    await expect(api.resolvePresentationLocation('file-app', 'full', 'new', firstBlock.startLine))
+      .resolves.toMatchObject({ rowIndex: firstBlock.rowIndex, side: 'new', line: firstBlock.startLine });
+    await api.saveWorkspaceUiState('workspace-localreview', {
+      mode: 'full',
+      fullFileSide: 'old',
+      expandedFullFileDeletionBlocks: [firstBlock.id]
+    });
+    const expanded = await api.getPresentationWindow({
+      fileId: 'file-app', mode: 'full', fullFileSide: 'old',
+      startRow: 0, endRow: 500, generation: 2
+    });
+    expect(expanded.omittedBlocks?.find((block) => block.id === firstBlock.id)?.expanded).toBe(true);
+    expect(expanded.rows.some((row) => row.kind === 'addition' && row.newLine === firstBlock.startLine)).toBe(true);
+  });
+
+  it('defaults Full File Both to additions expanded and deletions collapsed, with durable independent controls', async () => {
+    const api = makeMockApi();
+    const initial = await api.getPresentationWindow({
+      fileId: 'file-app', mode: 'full', fullFileSide: 'both',
+      startRow: 0, endRow: 500, generation: 1
+    });
+    const addition = initial.omittedBlocks?.find((block) => block.side === 'new');
+    const deletion = initial.omittedBlocks?.find((block) => block.side === 'old');
+    expect(addition?.expanded).toBe(true);
+    expect(deletion?.expanded).toBe(false);
+    expect(initial.rows.some((row) => row.kind === 'addition')).toBe(true);
+    expect(initial.rows.some((row) => row.kind === 'deletion')).toBe(false);
+
+    await api.saveWorkspaceUiState('workspace-localreview', {
+      mode: 'full',
+      fullFileSide: 'both',
+      expandedFullFileDeletionBlocks: deletion ? [deletion.id] : [],
+      collapsedFullFileAdditionBlocks: addition ? [addition.id] : []
+    });
+    const restarted = makeMockApi();
+    const toggled = await restarted.getPresentationWindow({
+      fileId: 'file-app', mode: 'full', fullFileSide: 'both',
+      startRow: 0, endRow: 500, generation: 2
+    });
+    expect(toggled.omittedBlocks?.find((block) => block.side === 'new')?.expanded).toBe(false);
+    expect(toggled.omittedBlocks?.find((block) => block.side === 'old')?.expanded).toBe(true);
+    expect(toggled.rows.some((row) => row.kind === 'addition' && row.newLine === addition?.startLine)).toBe(false);
+    expect(toggled.rows.some((row) => row.kind === 'deletion' && row.oldLine === deletion?.startLine)).toBe(true);
   });
 
   it('keeps removed workspaces recoverable and can reopen their captured snapshot', async () => {

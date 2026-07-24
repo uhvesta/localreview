@@ -1,8 +1,8 @@
 export type WorkspaceSource = 'local' | 'github' | 'ssh';
 export type DiffMode = 'unified' | 'split' | 'full' | 'difftastic';
-export type DiffKind = 'context' | 'addition' | 'deletion' | 'deletion_gate' | 'modification' | 'header';
+export type DiffKind = 'context' | 'addition' | 'deletion' | 'addition_gate' | 'deletion_gate' | 'modification' | 'header';
 export type DiffSide = 'old' | 'new';
-export type FullFileSide = DiffSide;
+export type FullFileSide = DiffSide | 'both';
 export type SyntaxClass =
   | 'attribute' | 'boolean' | 'comment' | 'constant' | 'constructor' | 'embedded'
   | 'escape' | 'function' | 'keyword' | 'markup' | 'module' | 'number'
@@ -129,11 +129,12 @@ export interface DiffRow {
   /** UTF-8 source byte offsets for safe complete-document Tree-sitter spans. */
   oldSourceStartByte?: number;
   newSourceStartByte?: number;
-  /** Present only on a collapsed Full File Current deletion gate. */
-  deletionBlockId?: string;
-  deletionCount?: number;
-  oldEndLine?: number;
-  deletionExpanded?: boolean;
+  /** Present only on a Full File gate for source omitted from this side. */
+  omittedBlockId?: string;
+  omittedCount?: number;
+  omittedEndLine?: number;
+  omittedSide?: DiffSide;
+  omittedExpanded?: boolean;
 }
 
 /** A Rust Tree-sitter span. It is rendered as text nodes, never injected HTML. */
@@ -162,7 +163,7 @@ export interface DiffPresentationWindow {
   totalRows: number;
   rows: DiffRow[];
   hunks: HunkLocation[];
-  deletionBlocks?: FullFileDeletionBlock[];
+  omittedBlocks?: FullFileOmittedBlock[];
   oldTokens?: SyntaxTokenSpan[];
   newTokens?: SyntaxTokenSpan[];
   highlightStatus?: 'highlighted' | 'plain_text' | 'disabled';
@@ -171,8 +172,9 @@ export interface DiffPresentationWindow {
   difftastic?: DifftasticPresentation;
 }
 
-export interface FullFileDeletionBlock {
+export interface FullFileOmittedBlock {
   id: string;
+  side: DiffSide;
   startLine: number;
   endLine: number;
   count: number;
@@ -196,6 +198,7 @@ export interface ViewportRequest {
    * archived browsing must never write through to that active session.
    */
   ephemeralExpandedFullFileDeletionBlocks?: string[];
+  ephemeralCollapsedFullFileAdditionBlocks?: string[];
 }
 
 export interface DifftasticSpan {
@@ -360,7 +363,11 @@ export interface WorkspaceUiState {
   rightTab: 'files' | 'comments' | 'outline';
   /** Undefined means a legacy/default selection; an empty array is an explicit durable choice. */
   selectedAnnotationIds?: string[];
+  /** Legacy protocol name; contains explicitly expanded omitted blocks. */
   expandedFullFileDeletionBlocks?: string[];
+  /** Additions are expanded by default in Both; this records explicit
+   * collapsed choices durably. */
+  collapsedFullFileAdditionBlocks?: string[];
 }
 
 export interface PromptRequest {

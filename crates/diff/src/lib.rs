@@ -469,6 +469,60 @@ pub fn full_file_current_rows(document: &ReviewDiffDocument) -> Vec<FullFileRow>
     rows
 }
 
+/// Projects the complete Base source while retaining Current-only additions at
+/// their exact insertion anchors. This is the symmetric counterpart of
+/// [`full_file_current_rows`]: Base rows remain ordered and lossless, while
+/// interleaved New rows can be disclosed as addition gates by Full File mode.
+#[must_use]
+pub fn full_file_base_rows(document: &ReviewDiffDocument) -> Vec<FullFileRow> {
+    let mut additions_by_anchor = vec![Vec::new(); document.old.lines().count().saturating_add(1)];
+    for hunk in &document.hunks {
+        for (index, row) in hunk.unified_rows.iter().enumerate() {
+            if row.kind != DiffLineKind::Addition {
+                continue;
+            }
+            let Some(cell) = row.new.as_ref() else {
+                continue;
+            };
+            let next_old = hunk.unified_rows[index.saturating_add(1)..]
+                .iter()
+                .find_map(|candidate| candidate.old.as_ref().map(|value| value.line_number));
+            let previous_old = hunk.unified_rows[..index]
+                .iter()
+                .rev()
+                .find_map(|candidate| candidate.old.as_ref().map(|value| value.line_number));
+            let anchor = next_old
+                .map(|line| line.saturating_sub(1))
+                .or(previous_old)
+                .unwrap_or(hunk.header.old_start);
+            let anchor = usize::try_from(anchor)
+                .unwrap_or(usize::MAX)
+                .min(additions_by_anchor.len().saturating_sub(1));
+            additions_by_anchor[anchor].push(FullFileRow {
+                side: DiffSide::New,
+                line_number: cell.line_number,
+                text: cell.text.clone(),
+                changed: true,
+                has_trailing_newline: cell.has_trailing_newline,
+            });
+        }
+    }
+
+    let base = full_file_rows(document, DiffSide::Old);
+    let mut rows = Vec::with_capacity(
+        base.len()
+            .saturating_add(additions_by_anchor.iter().map(Vec::len).sum::<usize>()),
+    );
+    for (index, row) in base.into_iter().enumerate() {
+        rows.append(&mut additions_by_anchor[index]);
+        rows.push(row);
+    }
+    if let Some(trailing) = additions_by_anchor.last_mut() {
+        rows.append(trailing);
+    }
+    rows
+}
+
 fn cell(
     side: DiffSide,
     source_index: u32,
@@ -1082,6 +1136,37 @@ mod tests {
             .iter()
             .filter(|row| row.side == DiffSide::Old)
             .all(|row| row.changed));
+    }
+
+    #[test]
+    fn full_file_base_interleaves_current_additions_without_losing_base_source() {
+        let document = document_from_sources(
+            ComparisonId::new(),
+            review_file(),
+            "before\nlegacy\nafter\n",
+            "before\ncurrent one\ncurrent two\nafter\ntail\n",
+        );
+        let rows = full_file_base_rows(&document);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.side, row.line_number, row.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (DiffSide::Old, 1, "before"),
+                (DiffSide::Old, 2, "legacy"),
+                (DiffSide::New, 2, "current one"),
+                (DiffSide::New, 3, "current two"),
+                (DiffSide::Old, 3, "after"),
+                (DiffSide::New, 5, "tail"),
+            ]
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.side == DiffSide::Old)
+                .map(|row| row.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["before", "legacy", "after"]
+        );
     }
 
     #[test]

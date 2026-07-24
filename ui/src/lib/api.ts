@@ -14,10 +14,12 @@ import type {
   ReviewCaptureRequest,
   DiffMode,
   DiffRow,
+  DiffSide,
   FinishReviewRequest,
   FinishReviewPreview,
   FinishReviewResult,
   GitHubPullRequestContext,
+  FullFileSide,
   ImportedGitHubConversationComment,
   ImportedGitHubReviewThread,
   PromptPreview,
@@ -219,51 +221,55 @@ function positionedRows(fileId: string) {
   return { rows, oldTokens, newTokens };
 }
 
-function mockFullFileProjection(fileId: string, side: 'old' | 'new', expandedBlocks: Set<string>) {
+function mockFullFileProjection(fileId: string, side: FullFileSide, expandedBlocks: Set<string>, collapsedAdditionBlocks: Set<string>) {
   const source = positionedRows(fileId);
-  if (side === 'old') {
-    return {
-      ...source,
-      rows: source.rows.filter((entry) => entry.kind !== 'header' && entry.oldLine !== undefined),
-      deletionBlocks: [] as NonNullable<DiffPresentationWindow['deletionBlocks']>
-    };
-  }
   const rows: DiffRow[] = [];
-  const deletionBlocks: NonNullable<DiffPresentationWindow['deletionBlocks']> = [];
+  const omittedBlocks: NonNullable<DiffPresentationWindow['omittedBlocks']> = [];
   for (let index = 0; index < source.rows.length;) {
     const current = source.rows[index]!;
     if (current.kind === 'header') {
       index += 1;
       continue;
     }
-    if (current.kind !== 'deletion') {
-      if (current.newLine !== undefined) rows.push(current);
+    const isOmitted = side === 'both'
+      ? current.kind === 'addition' || current.kind === 'deletion'
+      : current.kind === (side === 'old' ? 'addition' : 'deletion');
+    if (!isOmitted) {
+      if (side === 'old' ? current.oldLine !== undefined : current.newLine !== undefined) rows.push(current);
       index += 1;
       continue;
     }
-    const removed: DiffRow[] = [];
-    while (source.rows[index]?.kind === 'deletion') {
-      removed.push(source.rows[index]!);
+    const omittedKind = current.kind;
+    const omittedSide: DiffSide = omittedKind === 'addition' ? 'new' : 'old';
+    const omitted: DiffRow[] = [];
+    while (source.rows[index]?.kind === omittedKind) {
+      omitted.push(source.rows[index]!);
       index += 1;
     }
-    const startLine = removed[0]?.oldLine ?? 0;
-    const endLine = removed.at(-1)?.oldLine ?? startLine;
-    const id = `${fileId}:deletion:${startLine}-${endLine}`;
-    const expanded = expandedBlocks.has(id);
-    deletionBlocks.push({ id, startLine, endLine, count: removed.length, expanded, rowIndex: rows.length });
+    const sourceLine = (row: DiffRow) => omittedSide === 'old' ? row.oldLine : row.newLine;
+    const startLine = sourceLine(omitted[0]!) ?? 0;
+    const endLine = sourceLine(omitted.at(-1)!) ?? startLine;
+    const id = `${fileId}:${omittedSide}:${startLine}-${endLine}`;
+    const expanded = side === 'both' && omittedSide === 'new'
+      ? !collapsedAdditionBlocks.has(id)
+      : expandedBlocks.has(id);
+    omittedBlocks.push({ id, side: omittedSide, startLine, endLine, count: omitted.length, expanded, rowIndex: rows.length });
+    const action = omittedSide === 'old' ? 'deleted' : 'added';
     rows.push({
       id: `${id}:gate`,
-      kind: 'deletion_gate',
-      oldLine: startLine,
-      oldEndLine: endLine,
-      deletionBlockId: id,
-      deletionCount: removed.length,
-      deletionExpanded: expanded,
-      text: `${removed.length} deleted ${removed.length === 1 ? 'line' : 'lines'}`
+      kind: omittedSide === 'old' ? 'deletion_gate' : 'addition_gate',
+      oldLine: omittedSide === 'old' ? startLine : undefined,
+      newLine: omittedSide === 'new' ? startLine : undefined,
+      omittedEndLine: endLine,
+      omittedBlockId: id,
+      omittedCount: omitted.length,
+      omittedSide,
+      omittedExpanded: expanded,
+      text: `${omitted.length} ${action} ${omitted.length === 1 ? 'line' : 'lines'}`
     });
-    if (expanded) rows.push(...removed.map((entry) => ({ ...entry, deletionExpanded: true })));
+    if (expanded) rows.push(...omitted.map((entry) => ({ ...entry, omittedExpanded: true })));
   }
-  return { ...source, rows, deletionBlocks };
+  return { ...source, rows, omittedBlocks };
 }
 
 function mockHunks(sourceRows: DiffRow[], presentedRows: DiffRow[]) {
@@ -273,12 +279,12 @@ function mockHunks(sourceRows: DiffRow[], presentedRows: DiffRow[]) {
     if (!firstSource) return [];
     const rowIndex = Math.max(0, presentedRows.findIndex((candidate) =>
       candidate.id === firstSource.id
-      || (candidate.kind === 'deletion_gate'
-        && firstSource.oldLine !== undefined
-        && candidate.oldLine !== undefined
-        && candidate.oldEndLine !== undefined
-        && firstSource.oldLine >= candidate.oldLine
-        && firstSource.oldLine <= candidate.oldEndLine)
+      || ((candidate.kind === 'deletion_gate' || candidate.kind === 'addition_gate')
+        && candidate.omittedSide !== undefined
+        && candidate.omittedEndLine !== undefined
+        && (candidate.omittedSide === 'old' ? firstSource.oldLine : firstSource.newLine) !== undefined
+        && (candidate.omittedSide === 'old' ? firstSource.oldLine! : firstSource.newLine!) >= (candidate.omittedSide === 'old' ? candidate.oldLine! : candidate.newLine!)
+        && (candidate.omittedSide === 'old' ? firstSource.oldLine! : firstSource.newLine!) <= candidate.omittedEndLine)
     ));
     return [{
       id: entry.hunkId ?? entry.id,
@@ -447,7 +453,7 @@ export function makeMockApi(): ReviewApi {
   const saveWorkspaceUiStates = () => {
     if (typeof localStorage !== 'undefined') localStorage.setItem(uiStateKey, JSON.stringify(workspaceUiStates));
   };
-  const defaultWorkspaceUiState = (): WorkspaceUiState => ({ mode: 'unified', fullFileSide: 'new', scrollTop: 0, splitRatio: .5, rightTab: 'files' });
+  const defaultWorkspaceUiState = (): WorkspaceUiState => ({ mode: 'unified', fullFileSide: 'both', scrollTop: 0, splitRatio: .5, rightTab: 'files' });
   const activeReviewKey = (workspaceId: string) => {
     const reviewId = state.activeReviewIds?.[workspaceId];
     return reviewId ? `${workspaceId}:${reviewId}` : undefined;
@@ -761,9 +767,12 @@ export function makeMockApi(): ReviewApi {
       const expandedBlocks = new Set(request.ephemeralExpandedFullFileDeletionBlocks
         ?? Object.values(workspaceUiStates)
           .flatMap((workspaceState) => workspaceState.expandedFullFileDeletionBlocks ?? []));
+      const collapsedAdditionBlocks = new Set(request.ephemeralCollapsedFullFileAdditionBlocks
+        ?? Object.values(workspaceUiStates)
+          .flatMap((workspaceState) => workspaceState.collapsedFullFileAdditionBlocks ?? []));
       const all = request.mode === 'full'
-        ? mockFullFileProjection(request.fileId, request.fullFileSide === 'old' ? 'old' : 'new', expandedBlocks)
-        : { ...source, deletionBlocks: [] as NonNullable<DiffPresentationWindow['deletionBlocks']> };
+        ? mockFullFileProjection(request.fileId, request.fullFileSide ?? 'both', expandedBlocks, collapsedAdditionBlocks)
+        : { ...source, omittedBlocks: [] as NonNullable<DiffPresentationWindow['omittedBlocks']> };
       const startRow = Math.max(0, Math.min(all.rows.length, request.startRow));
       const endRow = Math.max(startRow, Math.min(all.rows.length, request.endRow));
       return {
@@ -774,7 +783,7 @@ export function makeMockApi(): ReviewApi {
         totalRows: all.rows.length,
         rows: all.rows.slice(startRow, endRow),
         hunks: mockHunks(source.rows, all.rows),
-        deletionBlocks: all.deletionBlocks,
+        omittedBlocks: all.omittedBlocks,
         oldTokens: all.oldTokens,
         newTokens: all.newTokens,
         highlightStatus: 'highlighted',
@@ -785,21 +794,32 @@ export function makeMockApi(): ReviewApi {
       const source = positionedRows(fileId);
       const expandedBlocks = new Set(Object.values(workspaceUiStates)
         .flatMap((workspaceState) => workspaceState.expandedFullFileDeletionBlocks ?? []));
+      const collapsedAdditionBlocks = new Set(Object.values(workspaceUiStates)
+        .flatMap((workspaceState) => workspaceState.collapsedFullFileAdditionBlocks ?? []));
       const fullFileSide = Object.values(workspaceUiStates)
         .find((workspaceState) => workspaceState.activeFileId === fileId && workspaceState.mode === 'full')
-        ?.fullFileSide ?? 'new';
+        ?.fullFileSide ?? 'both';
       const all = mode === 'full'
-        ? mockFullFileProjection(fileId, fullFileSide, expandedBlocks).rows
+        ? mockFullFileProjection(fileId, fullFileSide, expandedBlocks, collapsedAdditionBlocks).rows
         : source.rows;
       let rowIndex = all.findIndex((entry) => (side === 'old' ? entry.oldLine : entry.newLine) === line);
-      if (rowIndex < 0 && mode === 'full' && side === 'old') {
+      if (rowIndex < 0 && mode === 'full') {
         rowIndex = all.findIndex((entry) =>
-          entry.kind === 'deletion_gate'
-          && entry.oldLine !== undefined
-          && entry.oldEndLine !== undefined
-          && line >= entry.oldLine
-          && line <= entry.oldEndLine
+          (entry.kind === 'deletion_gate' || entry.kind === 'addition_gate')
+          && entry.omittedSide === side
+          && entry.omittedEndLine !== undefined
+          && (side === 'old' ? entry.oldLine : entry.newLine) !== undefined
+          && line >= (side === 'old' ? entry.oldLine! : entry.newLine!)
+          && line <= entry.omittedEndLine
         );
+      }
+      if (rowIndex < 0 && mode === 'full') {
+        const aligned = source.rows.find((entry) => (side === 'old' ? entry.oldLine : entry.newLine) === line);
+        const targetSide = side === 'old' ? 'new' : 'old';
+        const targetLine = targetSide === 'old' ? aligned?.oldLine : aligned?.newLine;
+        if (targetLine !== undefined) {
+          rowIndex = all.findIndex((entry) => (targetSide === 'old' ? entry.oldLine : entry.newLine) === targetLine);
+        }
       }
       if (mode === 'difftastic') {
         const structural = demoDifftastic(source.rows);

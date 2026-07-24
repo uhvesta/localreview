@@ -11,7 +11,7 @@ use std::{
 
 use chrono::Utc;
 use localreview_diff::{
-    document_from_sources, full_file_current_rows, full_file_rows, DiffLineKind, FullFileRow,
+    document_from_sources, full_file_base_rows, full_file_current_rows, DiffLineKind, FullFileRow,
     ReviewDiffDocument, ReviewFile, ReviewFileStatus,
 };
 use localreview_difftastic::{
@@ -348,11 +348,16 @@ struct ReviewUiState {
     /// reload never silently contracts a reviewer-expanded immutable hunk.
     #[serde(default)]
     hunk_context_lines: BTreeMap<String, u32>,
-    /// Stable deletion-block ids expanded in Full File Current mode. The ids
-    /// include the immutable comparison, so a refreshed capture can safely
-    /// prune stale entries instead of applying them to unrelated source.
+    /// Stable omitted-block ids expanded in Full File mode: deletions while
+    /// viewing Current and additions while viewing Base. The persisted field
+    /// keeps its original name for compatibility with existing review state.
     #[serde(default)]
     expanded_full_file_deletion_blocks: BTreeSet<String>,
+    /// Current-side change blocks are open by default in Full File's `Both`
+    /// projection. This inverse set records the additions a reviewer chose to
+    /// collapse so that choice survives restart.
+    #[serde(default)]
+    collapsed_full_file_addition_blocks: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -369,6 +374,7 @@ pub struct WorkspaceUiStateView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected_annotation_ids: Option<Vec<String>>,
     pub expanded_full_file_deletion_blocks: Vec<String>,
+    pub collapsed_full_file_addition_blocks: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -384,6 +390,7 @@ pub struct WorkspaceUiStatePatch {
     pub right_tab: Option<String>,
     pub selected_annotation_ids: Option<Vec<String>>,
     pub expanded_full_file_deletion_blocks: Option<Vec<String>>,
+    pub collapsed_full_file_addition_blocks: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -404,6 +411,7 @@ pub struct PresentationRequest {
     /// It is validated against the owning immutable session and is never
     /// written to either the archived or active session UI-state record.
     pub ephemeral_expanded_full_file_deletion_blocks: Option<Vec<String>>,
+    pub ephemeral_collapsed_full_file_addition_blocks: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -416,7 +424,7 @@ pub struct PresentationWindow {
     pub total_rows: u32,
     pub rows: Vec<DiffRowView>,
     pub hunks: Vec<HunkLocationView>,
-    pub deletion_blocks: Vec<FullFileDeletionBlockView>,
+    pub omitted_blocks: Vec<FullFileOmittedBlockView>,
     pub old_tokens: Vec<SyntaxTokenView>,
     pub new_tokens: Vec<SyntaxTokenView>,
     pub highlight_status: String,
@@ -765,7 +773,7 @@ impl Drop for PresentationWorkPermit<'_> {
 struct CachedCanonicalPresentation {
     rows: Vec<DiffRowView>,
     hunks: Vec<HunkLocationView>,
-    deletion_blocks: Vec<FullFileDeletionBlockView>,
+    omitted_blocks: Vec<FullFileOmittedBlockView>,
 }
 
 type HighlightWindow = (
@@ -1193,19 +1201,22 @@ pub struct DiffRowView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_source_start_byte: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub deletion_block_id: Option<String>,
+    pub omitted_block_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub deletion_count: Option<u32>,
+    pub omitted_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub old_end_line: Option<u32>,
+    pub omitted_end_line: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub deletion_expanded: Option<bool>,
+    pub omitted_side: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub omitted_expanded: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FullFileDeletionBlockView {
+pub struct FullFileOmittedBlockView {
     pub id: String,
+    pub side: String,
     pub start_line: u32,
     pub end_line: u32,
     pub count: u32,
@@ -2458,10 +2469,11 @@ impl DesktopController {
                             }),
                             old_source_start_byte: None,
                             new_source_start_byte: None,
-                            deletion_block_id: None,
-                            deletion_count: None,
-                            old_end_line: None,
-                            deletion_expanded: None,
+                            omitted_block_id: None,
+                            omitted_count: None,
+                            omitted_end_line: None,
+                            omitted_side: None,
+                            omitted_expanded: None,
                         }));
                         rows
                     })
@@ -2501,22 +2513,24 @@ impl DesktopController {
                             }),
                             old_source_start_byte: None,
                             new_source_start_byte: None,
-                            deletion_block_id: None,
-                            deletion_count: None,
-                            old_end_line: None,
-                            deletion_expanded: None,
+                            omitted_block_id: None,
+                            omitted_count: None,
+                            omitted_end_line: None,
+                            omitted_side: None,
+                            omitted_expanded: None,
                         }
                     }));
                     rows
                 })
                 .collect()),
             "full" => {
-                let side = if document.file.status == localreview_diff::ReviewFileStatus::Deleted {
-                    DiffSide::Old
+                let view = if document.file.status == localreview_diff::ReviewFileStatus::Deleted {
+                    FullFileView::Old
                 } else {
-                    DiffSide::New
+                    FullFileView::Both
                 };
-                let (projection, _) = full_file_projection(&document, side, &BTreeSet::new());
+                let (projection, _) =
+                    full_file_projection(&document, view, &BTreeSet::new(), &BTreeSet::new());
                 let old_offsets = source_line_offsets(&document.old.content);
                 let new_offsets = source_line_offsets(&document.new.content);
                 let mut rows = projection
@@ -2554,9 +2568,9 @@ impl DesktopController {
         let full_file_side = request
             .full_file_side
             .as_deref()
-            .map(parse_side)
+            .map(parse_full_file_view)
             .transpose()?
-            .unwrap_or(DiffSide::New);
+            .unwrap_or(FullFileView::Both);
         if let Some(ratio) = request.split_ratio {
             if !ratio.is_finite() || !(0.25..=0.75).contains(&ratio) {
                 return Err(DispatchError::Invalid(
@@ -2597,6 +2611,26 @@ impl DesktopController {
                 ));
             }
             ui_state.expanded_full_file_deletion_blocks = expanded;
+        }
+        if let Some(values) = request
+            .ephemeral_collapsed_full_file_addition_blocks
+            .as_ref()
+        {
+            const MAX_COLLAPSED_ADDITION_BLOCKS: usize = 10_000;
+            if values.len() > MAX_COLLAPSED_ADDITION_BLOCKS {
+                return Err(DispatchError::Invalid(format!(
+                    "ephemeralCollapsedFullFileAdditionBlocks may contain at most {MAX_COLLAPSED_ADDITION_BLOCKS} values"
+                )));
+            }
+            let collapsed = values.iter().cloned().collect::<BTreeSet<_>>();
+            let valid = valid_full_file_deletion_block_ids(&self.current_documents(session.id)?);
+            if !collapsed.is_subset(&valid) {
+                return Err(DispatchError::Invalid(
+                    "ephemeralCollapsedFullFileAdditionBlocks contains a stale or foreign block"
+                        .into(),
+                ));
+            }
+            ui_state.collapsed_full_file_addition_blocks = collapsed;
         }
         let settings = self.get_settings()?;
 
@@ -2654,7 +2688,7 @@ impl DesktopController {
             total_rows: u32::try_from(all_rows.len()).unwrap_or(u32::MAX),
             rows,
             hunks: canonical.hunks.clone(),
-            deletion_blocks: Vec::new(),
+            omitted_blocks: Vec::new(),
             old_tokens,
             new_tokens,
             highlight_status,
@@ -2707,26 +2741,40 @@ impl DesktopController {
 
         let row_index = match mode {
             "full" => {
-                let displayed_side =
+                let displayed_view =
                     if document.file.status == localreview_diff::ReviewFileStatus::Deleted {
-                        DiffSide::Old
+                        FullFileView::Old
                     } else {
                         ui_state
                             .full_file_side
                             .as_deref()
-                            .map(parse_side)
+                            .map(parse_full_file_view)
                             .transpose()?
-                            .unwrap_or(DiffSide::New)
+                            .unwrap_or(FullFileView::Both)
                     };
                 let (projection, _) = full_file_projection(
                     &document,
-                    displayed_side,
+                    displayed_view,
                     &ui_state.expanded_full_file_deletion_blocks,
+                    &ui_state.collapsed_full_file_addition_blocks,
                 );
-                nearest_full_file_row(&projection, side, line)
+                exact_full_file_row(&projection, side, line).unwrap_or_else(|| {
+                    let target_side = displayed_view.primary_side();
+                    let aligned = aligned_source_line(&document, side, line, target_side);
+                    nearest_full_file_row(&projection, target_side, aligned)
+                })
             }
             "unified" | "split" => {
-                let canonical = self.cached_canonical_rows(&document, mode, side, &ui_state)?;
+                let canonical = self.cached_canonical_rows(
+                    &document,
+                    mode,
+                    if side == DiffSide::Old {
+                        FullFileView::Old
+                    } else {
+                        FullFileView::New
+                    },
+                    &ui_state,
+                )?;
                 nearest_canonical_row(&canonical.rows, side, line)
             }
             "difftastic" => {
@@ -2746,6 +2794,7 @@ impl DesktopController {
                         full_file_side: Some(side_name(side).into()),
                         split_ratio: None,
                         ephemeral_expanded_full_file_deletion_blocks: None,
+                        ephemeral_collapsed_full_file_addition_blocks: None,
                     },
                     &document,
                     &ui_state,
@@ -2771,8 +2820,16 @@ impl DesktopController {
                     // canonical fallback. Its locations must still be
                     // authoritative and must not depend on the one-row
                     // virtual response above.
-                    let canonical =
-                        self.cached_canonical_rows(&document, "unified", side, &ui_state)?;
+                    let canonical = self.cached_canonical_rows(
+                        &document,
+                        "unified",
+                        if side == DiffSide::Old {
+                            FullFileView::Old
+                        } else {
+                            FullFileView::New
+                        },
+                        &ui_state,
+                    )?;
                     nearest_canonical_row(&canonical.rows, side, line)
                 }
             }
@@ -3018,7 +3075,13 @@ impl DesktopController {
         state
             .expanded_full_file_deletion_blocks
             .retain(|id| valid_blocks.contains(id));
-        if state.expanded_full_file_deletion_blocks.len() != before {
+        let collapsed_before = state.collapsed_full_file_addition_blocks.len();
+        state
+            .collapsed_full_file_addition_blocks
+            .retain(|id| valid_blocks.contains(id));
+        if state.expanded_full_file_deletion_blocks.len() != before
+            || state.collapsed_full_file_addition_blocks.len() != collapsed_before
+        {
             self.state()
                 .save_review_session_ui_state(session.id, &state)?;
         }
@@ -3057,7 +3120,7 @@ impl DesktopController {
             state.mode = Some(value);
         }
         if let Some(value) = patch.full_file_side {
-            parse_side(&value)?;
+            parse_full_file_view(&value)?;
             state.full_file_side = Some(value);
         }
         if let Some(value) = patch.nearest_source_line {
@@ -3136,6 +3199,22 @@ impl DesktopController {
                 ));
             }
             state.expanded_full_file_deletion_blocks = expanded;
+        }
+        if let Some(values) = patch.collapsed_full_file_addition_blocks {
+            const MAX_COLLAPSED_ADDITION_BLOCKS: usize = 10_000;
+            if values.len() > MAX_COLLAPSED_ADDITION_BLOCKS {
+                return Err(DispatchError::Invalid(format!(
+                    "collapsedFullFileAdditionBlocks may contain at most {MAX_COLLAPSED_ADDITION_BLOCKS} values"
+                )));
+            }
+            let collapsed = values.into_iter().collect::<BTreeSet<_>>();
+            let valid = valid_full_file_deletion_block_ids(&self.current_documents(session.id)?);
+            if !collapsed.is_subset(&valid) {
+                return Err(DispatchError::Invalid(
+                    "collapsedFullFileAdditionBlocks contains a stale or foreign block".into(),
+                ));
+            }
+            state.collapsed_full_file_addition_blocks = collapsed;
         }
         self.state()
             .save_review_session_ui_state(session.id, &state)?;
@@ -6380,7 +6459,7 @@ impl DesktopController {
         &self,
         document: &ReviewDiffDocument,
         mode: &str,
-        full_file_side: DiffSide,
+        full_file_view: FullFileView,
         state: &ReviewUiState,
     ) -> Result<Arc<CachedCanonicalPresentation>, DispatchError> {
         const MAX_CANONICAL_ENTRIES: usize = 16;
@@ -6388,6 +6467,7 @@ impl DesktopController {
         let expansion_key = serde_json::to_string(&(
             &state.hunk_context_lines,
             &state.expanded_full_file_deletion_blocks,
+            &state.collapsed_full_file_addition_blocks,
         ))
         .map_err(|_| DispatchError::Internal)?;
         let key = format!(
@@ -6395,7 +6475,7 @@ impl DesktopController {
             document.file.id,
             document.comparison_id,
             mode,
-            side_name(full_file_side),
+            full_file_view.name(),
             expansion_key
         );
         {
@@ -6412,7 +6492,7 @@ impl DesktopController {
         let cached = Arc::new(build_canonical_presentation(
             document,
             mode,
-            full_file_side,
+            full_file_view,
             state,
         )?);
         // A row-budgeted LRU keeps a handful of large full-file projections
@@ -6457,11 +6537,17 @@ impl DesktopController {
                     document,
                     DiffSide::Old,
                     line,
-                    row.old_end_line.unwrap_or(line),
+                    row.omitted_end_line.unwrap_or(line),
                 )
-            }) || row
-                .new_line
-                .is_some_and(|line| annotation_at(&annotations, document, DiffSide::New, line));
+            }) || row.new_line.is_some_and(|line| {
+                annotation_overlaps(
+                    &annotations,
+                    document,
+                    DiffSide::New,
+                    line,
+                    row.omitted_end_line.unwrap_or(line),
+                )
+            });
         }
         Ok(())
     }
@@ -6581,7 +6667,7 @@ impl DesktopController {
         &self,
         request: PresentationRequest,
         document: &ReviewDiffDocument,
-        requested_side: DiffSide,
+        requested_view: FullFileView,
         ui_state: &ReviewUiState,
         execution: FullFileWindowExecution<'_>,
     ) -> Result<PresentationWindow, DispatchError> {
@@ -6590,12 +6676,12 @@ impl DesktopController {
             max_window_rows,
             job,
         } = execution;
-        let side = if document.file.status == localreview_diff::ReviewFileStatus::Deleted {
-            DiffSide::Old
+        let view = if document.file.status == localreview_diff::ReviewFileStatus::Deleted {
+            FullFileView::Old
         } else {
-            requested_side
+            requested_view
         };
-        let canonical = self.cached_canonical_rows(document, "full", side, ui_state)?;
+        let canonical = self.cached_canonical_rows(document, "full", view, ui_state)?;
         let total = canonical.rows.len();
         let (start, end) =
             bounded_window(request.start_row, request.end_row, total, max_window_rows);
@@ -6625,7 +6711,7 @@ impl DesktopController {
             total_rows: u32::try_from(total).unwrap_or(u32::MAX),
             rows,
             hunks: canonical.hunks.clone(),
-            deletion_blocks: canonical.deletion_blocks.clone(),
+            omitted_blocks: canonical.omitted_blocks.clone(),
             old_tokens,
             new_tokens,
             highlight_status,
@@ -6653,9 +6739,10 @@ impl DesktopController {
         let fallback_side = request
             .full_file_side
             .as_deref()
-            .map(parse_side)
+            .map(parse_full_file_view)
             .transpose()?
-            .unwrap_or(DiffSide::New);
+            .unwrap_or(FullFileView::Both)
+            .primary_side();
         let cache_key = structural_cache_key(document, settings);
         let presentation = {
             let mut cache = self
@@ -6792,7 +6879,7 @@ impl DesktopController {
                     total_rows: u32::try_from(total_rows).unwrap_or(u32::MAX),
                     rows: Vec::new(),
                     hunks: Vec::new(),
-                    deletion_blocks: Vec::new(),
+                    omitted_blocks: Vec::new(),
                     old_tokens: Vec::new(),
                     new_tokens: Vec::new(),
                     highlight_status: "disabled".into(),
@@ -6824,8 +6911,16 @@ impl DesktopController {
         detail: String,
         max_window_rows: usize,
     ) -> Result<PresentationWindow, DispatchError> {
-        let canonical =
-            self.cached_canonical_rows(document, "unified", full_file_side, ui_state)?;
+        let canonical = self.cached_canonical_rows(
+            document,
+            "unified",
+            if full_file_side == DiffSide::Old {
+                FullFileView::Old
+            } else {
+                FullFileView::New
+            },
+            ui_state,
+        )?;
         let all_rows = &canonical.rows;
         let (start, end) = bounded_window(
             request.start_row,
@@ -6846,7 +6941,7 @@ impl DesktopController {
             total_rows: u32::try_from(all_rows.len()).unwrap_or(u32::MAX),
             rows,
             hunks: canonical.hunks.clone(),
-            deletion_blocks: Vec::new(),
+            omitted_blocks: Vec::new(),
             old_tokens: Vec::new(),
             new_tokens: Vec::new(),
             highlight_status: "disabled".into(),
@@ -7038,12 +7133,13 @@ fn nearest_canonical_row(rows: &[DiffRowView], side: DiffSide, line: u32) -> usi
 }
 
 #[derive(Clone, Debug)]
-struct FullFileDeletionBlock {
+struct FullFileOmittedBlock {
     id: String,
+    side: DiffSide,
     rows: Vec<FullFileRow>,
 }
 
-impl FullFileDeletionBlock {
+impl FullFileOmittedBlock {
     fn start_line(&self) -> u32 {
         self.rows.first().map_or(0, |row| row.line_number)
     }
@@ -7053,33 +7149,80 @@ impl FullFileDeletionBlock {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FullFileView {
+    Old,
+    New,
+    Both,
+}
+
+impl FullFileView {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Old => "old",
+            Self::New => "new",
+            Self::Both => "both",
+        }
+    }
+
+    fn primary_side(self) -> DiffSide {
+        match self {
+            Self::Old => DiffSide::Old,
+            Self::New | Self::Both => DiffSide::New,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum FullFileProjectedRow {
     Line(FullFileRow),
-    DeletionGate(FullFileDeletionBlock, bool),
+    OmittedGate(FullFileOmittedBlock, bool),
 }
 
-fn full_file_deletion_blocks(document: &ReviewDiffDocument) -> Vec<FullFileDeletionBlock> {
-    let rows = full_file_current_rows(document);
+fn full_file_omitted_blocks(
+    document: &ReviewDiffDocument,
+    view: FullFileView,
+) -> Vec<FullFileOmittedBlock> {
+    let rows = match view {
+        FullFileView::Old => full_file_base_rows(document),
+        FullFileView::New | FullFileView::Both => full_file_current_rows(document),
+    };
+    let is_omitted = |row: &FullFileRow| match view {
+        FullFileView::Old => row.side == DiffSide::New,
+        FullFileView::New => row.side == DiffSide::Old,
+        FullFileView::Both => row.changed,
+    };
     let mut blocks = Vec::new();
     let mut index = 0;
     while index < rows.len() {
-        if rows[index].side != DiffSide::Old {
+        if !is_omitted(&rows[index]) {
             index += 1;
             continue;
         }
+        let omitted_side = rows[index].side;
         let start = index;
-        while index < rows.len() && rows[index].side == DiffSide::Old {
+        while index < rows.len() && is_omitted(&rows[index]) && rows[index].side == omitted_side {
             index += 1;
         }
         let block_rows = rows[start..index].to_vec();
         let start_line = block_rows.first().map_or(0, |row| row.line_number);
         let end_line = block_rows.last().map_or(0, |row| row.line_number);
-        blocks.push(FullFileDeletionBlock {
-            id: format!(
+        let id = if omitted_side == DiffSide::Old {
+            // Preserve the pre-symmetric deletion ID so expansion choices
+            // survive an application upgrade.
+            format!(
                 "{}:{}:{start_line}-{end_line}",
                 document.comparison_id, document.file.id
-            ),
+            )
+        } else {
+            format!(
+                "{}:{}:new:{start_line}-{end_line}",
+                document.comparison_id, document.file.id
+            )
+        };
+        blocks.push(FullFileOmittedBlock {
+            id,
+            side: omitted_side,
             rows: block_rows,
         });
     }
@@ -7089,49 +7232,57 @@ fn full_file_deletion_blocks(document: &ReviewDiffDocument) -> Vec<FullFileDelet
 fn valid_full_file_deletion_block_ids(documents: &[PersistedReviewDocument]) -> BTreeSet<String> {
     documents
         .iter()
-        .flat_map(|document| full_file_deletion_blocks(&document.document))
+        .flat_map(|document| {
+            [FullFileView::Old, FullFileView::New, FullFileView::Both]
+                .into_iter()
+                .flat_map(|view| full_file_omitted_blocks(&document.document, view))
+        })
         .map(|block| block.id)
         .collect()
 }
 
 fn full_file_projection(
     document: &ReviewDiffDocument,
-    side: DiffSide,
+    view: FullFileView,
     expanded_blocks: &BTreeSet<String>,
-) -> (Vec<FullFileProjectedRow>, Vec<FullFileDeletionBlock>) {
-    if side == DiffSide::Old {
-        return (
-            full_file_rows(document, DiffSide::Old)
-                .into_iter()
-                .map(FullFileProjectedRow::Line)
-                .collect(),
-            Vec::new(),
-        );
-    }
-    let rows = full_file_current_rows(document);
-    let blocks = full_file_deletion_blocks(document);
+    collapsed_addition_blocks: &BTreeSet<String>,
+) -> (Vec<FullFileProjectedRow>, Vec<FullFileOmittedBlock>) {
+    let rows = match view {
+        FullFileView::Old => full_file_base_rows(document),
+        FullFileView::New | FullFileView::Both => full_file_current_rows(document),
+    };
+    let blocks = full_file_omitted_blocks(document, view);
     let mut blocks_by_start = blocks
         .iter()
         .cloned()
-        .map(|block| (block.start_line(), block))
+        .map(|block| ((side_name(block.side), block.start_line()), block))
         .collect::<BTreeMap<_, _>>();
     let mut projection = Vec::with_capacity(rows.len());
     let mut index = 0;
     while index < rows.len() {
         let row = &rows[index];
-        if row.side == DiffSide::New {
+        let belongs_to_complete_source = match view {
+            FullFileView::Old => row.side == DiffSide::Old,
+            FullFileView::New => row.side == DiffSide::New,
+            FullFileView::Both => !row.changed,
+        };
+        if belongs_to_complete_source {
             projection.push(FullFileProjectedRow::Line(row.clone()));
             index += 1;
             continue;
         }
-        let Some(block) = blocks_by_start.remove(&row.line_number) else {
+        let Some(block) = blocks_by_start.remove(&(side_name(row.side), row.line_number)) else {
             projection.push(FullFileProjectedRow::Line(row.clone()));
             index += 1;
             continue;
         };
         index = index.saturating_add(block.rows.len());
-        let expanded = expanded_blocks.contains(&block.id);
-        projection.push(FullFileProjectedRow::DeletionGate(block.clone(), expanded));
+        let expanded = if view == FullFileView::Both && block.side == DiffSide::New {
+            !collapsed_addition_blocks.contains(&block.id)
+        } else {
+            expanded_blocks.contains(&block.id)
+        };
+        projection.push(FullFileProjectedRow::OmittedGate(block.clone(), expanded));
         if expanded {
             projection.extend(block.rows.iter().cloned().map(FullFileProjectedRow::Line));
         }
@@ -7142,23 +7293,7 @@ fn full_file_projection(
 fn nearest_full_file_row(rows: &[FullFileProjectedRow], side: DiffSide, line: u32) -> usize {
     // When a deletion block is expanded, exact source locations must land on
     // the selectable Base row rather than on the preceding range gate.
-    rows.iter()
-        .enumerate()
-        .find_map(|(index, row)| match row {
-            FullFileProjectedRow::Line(row) => {
-                (row.side == side && row.line_number == line).then_some(index)
-            }
-            FullFileProjectedRow::DeletionGate(_, _) => None,
-        })
-        .or_else(|| {
-            rows.iter().enumerate().find_map(|(index, row)| match row {
-                FullFileProjectedRow::DeletionGate(block, _) => (side == DiffSide::Old
-                    && line >= block.start_line()
-                    && line <= block.end_line())
-                .then_some(index),
-                FullFileProjectedRow::Line(_) => None,
-            })
-        })
+    exact_full_file_row(rows, side, line)
         .or_else(|| {
             rows.iter()
                 .enumerate()
@@ -7166,21 +7301,104 @@ fn nearest_full_file_row(rows: &[FullFileProjectedRow], side: DiffSide, line: u3
                     FullFileProjectedRow::Line(row) if row.side == side => {
                         Some((index, row.line_number.abs_diff(line)))
                     }
-                    FullFileProjectedRow::DeletionGate(block, _) if side == DiffSide::Old => {
-                        Some((
-                            index,
-                            block
-                                .start_line()
-                                .abs_diff(line)
-                                .min(block.end_line().abs_diff(line)),
-                        ))
-                    }
+                    FullFileProjectedRow::OmittedGate(block, _) if side == block.side => Some((
+                        index,
+                        block
+                            .start_line()
+                            .abs_diff(line)
+                            .min(block.end_line().abs_diff(line)),
+                    )),
                     _ => None,
                 })
                 .min_by_key(|(index, distance)| (*distance, *index))
                 .map(|(index, _)| index)
         })
         .unwrap_or(0)
+}
+
+fn exact_full_file_row(rows: &[FullFileProjectedRow], side: DiffSide, line: u32) -> Option<usize> {
+    rows.iter()
+        .enumerate()
+        .find_map(|(index, row)| match row {
+            FullFileProjectedRow::Line(row) => {
+                (row.side == side && row.line_number == line).then_some(index)
+            }
+            FullFileProjectedRow::OmittedGate(_, _) => None,
+        })
+        .or_else(|| {
+            rows.iter().enumerate().find_map(|(index, row)| match row {
+                FullFileProjectedRow::OmittedGate(block, _) => {
+                    (side == block.side && line >= block.start_line() && line <= block.end_line())
+                        .then_some(index)
+                }
+                FullFileProjectedRow::Line(_) => None,
+            })
+        })
+}
+
+fn aligned_source_line(
+    document: &ReviewDiffDocument,
+    source_side: DiffSide,
+    source_line: u32,
+    target_side: DiffSide,
+) -> u32 {
+    if source_side == target_side {
+        return source_line;
+    }
+    let source_count = match source_side {
+        DiffSide::Old => document.old.line_count,
+        DiffSide::New => document.new.line_count,
+    };
+    let target_count = match target_side {
+        DiffSide::Old => document.old.line_count,
+        DiffSide::New => document.new.line_count,
+    };
+    if target_count == 0 {
+        return 0;
+    }
+    let mut pairs = document
+        .hunks
+        .iter()
+        .flat_map(|hunk| hunk.split_rows.iter())
+        .filter_map(|row| {
+            let (Some(old), Some(new)) = (&row.old, &row.new) else {
+                return None;
+            };
+            Some(match source_side {
+                DiffSide::Old => (old.line_number, new.line_number),
+                DiffSide::New => (new.line_number, old.line_number),
+            })
+        })
+        .collect::<Vec<_>>();
+    pairs.push((0, 0));
+    pairs.push((
+        source_count.saturating_add(1),
+        target_count.saturating_add(1),
+    ));
+    pairs.sort_unstable();
+    pairs.dedup();
+    if let Some((_, target)) = pairs.iter().find(|(source, _)| *source == source_line) {
+        return (*target).clamp(1, target_count);
+    }
+    let before = pairs
+        .iter()
+        .rev()
+        .find(|(source, _)| *source < source_line)
+        .copied()
+        .unwrap_or((0, 0));
+    let after = pairs
+        .iter()
+        .find(|(source, _)| *source > source_line)
+        .copied()
+        .unwrap_or((
+            source_count.saturating_add(1),
+            target_count.saturating_add(1),
+        ));
+    let mapped = before
+        .1
+        .saturating_add(source_line.saturating_sub(before.0))
+        .min(after.1);
+    mapped.clamp(1, target_count)
 }
 
 fn full_file_row_view(
@@ -7213,54 +7431,72 @@ fn full_file_row_view(
                 .then(|| source_offset(old_offsets, row.line_number)),
             new_source_start_byte: (row.side == DiffSide::New)
                 .then(|| source_offset(new_offsets, row.line_number)),
-            deletion_block_id: None,
-            deletion_count: None,
-            old_end_line: None,
-            deletion_expanded: None,
+            omitted_block_id: None,
+            omitted_count: None,
+            omitted_end_line: None,
+            omitted_side: None,
+            omitted_expanded: None,
         },
-        FullFileProjectedRow::DeletionGate(block, expanded) => {
+        FullFileProjectedRow::OmittedGate(block, expanded) => {
             let count = u32::try_from(block.rows.len()).unwrap_or(u32::MAX);
+            let omission = if block.side == DiffSide::Old {
+                "deleted"
+            } else {
+                "added"
+            };
             DiffRowView {
-                id: format!("full:deletion-gate:{}", block.id),
-                kind: "deletion_gate".into(),
+                id: format!("full:{omission}-gate:{}", block.id),
+                kind: if block.side == DiffSide::Old {
+                    "deletion_gate"
+                } else {
+                    "addition_gate"
+                }
+                .into(),
                 hunk_id: None,
-                old_line: Some(block.start_line()),
-                new_line: None,
+                old_line: (block.side == DiffSide::Old).then(|| block.start_line()),
+                new_line: (block.side == DiffSide::New).then(|| block.start_line()),
                 old_text: None,
                 new_text: None,
                 text: Some(format!(
-                    "{count} deleted {}",
+                    "{count} {omission} {}",
                     if count == 1 { "line" } else { "lines" }
                 )),
                 hunk: None,
                 has_annotation: false,
                 old_source_start_byte: None,
                 new_source_start_byte: None,
-                deletion_block_id: Some(block.id.clone()),
-                deletion_count: Some(count),
-                old_end_line: Some(block.end_line()),
-                deletion_expanded: Some(*expanded),
+                omitted_block_id: Some(block.id.clone()),
+                omitted_count: Some(count),
+                omitted_end_line: Some(block.end_line()),
+                omitted_side: Some(side_name(block.side).into()),
+                omitted_expanded: Some(*expanded),
             }
         }
     }
 }
 
-fn full_file_deletion_block_views(
-    blocks: &[FullFileDeletionBlock],
+fn full_file_omitted_block_views(
+    blocks: &[FullFileOmittedBlock],
     projection: &[FullFileProjectedRow],
-    expanded_blocks: &BTreeSet<String>,
-) -> Vec<FullFileDeletionBlockView> {
+) -> Vec<FullFileOmittedBlockView> {
     blocks
         .iter()
-        .map(|block| FullFileDeletionBlockView {
+        .map(|block| FullFileOmittedBlockView {
             id: block.id.clone(),
+            side: side_name(block.side).into(),
             start_line: block.start_line(),
             end_line: block.end_line(),
             count: u32::try_from(block.rows.len()).unwrap_or(u32::MAX),
-            expanded: expanded_blocks.contains(&block.id),
+            expanded: projection.iter().any(|row| {
+                matches!(
+                    row,
+                    FullFileProjectedRow::OmittedGate(candidate, true)
+                        if candidate.id == block.id
+                )
+            }),
             row_index: u32::try_from(nearest_full_file_row(
                 projection,
-                DiffSide::Old,
+                block.side,
                 block.start_line(),
             ))
             .unwrap_or(u32::MAX),
@@ -7317,7 +7553,10 @@ fn workspace_ui_state_view(state: &ReviewUiState) -> WorkspaceUiStateView {
     WorkspaceUiStateView {
         active_file_id: state.active_file_id.clone(),
         mode: state.mode.clone().unwrap_or_else(|| "unified".into()),
-        full_file_side: state.full_file_side.clone().unwrap_or_else(|| "new".into()),
+        full_file_side: state
+            .full_file_side
+            .clone()
+            .unwrap_or_else(|| "both".into()),
         nearest_source_line: state.nearest_source_line,
         nearest_source_side: state.nearest_source_side.clone(),
         scroll_top: state.scroll_top.unwrap_or(0.0),
@@ -7332,13 +7571,18 @@ fn workspace_ui_state_view(state: &ReviewUiState) -> WorkspaceUiStateView {
             .iter()
             .cloned()
             .collect(),
+        collapsed_full_file_addition_blocks: state
+            .collapsed_full_file_addition_blocks
+            .iter()
+            .cloned()
+            .collect(),
     }
 }
 
 fn build_canonical_presentation(
     document: &ReviewDiffDocument,
     mode: &str,
-    full_file_side: DiffSide,
+    full_file_view: FullFileView,
     state: &ReviewUiState,
 ) -> Result<CachedCanonicalPresentation, DispatchError> {
     match mode {
@@ -7382,10 +7626,11 @@ fn build_canonical_presentation(
                     has_annotation: false,
                     old_source_start_byte: None,
                     new_source_start_byte: None,
-                    deletion_block_id: None,
-                    deletion_count: None,
-                    old_end_line: None,
-                    deletion_expanded: None,
+                    omitted_block_id: None,
+                    omitted_count: None,
+                    omitted_end_line: None,
+                    omitted_side: None,
+                    omitted_expanded: None,
                 });
                 let extra = context.saturating_sub(3);
                 rows.extend(expanded_context_rows(
@@ -7446,33 +7691,33 @@ fn build_canonical_presentation(
             Ok(CachedCanonicalPresentation {
                 rows,
                 hunks,
-                deletion_blocks: Vec::new(),
+                omitted_blocks: Vec::new(),
             })
         }
         "full" => {
-            let side = if document.file.status == localreview_diff::ReviewFileStatus::Deleted {
-                DiffSide::Old
+            let view = if document.file.status == localreview_diff::ReviewFileStatus::Deleted {
+                FullFileView::Old
             } else {
-                full_file_side
+                full_file_view
             };
             let old_offsets = source_line_offsets(&document.old.content);
             let new_offsets = source_line_offsets(&document.new.content);
-            let (projection, blocks) =
-                full_file_projection(document, side, &state.expanded_full_file_deletion_blocks);
+            let (projection, blocks) = full_file_projection(
+                document,
+                view,
+                &state.expanded_full_file_deletion_blocks,
+                &state.collapsed_full_file_addition_blocks,
+            );
             let rows = projection
                 .iter()
                 .map(|row| full_file_row_view(row, &old_offsets, &new_offsets))
                 .collect::<Vec<_>>();
-            let hunks = full_file_hunk_locations(document, side, &projection);
-            let deletion_blocks = full_file_deletion_block_views(
-                &blocks,
-                &projection,
-                &state.expanded_full_file_deletion_blocks,
-            );
+            let hunks = full_file_hunk_locations(document, view.primary_side(), &projection);
+            let omitted_blocks = full_file_omitted_block_views(&blocks, &projection);
             Ok(CachedCanonicalPresentation {
                 rows,
                 hunks,
-                deletion_blocks,
+                omitted_blocks,
             })
         }
         _ => Err(DispatchError::Invalid(
@@ -7557,10 +7802,11 @@ fn expanded_context_rows(
             has_annotation: false,
             old_source_start_byte: old_line.map(|line| source_offset(old_offsets, line)),
             new_source_start_byte: new_line.map(|line| source_offset(new_offsets, line)),
-            deletion_block_id: None,
-            deletion_count: None,
-            old_end_line: None,
-            deletion_expanded: None,
+            omitted_block_id: None,
+            omitted_count: None,
+            omitted_end_line: None,
+            omitted_side: None,
+            omitted_expanded: None,
         });
     }
     if before {
@@ -7591,10 +7837,11 @@ fn diff_row_from_cells(
         has_annotation: false,
         old_source_start_byte: old.map(|cell| source_offset(old_offsets, cell.line_number)),
         new_source_start_byte: new.map(|cell| source_offset(new_offsets, cell.line_number)),
-        deletion_block_id: None,
-        deletion_count: None,
-        old_end_line: None,
-        deletion_expanded: None,
+        omitted_block_id: None,
+        omitted_count: None,
+        omitted_end_line: None,
+        omitted_side: None,
+        omitted_expanded: None,
     }
 }
 
@@ -7657,7 +7904,12 @@ fn full_file_hunk_locations(
                     DiffSide::Old => row
                         .old
                         .as_ref()
-                        .map(|cell| (DiffSide::Old, cell.line_number)),
+                        .map(|cell| (DiffSide::Old, cell.line_number))
+                        .or_else(|| {
+                            row.new
+                                .as_ref()
+                                .map(|cell| (DiffSide::New, cell.line_number))
+                        }),
                     DiffSide::New => row
                         .old
                         .as_ref()
@@ -7689,24 +7941,6 @@ fn full_file_hunk_locations(
             }
         })
         .collect()
-}
-
-fn annotation_at(
-    annotations: &[Annotation],
-    document: &ReviewDiffDocument,
-    side: DiffSide,
-    line: u32,
-) -> bool {
-    annotations.iter().any(|annotation| {
-        !is_soft_deleted(annotation)
-            && annotation.anchor.as_ref().is_some_and(|anchor| {
-                anchor.comparison_id == document.comparison_id
-                    && anchor.file_path == document.file.path
-                    && anchor.side == Some(side)
-                    && anchor.start_line.unwrap_or_default() <= line
-                    && anchor.end_line.unwrap_or_default() >= line
-            })
-    })
 }
 
 fn annotation_overlaps(
@@ -8732,10 +8966,11 @@ fn header_row(hunk: &localreview_diff::ReviewHunk) -> DiffRowView {
         has_annotation: false,
         old_source_start_byte: None,
         new_source_start_byte: None,
-        deletion_block_id: None,
-        deletion_count: None,
-        old_end_line: None,
-        deletion_expanded: None,
+        omitted_block_id: None,
+        omitted_count: None,
+        omitted_end_line: None,
+        omitted_side: None,
+        omitted_expanded: None,
     }
 }
 
@@ -9383,6 +9618,17 @@ fn parse_side(value: &str) -> Result<DiffSide, DispatchError> {
         "new" => Ok(DiffSide::New),
         _ => Err(DispatchError::Invalid(
             "annotation side must be old or new".into(),
+        )),
+    }
+}
+
+fn parse_full_file_view(value: &str) -> Result<FullFileView, DispatchError> {
+    match value {
+        "old" => Ok(FullFileView::Old),
+        "new" => Ok(FullFileView::New),
+        "both" => Ok(FullFileView::Both),
+        _ => Err(DispatchError::Invalid(
+            "fullFileSide must be old, new, or both".into(),
         )),
     }
 }
@@ -10453,6 +10699,7 @@ mod tests {
                     full_file_side: Some("new".into()),
                     split_ratio: None,
                     ephemeral_expanded_full_file_deletion_blocks: None,
+                    ephemeral_collapsed_full_file_addition_blocks: None,
                 },
                 resources.path(),
             )
@@ -10488,6 +10735,7 @@ mod tests {
                     full_file_side: Some("new".into()),
                     split_ratio: None,
                     ephemeral_expanded_full_file_deletion_blocks: None,
+                    ephemeral_collapsed_full_file_addition_blocks: None,
                 },
                 resources.path(),
             )
@@ -10504,6 +10752,7 @@ mod tests {
                     full_file_side: Some("new".into()),
                     split_ratio: None,
                     ephemeral_expanded_full_file_deletion_blocks: None,
+                    ephemeral_collapsed_full_file_addition_blocks: None,
                 },
                 resources.path(),
             )
@@ -11289,7 +11538,7 @@ mod tests {
             state.hunk_context_lines.insert(format!("view-{index}"), 3);
             fixture
                 .controller
-                .cached_canonical_rows(&document, "unified", DiffSide::New, &state)
+                .cached_canonical_rows(&document, "unified", FullFileView::New, &state)
                 .unwrap();
         }
         let cache = fixture.controller.presentation_cache.lock().unwrap();
@@ -11323,11 +11572,11 @@ mod tests {
 
         let first = fixture
             .controller
-            .cached_canonical_rows(&document, "full", DiffSide::New, &state)
+            .cached_canonical_rows(&document, "full", FullFileView::New, &state)
             .unwrap();
         let second = fixture
             .controller
-            .cached_canonical_rows(&document, "full", DiffSide::New, &state)
+            .cached_canonical_rows(&document, "full", FullFileView::New, &state)
             .unwrap();
 
         assert!(first.rows.len() > 12_000);
@@ -11403,6 +11652,7 @@ mod tests {
                     full_file_side: Some("new".into()),
                     split_ratio: Some(0.5),
                     ephemeral_expanded_full_file_deletion_blocks: None,
+                    ephemeral_collapsed_full_file_addition_blocks: None,
                 },
                 resources.path(),
             )
@@ -11430,6 +11680,7 @@ mod tests {
                     full_file_side: None,
                     split_ratio: None,
                     ephemeral_expanded_full_file_deletion_blocks: None,
+                    ephemeral_collapsed_full_file_addition_blocks: None,
                 },
                 resources.path(),
             )
@@ -11453,6 +11704,7 @@ mod tests {
                     full_file_side: Some("new".into()),
                     split_ratio: None,
                     ephemeral_expanded_full_file_deletion_blocks: None,
+                    ephemeral_collapsed_full_file_addition_blocks: None,
                 },
                 resources.path(),
             )
@@ -11468,7 +11720,7 @@ mod tests {
         assert!(full.rows.iter().any(|row| {
             row.kind == "deletion_gate"
                 && row.old_line == Some(40)
-                && row.old_end_line == Some(40)
+                && row.omitted_end_line == Some(40)
                 && row.old_source_start_byte.is_none()
         }));
         assert!(full.old_tokens.is_empty());
@@ -11524,6 +11776,7 @@ mod tests {
                     full_file_side: Some("new".into()),
                     split_ratio: None,
                     ephemeral_expanded_full_file_deletion_blocks: None,
+                    ephemeral_collapsed_full_file_addition_blocks: None,
                 },
                 resources.path(),
             )
@@ -11536,7 +11789,7 @@ mod tests {
             .iter()
             .enumerate()
             .filter(|(_, row)| row.kind == "deletion_gate")
-            .map(|(index, row)| (index, row.old_line, row.old_end_line, row.deletion_count))
+            .map(|(index, row)| (index, row.old_line, row.omitted_end_line, row.omitted_count))
             .collect::<Vec<_>>();
         assert_eq!(
             gates,
@@ -11545,8 +11798,8 @@ mod tests {
                 (17, Some(20), Some(21), Some(2)),
             ]
         );
-        assert_eq!(full.deletion_blocks.len(), 2);
-        assert!(full.deletion_blocks.iter().all(|block| !block.expanded));
+        assert_eq!(full.omitted_blocks.len(), 2);
+        assert!(full.omitted_blocks.iter().all(|block| !block.expanded));
         assert!(full.rows[4].has_annotation);
         assert!(!full.rows[17].has_annotation);
         assert_eq!(
@@ -11579,7 +11832,7 @@ mod tests {
         assert_eq!(location.row_index, 17);
 
         let mut expanded_ids = full
-            .deletion_blocks
+            .omitted_blocks
             .iter()
             .map(|block| block.id.clone())
             .collect::<Vec<_>>();
@@ -11597,11 +11850,12 @@ mod tests {
                     full_file_side: Some("new".into()),
                     split_ratio: None,
                     ephemeral_expanded_full_file_deletion_blocks: Some(expanded_ids.clone()),
+                    ephemeral_collapsed_full_file_addition_blocks: None,
                 },
                 resources.path(),
             )
             .unwrap();
-        assert!(ephemeral.deletion_blocks.iter().all(|block| block.expanded));
+        assert!(ephemeral.omitted_blocks.iter().all(|block| block.expanded));
         assert!(
             fixture
                 .controller
@@ -11652,13 +11906,14 @@ mod tests {
                     full_file_side: Some("new".into()),
                     split_ratio: None,
                     ephemeral_expanded_full_file_deletion_blocks: None,
+                    ephemeral_collapsed_full_file_addition_blocks: None,
                 },
                 resources.path(),
             )
             .unwrap();
         // Each expanded block retains its one-row inline collapse gate.
         assert_eq!(expanded.total_rows, 32);
-        assert!(expanded.deletion_blocks.iter().all(|block| block.expanded));
+        assert!(expanded.omitted_blocks.iter().all(|block| block.expanded));
         assert_eq!(
             expanded
                 .rows
@@ -11681,7 +11936,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .filter(|(_, row)| row.kind == "deletion_gate")
-                .map(|(index, row)| (index, row.deletion_expanded))
+                .map(|(index, row)| (index, row.omitted_expanded))
                 .collect::<Vec<_>>(),
             vec![(4, Some(true)), (20, Some(true))]
         );
@@ -11706,6 +11961,334 @@ mod tests {
             .unwrap();
         assert_eq!(expanded_location.row_index, 21);
         assert!(!expanded.old_tokens.is_empty());
+    }
+
+    #[test]
+    fn full_file_base_collapses_additions_and_aligns_both_sides_across_line_shifts() {
+        let old = (1..=30)
+            .map(|line| format!("let value_{line} = {line};\n"))
+            .collect::<String>();
+        let mut new = String::new();
+        for line in 1..=30 {
+            new.push_str(&format!("let value_{line} = {line};\n"));
+            if line == 5 {
+                new.push_str(
+                    "let inserted_a = true;\nlet inserted_b = true;\nlet inserted_c = true;\n",
+                );
+            }
+            if line == 20 {
+                new.push_str("let inserted_d = true;\nlet inserted_e = true;\n");
+            }
+        }
+        let fixture = review_fixture(&old, &new);
+        let resources = TempDir::new().unwrap();
+        fixture
+            .controller
+            .save_workspace_ui_state(
+                fixture.workspace_id,
+                serde_json::from_value(serde_json::json!({ "fullFileSide": "old" })).unwrap(),
+            )
+            .unwrap();
+        let base = fixture
+            .controller
+            .presentation_window(
+                PresentationRequest {
+                    file_id: fixture.file_id.to_string(),
+                    comparison_id: None,
+                    mode: "full".into(),
+                    start_row: 0,
+                    end_row: u32::MAX,
+                    generation: 30,
+                    full_file_side: Some("old".into()),
+                    split_ratio: None,
+                    ephemeral_expanded_full_file_deletion_blocks: None,
+                    ephemeral_collapsed_full_file_addition_blocks: None,
+                },
+                resources.path(),
+            )
+            .unwrap();
+        let gates = base
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.kind == "addition_gate")
+            .map(|(index, row)| (index, row.new_line, row.omitted_end_line, row.omitted_count))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            gates,
+            vec![
+                (5, Some(6), Some(8), Some(3)),
+                (21, Some(24), Some(25), Some(2)),
+            ]
+        );
+        assert!(base
+            .omitted_blocks
+            .iter()
+            .all(|block| block.side == "new" && !block.expanded));
+
+        let collapsed_midpoint = fixture
+            .controller
+            .resolve_presentation_location(
+                fixture.file_id,
+                None,
+                "full",
+                DiffSide::New,
+                7,
+                resources.path(),
+            )
+            .unwrap();
+        assert_eq!(collapsed_midpoint.row_index, 5);
+
+        let aligned_base_context = fixture
+            .controller
+            .resolve_presentation_location(
+                fixture.file_id,
+                None,
+                "full",
+                DiffSide::New,
+                30,
+                resources.path(),
+            )
+            .unwrap();
+        assert_eq!(
+            base.rows[usize::try_from(aligned_base_context.row_index).unwrap()].old_line,
+            Some(25)
+        );
+
+        let expanded_ids = base
+            .omitted_blocks
+            .iter()
+            .map(|block| block.id.clone())
+            .collect::<Vec<_>>();
+        let expanded = fixture
+            .controller
+            .presentation_window(
+                PresentationRequest {
+                    file_id: fixture.file_id.to_string(),
+                    comparison_id: None,
+                    mode: "full".into(),
+                    start_row: 0,
+                    end_row: u32::MAX,
+                    generation: 31,
+                    full_file_side: Some("old".into()),
+                    split_ratio: None,
+                    ephemeral_expanded_full_file_deletion_blocks: Some(expanded_ids),
+                    ephemeral_collapsed_full_file_addition_blocks: None,
+                },
+                resources.path(),
+            )
+            .unwrap();
+        assert_eq!(
+            expanded
+                .rows
+                .iter()
+                .filter(|row| row.kind == "addition")
+                .count(),
+            5
+        );
+
+        fixture
+            .controller
+            .save_workspace_ui_state(
+                fixture.workspace_id,
+                serde_json::from_value(serde_json::json!({ "fullFileSide": "new" })).unwrap(),
+            )
+            .unwrap();
+        let aligned_current_context = fixture
+            .controller
+            .resolve_presentation_location(
+                fixture.file_id,
+                None,
+                "full",
+                DiffSide::Old,
+                25,
+                resources.path(),
+            )
+            .unwrap();
+        let current = fixture
+            .controller
+            .presentation_window(
+                PresentationRequest {
+                    file_id: fixture.file_id.to_string(),
+                    comparison_id: None,
+                    mode: "full".into(),
+                    start_row: aligned_current_context.row_index,
+                    end_row: aligned_current_context.row_index.saturating_add(1),
+                    generation: 32,
+                    full_file_side: Some("new".into()),
+                    split_ratio: None,
+                    ephemeral_expanded_full_file_deletion_blocks: None,
+                    ephemeral_collapsed_full_file_addition_blocks: None,
+                },
+                resources.path(),
+            )
+            .unwrap();
+        assert_eq!(current.rows[0].new_line, Some(30));
+    }
+
+    #[test]
+    fn full_file_both_defaults_additions_open_deletions_closed_and_persists_each_control() {
+        let fixture = review_fixture(
+            "keep\nold a\nold b\ntail\n",
+            "keep\nnew a\nnew b\nnew c\ntail\n",
+        );
+        let resources = TempDir::new().unwrap();
+        let both = fixture
+            .controller
+            .presentation_window(
+                PresentationRequest {
+                    file_id: fixture.file_id.to_string(),
+                    comparison_id: None,
+                    mode: "full".into(),
+                    start_row: 0,
+                    end_row: u32::MAX,
+                    generation: 40,
+                    full_file_side: Some("both".into()),
+                    split_ratio: None,
+                    ephemeral_expanded_full_file_deletion_blocks: None,
+                    ephemeral_collapsed_full_file_addition_blocks: None,
+                },
+                resources.path(),
+            )
+            .unwrap();
+        let addition = both
+            .omitted_blocks
+            .iter()
+            .find(|block| block.side == "new")
+            .unwrap();
+        let deletion = both
+            .omitted_blocks
+            .iter()
+            .find(|block| block.side == "old")
+            .unwrap();
+        let total_additions = both
+            .omitted_blocks
+            .iter()
+            .filter(|block| block.side == "new")
+            .map(|block| usize::try_from(block.count).unwrap())
+            .sum::<usize>();
+        assert!(addition.expanded);
+        assert!(!deletion.expanded);
+        assert_eq!(
+            both.rows
+                .iter()
+                .filter(|row| row.kind == "addition")
+                .count(),
+            total_additions
+        );
+        assert_eq!(
+            both.rows
+                .iter()
+                .filter(|row| row.kind == "deletion")
+                .count(),
+            0
+        );
+
+        let addition_id = addition.id.clone();
+        let deletion_id = deletion.id.clone();
+        let collapsed_in_place = fixture
+            .controller
+            .presentation_window(
+                PresentationRequest {
+                    file_id: fixture.file_id.to_string(),
+                    comparison_id: None,
+                    mode: "full".into(),
+                    start_row: 0,
+                    end_row: u32::MAX,
+                    generation: 41,
+                    full_file_side: Some("both".into()),
+                    split_ratio: None,
+                    ephemeral_expanded_full_file_deletion_blocks: Some(vec![]),
+                    ephemeral_collapsed_full_file_addition_blocks: Some(vec![addition_id.clone()]),
+                },
+                resources.path(),
+            )
+            .unwrap();
+        assert_eq!(
+            collapsed_in_place
+                .rows
+                .iter()
+                .filter(|row| row.kind == "addition")
+                .count(),
+            total_additions.saturating_sub(usize::try_from(addition.count).unwrap())
+        );
+        let expanded_in_place = fixture
+            .controller
+            .presentation_window(
+                PresentationRequest {
+                    file_id: fixture.file_id.to_string(),
+                    comparison_id: None,
+                    mode: "full".into(),
+                    start_row: 0,
+                    end_row: u32::MAX,
+                    generation: 42,
+                    full_file_side: Some("both".into()),
+                    split_ratio: None,
+                    ephemeral_expanded_full_file_deletion_blocks: Some(vec![]),
+                    ephemeral_collapsed_full_file_addition_blocks: Some(vec![]),
+                },
+                resources.path(),
+            )
+            .unwrap();
+        assert_eq!(
+            expanded_in_place
+                .rows
+                .iter()
+                .filter(|row| row.kind == "addition")
+                .count(),
+            total_additions
+        );
+        fixture
+            .controller
+            .save_workspace_ui_state(
+                fixture.workspace_id,
+                serde_json::from_value(serde_json::json!({
+                    "fullFileSide": "both",
+                    "expandedFullFileDeletionBlocks": [deletion_id],
+                    "collapsedFullFileAdditionBlocks": [addition_id]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let reopened =
+            DesktopController::new(StateStore::open(fixture._state_directory.path()).unwrap());
+        let state = reopened.workspace_ui_state(fixture.workspace_id).unwrap();
+        assert_eq!(state.full_file_side, "both");
+        assert_eq!(state.expanded_full_file_deletion_blocks, vec![deletion_id]);
+        assert_eq!(state.collapsed_full_file_addition_blocks, vec![addition_id]);
+        let toggled = reopened
+            .presentation_window(
+                PresentationRequest {
+                    file_id: fixture.file_id.to_string(),
+                    comparison_id: None,
+                    mode: "full".into(),
+                    start_row: 0,
+                    end_row: u32::MAX,
+                    generation: 43,
+                    full_file_side: Some("both".into()),
+                    split_ratio: None,
+                    ephemeral_expanded_full_file_deletion_blocks: None,
+                    ephemeral_collapsed_full_file_addition_blocks: None,
+                },
+                resources.path(),
+            )
+            .unwrap();
+        assert_eq!(
+            toggled
+                .rows
+                .iter()
+                .filter(|row| row.kind == "addition")
+                .count(),
+            total_additions.saturating_sub(usize::try_from(addition.count).unwrap())
+        );
+        assert_eq!(
+            toggled
+                .rows
+                .iter()
+                .filter(|row| row.kind == "deletion")
+                .count(),
+            usize::try_from(deletion.count).unwrap()
+        );
     }
 
     #[test]
@@ -11745,10 +12328,10 @@ mod tests {
 
         assert_eq!((unified.side.as_str(), unified.line), ("new", 180));
         assert!(unified.row_index > 0);
-        // The replacement at line 180 contributes one old-side tombstone to
-        // Current Full File, so every later Current source line is shifted by
-        // one presentation row while retaining its source coordinate.
-        assert_eq!(full.row_index, 240);
+        // Both is the Full File default. The replacement contributes one
+        // collapsed deletion gate plus one expanded addition gate before the
+        // Current source row, while retaining the source coordinate.
+        assert_eq!(full.row_index, 241);
         assert!(fixture
             .controller
             .resolve_presentation_location(
@@ -12270,7 +12853,7 @@ mod tests {
         let presentation = build_canonical_presentation(
             &document,
             "unified",
-            DiffSide::New,
+            FullFileView::New,
             &ReviewUiState::default(),
         )
         .unwrap();
@@ -12665,6 +13248,7 @@ mod tests {
                     full_file_side: None,
                     split_ratio: None,
                     ephemeral_expanded_full_file_deletion_blocks: None,
+                    ephemeral_collapsed_full_file_addition_blocks: None,
                 },
                 Path::new("."),
             )
@@ -13423,6 +14007,7 @@ mod tests {
                     full_file_side: None,
                     split_ratio: Some(0.5),
                     ephemeral_expanded_full_file_deletion_blocks: None,
+                    ephemeral_collapsed_full_file_addition_blocks: None,
                 },
                 &resource_dir,
             )
