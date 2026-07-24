@@ -97,15 +97,14 @@
     const result: Entry[] = [];
     const fileHeight = (file: ReviewFile) => {
       // Repository grouping already renders the directory and repository
-      // ancestry. Size its virtual row from what is actually visible, not the
-      // hidden fully-qualified path retained only for title/ARIA.
-      const displayedPath = mode === 'flat' ? file.path : basename(file.path);
-      const pathLines = Math.max(1, Math.ceil(displayedPath.length / Math.max(24, Math.floor(42 / scale))));
+      // ancestry. The filename and compact stats use separate rows, so long
+      // hidden paths must not reserve blank vertical space.
       const metadataLines =
         Number(Boolean(file.previousPath))
         + Number(mode !== 'repository')
         + Number(classificationBadges(file).length > 0);
-      return Math.ceil((42 + Math.min(2, pathLines - 1 + metadataLines) * 16) * scale);
+      const visibleTextLines = 1 + metadataLines;
+      return Math.max(38, Math.ceil(8 + (visibleTextLines * 13 + 14) * scale));
     };
     if (mode === 'flat') return source.map((file) => ({ kind: 'file', id: file.id, file, depth: 0, height: fileHeight(file) }));
 
@@ -216,6 +215,10 @@
     });
   }
   function activate(fileId: string) { onSelect(fileId); }
+  function openFile(file: ReviewFile) {
+    activate(file.id);
+    onToggleViewed(file.id, !file.viewed);
+  }
   function toggleGroup(id: string) {
     const next = new Set(collapsedGroups);
     next.has(id) ? next.delete(id) : next.add(id);
@@ -234,15 +237,15 @@
     await tick();
     viewport.querySelector<HTMLButtonElement>(`[data-file-id="${CSS.escape(target.id)}"]`)?.focus({ preventScroll: true });
   }
-  function onKeydown(event: KeyboardEvent, fileId: string) {
+  function onKeydown(event: KeyboardEvent, file: ReviewFile) {
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       event.preventDefault();
-      void moveFocus(fileId, event.key === 'ArrowDown' ? 1 : -1);
+      void moveFocus(file.id, event.key === 'ArrowDown' ? 1 : -1);
       return;
     }
     if (event.key !== 'Enter' && event.key !== ' ') return;
     event.preventDefault();
-    activate(fileId);
+    openFile(file);
   }
 
   function classificationBadges(file: ReviewFile) {
@@ -309,12 +312,12 @@
           {@const repositoryName = repositoryNames.get(file.repositoryId) ?? file.repositoryId}
           {@const badges = classificationBadges(file)}
           {@const displayPath = displayedFilePath(file.path)}
-          <div class:active={file.id === activeFileId} class="file-row" role="treeitem" aria-level={entry.depth + 1} aria-selected={file.id === activeFileId} style:height={`${entry.height}px`} style:padding-left={`${entry.depth * 14}px`}>
-            <button class="file-select" data-file-id={file.id} title={file.path} aria-label={`${file.path}, ${repositoryName}, ${file.status}, ${file.viewed ? 'viewed' : 'unviewed'}, ${file.annotationCount} annotations${badges.length ? `, ${badges.map((badge) => badge[1]).join(', ')}` : ''}`} on:focus={() => focusedFileId = file.id} on:click={() => activate(file.id)} on:keydown={(event) => onKeydown(event, file.id)}>
+          <div class:active={file.id === activeFileId} class="file-row" role="treeitem" aria-level={entry.depth + 1} aria-selected={file.id === activeFileId} style:height={`${entry.height}px`} style:padding-left={`${Math.min(entry.depth, 4) * 6}px`}>
+            <button class="file-select" data-file-id={file.id} title={`${file.path} — click to mark ${file.viewed ? 'unviewed' : 'viewed'}`} aria-label={`${file.path}, ${repositoryName}, ${file.status}, ${file.viewed ? 'viewed' : 'unviewed'}, click to mark ${file.viewed ? 'unviewed' : 'viewed'}, ${file.annotationCount} annotations${badges.length ? `, ${badges.map((badge) => badge[1]).join(', ')}` : ''}`} aria-pressed={file.viewed} on:focus={() => focusedFileId = file.id} on:click={() => openFile(file)} on:keydown={(event) => onKeydown(event, file)}>
               <span class:viewed={file.viewed} class="view-marker" aria-hidden="true"></span>
               <span class="file-info"><span class="file-path" title={file.path}>{displayPath}</span>{#if file.previousPath}<span class="old-path" title={file.previousPath}>{displayedFilePath(file.previousPath)}</span>{/if}{#if grouping !== 'repository'}<span class="file-repo">{repositoryName}</span>{/if}{#if badges.length}<span class="classification-badges" aria-label="Capture-time file classifications">{#each badges as badge (badge[0])}<span class={`classification-badge ${badge[0]}`}>{badge[1]}</span>{/each}</span>{/if}</span>
             </button>
-            <div class="file-row-stats"><button class="view-toggle" aria-label={`Mark ${file.path} ${file.viewed ? 'unviewed' : 'viewed'}`} aria-pressed={file.viewed} on:click={() => onToggleViewed(file.id, !file.viewed)}>{file.viewed ? 'Viewed' : 'Mark viewed'}</button><span class="status-chip {file.status}" aria-label={file.status}>{file.status[0].toUpperCase()}</span><span class="additions">+{file.additions}</span>{#if file.deletions}<span class="deletions">−{file.deletions}</span>{/if}{#if file.annotationCount}<span class="annotation-count">● {file.annotationCount}</span>{/if}</div>
+            <div class="file-row-stats"><span class="status-chip {file.status}" aria-label={file.status}>{file.status[0].toUpperCase()}</span><span class="additions">+{file.additions}</span>{#if file.deletions}<span class="deletions">−{file.deletions}</span>{/if}{#if file.annotationCount}<span class="annotation-count">● {file.annotationCount}</span>{/if}</div>
           </div>
         {/if}
       {/each}

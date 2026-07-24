@@ -192,8 +192,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 
 /* Review setup and durable-history controls added after the initial shell. */
 .file-row { cursor: pointer; }
-.view-toggle { padding: 2px 4px; border: 1px solid #3b4f69; border-radius: 4px; background: #192534; color: #a9c7ed; font-size: calc(9px * var(--font-scale)); }
-.view-toggle:hover { background: #274263; color: #fff; }
 .history-actions { display: flex; gap: 6px; }
 .archived-workspaces { display: grid; gap: 7px; padding: 12px 18px; border-bottom: 1px solid #304053; background: #121b27; overflow: auto; }
 .archived-workspaces > strong { color: #c6dcf7; font-size: calc(11px * var(--font-scale)); }
@@ -370,10 +368,11 @@ button.split-divider { cursor: col-resize; border: 0; padding: 0; min-width: 7px
 .virtual-file-list { overflow: auto; contain: strict; }
 .virtual-file-spacer { position: relative; min-width: 0; }
 .virtual-file-window { min-width: 0; }
-.virtual-file-list .file-row { display: flex; min-width: 0; align-items: stretch; padding: 0; }
-.file-select { min-width: 0; flex: 1 1 0; display: flex; align-items: flex-start; gap: 7px; padding: 8px 4px 8px 10px; border: 0; color: inherit; background: transparent; text-align: left; }
+.virtual-file-list .file-row { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto; align-content: start; gap: 0; padding: 0; }
+.file-select { grid-column: 1; grid-row: 1; width: 100%; min-width: 0; display: flex; align-items: flex-start; gap: 5px; padding: 4px 8px 1px 1px; border: 0; color: inherit; background: transparent; text-align: left; }
 .file-select:hover, .file-select:focus-visible { background: #18212e; outline-offset: -2px; }
-.virtual-file-list .file-row-stats { min-width: max-content; padding: 8px 10px 8px 3px; }
+.file-select:hover .view-marker, .file-select:focus-visible .view-marker { border-color: #9fc7fb; box-shadow: 0 0 0 2px #527caf55; }
+.virtual-file-list .file-row-stats { grid-column: 1; grid-row: 2; min-width: 0; justify-content: flex-end; padding: 1px 8px 4px 13px; }
 .virtual-group { display: flex; align-items: center; }
 
 .modal-backdrop { padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left)); }

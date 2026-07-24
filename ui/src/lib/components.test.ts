@@ -795,6 +795,8 @@ describe('review components', () => {
 
   it('compacts consecutive single-child folders without merging the repository row', async () => {
     const host = target();
+    const selections: string[] = [];
+    const viewedChanges: Array<[string, boolean]> = [];
     const component = mount(VirtualFileList, { target: host, props: {
       files: [{
         id: 'ghostty-model',
@@ -809,7 +811,9 @@ describe('review components', () => {
         annotationCount: 0
       }],
       repositories: [{ id: 'mono', name: 'mono', path: '/tmp/mono', branch: 'feature', base: 'origin/main', mergeBase: 'a', head: 'b' }],
-      grouping: 'repository'
+      grouping: 'repository',
+      onSelect: (fileId: string) => selections.push(fileId),
+      onToggleViewed: (fileId: string, viewed: boolean) => viewedChanges.push([fileId, viewed])
     } });
     await settle();
 
@@ -825,11 +829,18 @@ describe('review components', () => {
     expect(host.querySelectorAll('.file-row')).toHaveLength(1);
     const fileRow = host.querySelector<HTMLElement>('.file-row')!;
     expect(fileRow.getAttribute('aria-level')).toBe('3');
-    expect(fileRow.style.height).toBe('42px');
+    expect(fileRow.style.height).toBe('38px');
     expect(host.querySelector('.file-path')?.textContent).toBe('BossPaneModel.swift');
     expect(host.querySelector('.file-path')?.getAttribute('title')).toBe('tools/boss/app-macos/Sources/Ghostty/BossPaneModel.swift');
     expect(host.querySelector('.file-repo')).toBeNull();
     expect(host.querySelector('.file-select')?.getAttribute('aria-label')).toContain('tools/boss/app-macos/Sources/Ghostty/BossPaneModel.swift, mono, modified');
+    expect(fileRow.style.paddingLeft).toBe('12px');
+    expect(host.querySelector('.file-select')?.getAttribute('aria-pressed')).toBe('false');
+    expect(host.querySelector('.view-marker')?.classList.contains('viewed')).toBe(false);
+    expect(host.querySelector('.view-toggle')).toBeNull();
+    host.querySelector<HTMLButtonElement>('.file-select')?.click();
+    expect(selections).toEqual(['ghostty-model']);
+    expect(viewedChanges).toEqual([['ghostty-model', true]]);
 
     groups[1].click();
     await settle();
@@ -869,9 +880,43 @@ describe('review components', () => {
     expect(animationFrame).not.toHaveBeenCalled();
     expect(host.querySelectorAll('.file-row').length).toBeLessThan(40);
     const visiblePaths = [...host.querySelectorAll<HTMLElement>('.file-path')].map((node) => node.textContent ?? '');
-    expect(visiblePaths.some((path) => path.includes('file-068'))).toBe(true);
+    const visibleIndexes = visiblePaths.map((path) => Number(path.match(/file-(\d+)/)?.[1] ?? 0));
+    expect(Math.min(...visibleIndexes)).toBeGreaterThan(8_000);
     expect(visiblePaths.some((path) => path.includes('file-000'))).toBe(false);
     animationFrame.mockRestore();
+    unmount(component);
+  });
+
+  it('clicks a viewed filename to open it and mark it unviewed', async () => {
+    const viewedChanges: Array<[string, boolean]> = [];
+    const selections: string[] = [];
+    const host = target();
+    const component = mount(VirtualFileList, { target: host, props: {
+      files: [{
+        id: 'viewed-file',
+        repositoryId: 'repo',
+        path: 'src/already-reviewed.ts',
+        status: 'modified',
+        additions: 2,
+        deletions: 1,
+        hunkCount: 1,
+        language: 'TypeScript',
+        viewed: true,
+        annotationCount: 0
+      }],
+      repositories: [{ id: 'repo', name: 'repo', path: '/tmp/repo', branch: 'feature', base: 'origin/main', mergeBase: 'a', head: 'b' }],
+      grouping: 'repository',
+      onSelect: (fileId: string) => selections.push(fileId),
+      onToggleViewed: (fileId: string, viewed: boolean) => viewedChanges.push([fileId, viewed])
+    } });
+    await settle();
+
+    const filename = host.querySelector<HTMLButtonElement>('.file-select')!;
+    expect(filename.getAttribute('aria-pressed')).toBe('true');
+    expect(filename.querySelector('.view-marker')?.classList.contains('viewed')).toBe(true);
+    filename.click();
+    expect(selections).toEqual(['viewed-file']);
+    expect(viewedChanges).toEqual([['viewed-file', false]]);
     unmount(component);
   });
 
