@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-window",
-  "description": "The only frontend capability. Native review work is exposed through explicit commands; filesystem and shell plugins are deliberately absent.",
-  "windows": ["main"],
+  "description": "The reviewed main and code-navigation webviews. Native review work is exposed through explicit commands; filesystem and shell plugins are deliberately absent.",
+  "windows": ["main", "symbol-navigation-*"],
   "permissions": [
     "core:default",
     "core:window:allow-show",

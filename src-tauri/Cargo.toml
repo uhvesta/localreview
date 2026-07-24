@@ -1,6 +1,6 @@
 [package]
 name = "localreview-desktop"
-version = "0.1.6"
+version = "0.1.7"
 description = "LocalReview macOS desktop shell"
 authors = ["LocalReview contributors"]
 edition = "2021"
@@ -14,6 +14,14 @@ path = "src/lib.rs"
 [[bin]]
 name = "localreview-desktop"
 path = "src/main.rs"
+
+[[bin]]
+name = "localreview-perf"
+path = "src/perf_main.rs"
+required-features = ["perf-harness"]
+
+[features]
+perf-harness = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

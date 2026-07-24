@@ -458,6 +458,47 @@ impl HighlightService {
         request: &HighlightRequest<'_>,
         cancellation: Option<&HighlightCancellation>,
     ) -> HighlightResult {
+        self.highlight_ranges(request, cancellation, None)
+    }
+
+    /// Highlights an immutable source document but returns only tokens that
+    /// overlap the requested byte range. The complete parse remains cached;
+    /// cached viewport reads no longer clone and scan every token in a large
+    /// file merely to redraw a small disclosure window.
+    #[must_use]
+    pub fn highlight_byte_range(
+        &self,
+        request: &HighlightRequest<'_>,
+        cancellation: Option<&HighlightCancellation>,
+        byte_range: Option<(u32, u32)>,
+    ) -> HighlightResult {
+        let ranges = byte_range.map(|range| [range]);
+        self.highlight_ranges(
+            request,
+            cancellation,
+            ranges.as_ref().map(|ranges| ranges.as_slice()),
+        )
+    }
+
+    /// Returns tokens overlapping any requested viewport interval. Unlike one
+    /// min/max byte range, this does not ship syntax tokens for large
+    /// unchanged gaps between sparse unified-diff rows.
+    #[must_use]
+    pub fn highlight_byte_ranges(
+        &self,
+        request: &HighlightRequest<'_>,
+        cancellation: Option<&HighlightCancellation>,
+        byte_ranges: &[(u32, u32)],
+    ) -> HighlightResult {
+        self.highlight_ranges(request, cancellation, Some(byte_ranges))
+    }
+
+    fn highlight_ranges(
+        &self,
+        request: &HighlightRequest<'_>,
+        cancellation: Option<&HighlightCancellation>,
+        byte_ranges: Option<&[(u32, u32)]>,
+    ) -> HighlightResult {
         let language = resolve_language(request.path, request.source, request.language_attribute);
         let Some(language) = language else {
             return plain(None, PlainTextReason::UnknownLanguage);
@@ -482,7 +523,7 @@ impl HighlightService {
         }
         let key = cache_key(request, language);
         if let Ok(mut cache) = self.cache.lock() {
-            if let Some(tokens) = cache.get(&key) {
+            if let Some(tokens) = cache.get(&key, byte_ranges) {
                 return HighlightResult {
                     key: Some(key),
                     language: Some(language),
@@ -545,14 +586,15 @@ impl HighlightService {
             .source
             .len()
             .saturating_add(tokens.len().saturating_mul(24));
+        let visible_tokens = tokens_in_byte_ranges(&tokens, byte_ranges);
         if let Ok(mut cache) = self.cache.lock() {
-            cache.insert(key.clone(), tokens.clone(), weight);
+            cache.insert(key.clone(), tokens, weight);
         }
         HighlightResult {
             key: Some(key),
             language: Some(language),
             status: HighlightStatus::Highlighted,
-            tokens,
+            tokens: visible_tokens,
         }
     }
 
@@ -1552,6 +1594,52 @@ struct CacheEntry {
     weight: usize,
 }
 
+fn tokens_in_byte_ranges(
+    tokens: &[TokenSpan],
+    byte_ranges: Option<&[(u32, u32)]>,
+) -> Vec<TokenSpan> {
+    let Some(byte_ranges) = byte_ranges else {
+        return tokens.to_vec();
+    };
+    if byte_ranges.is_empty() {
+        return Vec::new();
+    }
+    let mut ranges = byte_ranges
+        .iter()
+        .copied()
+        .filter(|(start, end)| start < end)
+        .collect::<Vec<_>>();
+    ranges.sort_unstable();
+    let mut merged = Vec::<(u32, u32)>::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some((_, previous_end)) = merged.last_mut() {
+            if start <= *previous_end {
+                *previous_end = (*previous_end).max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    let mut visible = Vec::new();
+    let mut last_index = None;
+    for (start, end) in merged {
+        let first = tokens.partition_point(|token| token.end_byte <= start);
+        for (offset, token) in tokens[first..]
+            .iter()
+            .take_while(|token| token.start_byte < end)
+            .enumerate()
+        {
+            let index = first + offset;
+            if last_index == Some(index) {
+                continue;
+            }
+            visible.push(token.clone());
+            last_index = Some(index);
+        }
+    }
+    visible
+}
+
 #[derive(Debug)]
 struct WeightedLru {
     entries: HashMap<HighlightCacheKey, CacheEntry>,
@@ -1570,8 +1658,12 @@ impl WeightedLru {
         }
     }
 
-    fn get(&mut self, key: &HighlightCacheKey) -> Option<Vec<TokenSpan>> {
-        let tokens = self.entries.get(key)?.tokens.clone();
+    fn get(
+        &mut self,
+        key: &HighlightCacheKey,
+        byte_ranges: Option<&[(u32, u32)]>,
+    ) -> Option<Vec<TokenSpan>> {
+        let tokens = tokens_in_byte_ranges(&self.entries.get(key)?.tokens, byte_ranges);
         self.touch(key);
         Some(tokens)
     }
@@ -2045,6 +2137,51 @@ mod tests {
         assert!(second.key.is_some());
         assert!(service.cache_weight_bytes() <= 220);
         assert_ne!(first.key, second.key);
+    }
+
+    #[test]
+    fn cached_byte_range_reads_return_only_viewport_tokens() {
+        let source = "fn first() -> u32 { 1 }\nfn second() -> u32 { first() }\n";
+        let service = HighlightService::default();
+        let request = request("example.rs", source, DiffSide::New);
+        let complete = service.highlight(&request, None);
+        let start = u32::try_from(source.find("fn second").unwrap()).unwrap();
+        let end = u32::try_from(source.len()).unwrap();
+
+        let cold_or_cached = service.highlight_byte_range(&request, None, Some((start, end)));
+        let cached = service.highlight_byte_range(&request, None, Some((start, end)));
+
+        assert!(!cached.tokens.is_empty());
+        assert!(cached.tokens.len() < complete.tokens.len());
+        assert_eq!(cold_or_cached.tokens, cached.tokens);
+        assert!(cached
+            .tokens
+            .iter()
+            .all(|token| token.end_byte > start && token.start_byte < end));
+    }
+
+    #[test]
+    fn sparse_viewport_ranges_do_not_return_tokens_from_large_unchanged_gaps() {
+        let source = (0..2_000)
+            .map(|index| format!("fn generated_{index}() -> usize {{ {index} }}\n"))
+            .collect::<String>();
+        let service = HighlightService::default();
+        let request = request("generated.rs", &source, DiffSide::New);
+        let complete = service.highlight(&request, None);
+        let first_end = u32::try_from(source.find('\n').unwrap()).unwrap();
+        let last_start = u32::try_from(source.rfind("fn generated_1999").unwrap()).unwrap();
+        let end = u32::try_from(source.len()).unwrap();
+        let ranges = [(0, first_end), (last_start, end)];
+
+        let visible = service.highlight_byte_ranges(&request, None, &ranges);
+
+        assert!(!visible.tokens.is_empty());
+        assert!(visible.tokens.len() * 100 < complete.tokens.len());
+        assert!(visible.tokens.iter().all(|token| {
+            ranges
+                .iter()
+                .any(|(start, end)| token.end_byte > *start && token.start_byte < *end)
+        }));
     }
 
     #[test]

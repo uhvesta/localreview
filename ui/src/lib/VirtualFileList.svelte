@@ -14,9 +14,22 @@
   export let onToggleViewed: (fileId: string, viewed: boolean) => void = () => {};
 
   type Entry =
-    | { kind: 'group'; id: string; label: string; depth: number; height: number; expanded: boolean }
+    | {
+        kind: 'group';
+        id: string;
+        chain: Array<{ id: string; label: string }>;
+        depth: number;
+        height: number;
+        expanded: boolean;
+      }
     | { kind: 'file'; id: string; file: ReviewFile; depth: number; height: number };
-  type TreeGroup = { id: string; label: string; groups: Map<string, TreeGroup>; files: ReviewFile[] };
+  type TreeGroup = {
+    id: string;
+    label: string;
+    repository: boolean;
+    groups: Map<string, TreeGroup>;
+    files: ReviewFile[];
+  };
 
   let viewport: HTMLDivElement;
   let scrollTop = 0;
@@ -47,10 +60,10 @@
     void tick().then(() => viewport.querySelector<HTMLButtonElement>(`[data-file-id="${CSS.escape(focusedFileId!)}"]`)?.focus({ preventScroll: true }));
   }
 
-  function group(root: TreeGroup, id: string, label: string) {
+  function group(root: TreeGroup, id: string, label: string, repository = false) {
     let value = root.groups.get(id);
     if (!value) {
-      value = { id, label, groups: new Map(), files: [] };
+      value = { id, label, repository, groups: new Map(), files: [] };
       root.groups.set(id, value);
     }
     return value;
@@ -89,12 +102,12 @@
     };
     if (mode === 'flat') return source.map((file) => ({ kind: 'file', id: file.id, file, depth: 0, height: fileHeight(file) }));
 
-    const root: TreeGroup = { id: 'root', label: '', groups: new Map(), files: [] };
+    const root: TreeGroup = { id: 'root', label: '', repository: false, groups: new Map(), files: [] };
     const ordered = [...source].sort((left, right) => `${left.repositoryId}/${left.path}`.localeCompare(`${right.repositoryId}/${right.path}`));
     for (const file of ordered) {
       let cursor = root;
       let prefix = mode === 'repository' ? `repo:${file.repositoryId}` : `folder-repo:${file.repositoryId}`;
-      if (mode === 'repository') cursor = group(cursor, prefix, names.get(file.repositoryId) ?? file.repositoryId);
+      if (mode === 'repository') cursor = group(cursor, prefix, names.get(file.repositoryId) ?? file.repositoryId, true);
       const folders = file.path.split('/').slice(0, -1);
       for (const part of folders) {
         prefix = `${prefix}/${part}`;
@@ -105,10 +118,29 @@
 
     const flatten = (node: TreeGroup, depth: number) => {
       for (const child of node.groups.values()) {
-        const expanded = !collapsed.has(child.id);
-        result.push({ kind: 'group', id: child.id, label: child.label, depth, height: Math.ceil(30 * scale), expanded });
+        const chain = [child];
+        let terminal = child;
+        let expanded = !collapsed.has(terminal.id);
+        // Repository rows remain an explicit grouping boundary. Folder-only
+        // single-child paths are visually equivalent to one folder and can be
+        // compacted without changing the underlying stable group ids.
+        if (!child.repository) {
+          while (expanded && terminal.files.length === 0 && terminal.groups.size === 1) {
+            terminal = terminal.groups.values().next().value as TreeGroup;
+            chain.push(terminal);
+            expanded = !collapsed.has(terminal.id);
+          }
+        }
+        result.push({
+          kind: 'group',
+          id: terminal.id,
+          chain: chain.map(({ id, label }) => ({ id, label })),
+          depth,
+          height: Math.ceil(30 * scale),
+          expanded
+        });
         if (!expanded) continue;
-        flatten(child, depth + 1);
+        flatten(terminal, depth + 1);
       }
       for (const file of node.files) result.push({ kind: 'file', id: file.id, file, depth, height: fileHeight(file) });
     };
@@ -191,6 +223,17 @@
     ].filter((badge): badge is [string, string] => Boolean(badge));
   }
 
+  function basename(path: string) {
+    const normalized = path.replace(/\/+$/, '');
+    return normalized.slice(normalized.lastIndexOf('/') + 1) || normalized;
+  }
+
+  function displayedFilePath(path: string) {
+    // Flat grouping has no parent rows, so retain its repository-relative
+    // path. Folder/repository trees already communicate every parent segment.
+    return grouping === 'flat' ? path : basename(path);
+  }
+
   onDestroy(() => observer?.disconnect());
 </script>
 
@@ -200,17 +243,38 @@
     <div class="virtual-file-window" style:transform={`translateY(${translateY}px)`}>
       {#each visible as entry (entry.id)}
         {#if entry.kind === 'group'}
-          <button class="file-group-label virtual-group" role="treeitem" aria-selected="false" aria-expanded={entry.expanded} style:height={`${entry.height}px`} style:padding-left={`${8 + entry.depth * 14}px`} on:click={() => toggleGroup(entry.id)}>
-            <span class="tree-chevron" aria-hidden="true">{entry.expanded ? '⌄' : '›'}</span><span>{entry.label}</span>
+          {@const compactLabel = entry.chain.map((part) => part.label).join('/')}
+          <button
+            class="file-group-label virtual-group"
+            class:compact-folder-chain={entry.chain.length > 1}
+            data-group-id={entry.id}
+            data-chain-length={entry.chain.length}
+            role="treeitem"
+            aria-label={`${compactLabel}, folder`}
+            aria-level={entry.depth + 1}
+            aria-selected="false"
+            aria-expanded={entry.expanded}
+            title={compactLabel}
+            style:height={`${entry.height}px`}
+            style:padding-left={`${8 + entry.depth * 14}px`}
+            on:click={() => toggleGroup(entry.id)}
+          >
+            <span class="tree-chevron" aria-hidden="true">{entry.expanded ? '⌄' : '›'}</span>
+            <span class="compact-folder-path">
+              {#each entry.chain as part, index (part.id)}
+                {#if index > 0}<span class="compact-folder-separator" aria-hidden="true">/</span>{/if}<span class="compact-folder-segment">{part.label}</span>
+              {/each}
+            </span>
           </button>
         {:else}
           {@const file = entry.file}
           {@const repositoryName = repositoryNames.get(file.repositoryId) ?? file.repositoryId}
           {@const badges = classificationBadges(file)}
-          <div class:active={file.id === activeFileId} class="file-row" role="treeitem" aria-selected={file.id === activeFileId} style:height={`${entry.height}px`} style:padding-left={`${entry.depth * 14}px`}>
-            <button class="file-select" data-file-id={file.id} aria-label={`${file.path}, ${repositoryName}, ${file.status}, ${file.viewed ? 'viewed' : 'unviewed'}, ${file.annotationCount} annotations${badges.length ? `, ${badges.map((badge) => badge[1]).join(', ')}` : ''}`} on:focus={() => focusedFileId = file.id} on:click={() => activate(file.id)} on:keydown={(event) => onKeydown(event, file.id)}>
+          {@const displayPath = displayedFilePath(file.path)}
+          <div class:active={file.id === activeFileId} class="file-row" role="treeitem" aria-level={entry.depth + 1} aria-selected={file.id === activeFileId} style:height={`${entry.height}px`} style:padding-left={`${entry.depth * 14}px`}>
+            <button class="file-select" data-file-id={file.id} title={file.path} aria-label={`${file.path}, ${repositoryName}, ${file.status}, ${file.viewed ? 'viewed' : 'unviewed'}, ${file.annotationCount} annotations${badges.length ? `, ${badges.map((badge) => badge[1]).join(', ')}` : ''}`} on:focus={() => focusedFileId = file.id} on:click={() => activate(file.id)} on:keydown={(event) => onKeydown(event, file.id)}>
               <span class:viewed={file.viewed} class="view-marker" aria-hidden="true"></span>
-              <span class="file-info"><span class="file-path">{file.path}</span>{#if file.previousPath}<span class="old-path">{file.previousPath}</span>{/if}<span class="file-repo">{repositoryName}</span>{#if badges.length}<span class="classification-badges" aria-label="Capture-time file classifications">{#each badges as badge (badge[0])}<span class={`classification-badge ${badge[0]}`}>{badge[1]}</span>{/each}</span>{/if}</span>
+              <span class="file-info"><span class="file-path" title={file.path}>{displayPath}</span>{#if file.previousPath}<span class="old-path" title={file.previousPath}>{displayedFilePath(file.previousPath)}</span>{/if}<span class="file-repo">{repositoryName}</span>{#if badges.length}<span class="classification-badges" aria-label="Capture-time file classifications">{#each badges as badge (badge[0])}<span class={`classification-badge ${badge[0]}`}>{badge[1]}</span>{/each}</span>{/if}</span>
             </button>
             <div class="file-row-stats"><button class="view-toggle" aria-label={`Mark ${file.path} ${file.viewed ? 'unviewed' : 'viewed'}`} aria-pressed={file.viewed} on:click={() => onToggleViewed(file.id, !file.viewed)}>{file.viewed ? 'Viewed' : 'Mark viewed'}</button><span class="status-chip {file.status}" aria-label={file.status}>{file.status[0].toUpperCase()}</span><span class="additions">+{file.additions}</span>{#if file.deletions}<span class="deletions">−{file.deletions}</span>{/if}{#if file.annotationCount}<span class="annotation-count">● {file.annotationCount}</span>{/if}</div>
           </div>

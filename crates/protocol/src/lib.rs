@@ -23,7 +23,10 @@ pub use reverse::*;
 /// Version 4 transports exact source bytes (including CRLF/final-newline
 /// state) rather than reconstructed logical lines. It deliberately does not
 /// negotiate v3 because a v3 decoder cannot validate the byte-exact window.
-pub const PROTOCOL_VERSION: u16 = 4;
+/// Version 5 adds the closed programmatic desktop-controller command set and
+/// typed JSON result envelope. Older desktops cannot safely interpret those
+/// commands, so the CLI must fail the handshake instead of guessing support.
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// A deliberately conservative ceiling for any one local or remote message.
 /// This bounds the framed (possibly compressed) payload before allocation.

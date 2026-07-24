@@ -76,7 +76,44 @@ export interface RepositorySetup {
   lastFetchError?: string;
   discoveryError?: string;
   comparisonError?: string;
+  /** Native-classified diagnostics with actions the UI can offer safely.
+   * Raw errors above remain available for expandable technical details. */
+  issues?: ActionableIssue[];
   statusCheckedAt?: string;
+}
+
+export interface ActionableIssue {
+  id: string;
+  kind:
+    | 'missing_base_reference'
+    | 'missing_head'
+    | 'git_unavailable'
+    | 'repository_unavailable'
+    | 'repository_permission_denied'
+    | 'capture_limit_exceeded'
+    | 'concurrent_modification'
+    | 'invalid_comparison'
+    | 'remote_fetch_failed'
+    | 'repository_discovery_failed'
+    | string;
+  severity: 'warning' | 'error';
+  title: string;
+  message: string;
+  dismissible: boolean;
+  actions: ActionableIssueAction[];
+}
+
+export interface ActionableIssueAction {
+  kind:
+    | 'open_review_setup'
+    | 'apply_suggested_base'
+    | 'fetch_repository'
+    | 'retry_refresh'
+    | 'retry_setup'
+    | 'disable_repository'
+    | string;
+  label: string;
+  value?: string;
 }
 
 export interface ReviewFile {
@@ -145,6 +182,8 @@ export interface SyntaxTokenSpan {
 }
 
 export interface HunkLocation {
+  /** Navigable review unit. Unified/Split expose canonical Git hunks; Full
+   * File exposes each maximal non-context change cluster inside those hunks. */
   id: string;
   rowIndex: number;
   oldLine?: number;
@@ -162,6 +201,7 @@ export interface DiffPresentationWindow {
   startRow: number;
   totalRows: number;
   rows: DiffRow[];
+  /** Complete navigation index, including locations outside this row window. */
   hunks: HunkLocation[];
   omittedBlocks?: FullFileOmittedBlock[];
   oldTokens?: SyntaxTokenSpan[];
@@ -239,6 +279,113 @@ export interface OutlineSymbol {
   endLine: number;
   depth: number;
   side: DiffSide;
+}
+
+export type SymbolNavigationKind = 'definitions' | 'references' | 'all';
+
+/** Immutable capture coordinates for a token selected in the canonical diff.
+ * IDs, rather than checkout paths, cross the native boundary. */
+export interface SymbolNavigationTarget {
+  workspaceId: string;
+  repositoryId: string;
+  fileId: string;
+  comparisonId?: string;
+  side: DiffSide;
+  line: number;
+  /** One-based UTF-16 column in the rendered source row. */
+  column: number;
+  symbol: string;
+}
+
+export interface SymbolNavigationOpenRequest extends SymbolNavigationTarget {
+  initialQuery: Exclude<SymbolNavigationKind, 'all'>;
+}
+
+export interface SymbolNavigationLocation {
+  repositoryId: string;
+  path: string;
+  line: number;
+  column: number;
+  endLine: number;
+  endColumn: number;
+  preview: string;
+  kind: string;
+  role: 'definition' | 'reference';
+  sourceFingerprint: string;
+  fileId?: string;
+  comparisonId?: string;
+  side?: DiffSide;
+}
+
+export interface SymbolNavigationQuery {
+  workspaceId: string;
+  repositoryId: string;
+  /** Keeps reviewed-file mappings pinned to the originating review round. */
+  comparisonId?: string;
+  symbol: string;
+  kind: SymbolNavigationKind;
+  limit?: number;
+}
+
+export interface SymbolNavigationResult {
+  symbol: string;
+  definitions: SymbolNavigationLocation[];
+  references: SymbolNavigationLocation[];
+  truncated: boolean;
+  diagnostics: string[];
+}
+
+export interface SymbolSourceRequest {
+  workspaceId: string;
+  repositoryId: string;
+  path: string;
+  expectedFingerprint: string;
+  startLine: number;
+  lineCount: number;
+}
+
+export interface SymbolSourceView {
+  repositoryId: string;
+  path: string;
+  sourceFingerprint: string;
+  startLine: number;
+  totalLines: number;
+  lines: string[];
+  /** Absolute UTF-8 byte offset for each returned source line. */
+  lineStartBytes: number[];
+  tokens: SyntaxTokenSpan[];
+  highlightStatus: 'highlighted' | 'plain_text';
+  highlightReason?: string;
+  language?: string;
+}
+
+export interface RepositorySourceOpenRequest {
+  workspaceId: string;
+  repositoryId: string;
+  path: string;
+  startLine: number;
+  lineCount: number;
+}
+
+export interface RepositoryFilesRequest {
+  workspaceId: string;
+  repositoryId: string;
+  comparisonId?: string;
+  query?: string;
+  limit?: number;
+}
+
+export interface RepositoryFileEntry {
+  path: string;
+  fileId?: string;
+  comparisonId?: string;
+  side?: DiffSide;
+}
+
+export interface RepositoryFilesResult {
+  files: RepositoryFileEntry[];
+  truncated: boolean;
+  diagnostics: string[];
 }
 
 export interface DiffSelection {
@@ -325,6 +472,7 @@ export interface LocalRefreshOutcome {
     repositoryId: string;
     repositoryPath: string;
     error: string;
+    issue?: ActionableIssue;
   }>;
 }
 
@@ -640,6 +788,18 @@ export interface ReviewApi {
   getRows?(fileId: string, mode: DiffMode): Promise<DiffRow[]>;
   expandHunk(fileId: string, hunkId: string, contextLines: number, comparisonId?: string): Promise<void>;
   getOutline(fileId: string, side: DiffSide, comparisonId?: string): Promise<OutlineSymbol[]>;
+  /** Creates or focuses a completely separate native symbol-results window. */
+  openSymbolNavigation(request: SymbolNavigationOpenRequest): Promise<{ windowLabel: string }>;
+  /** Definitions/references are discovered only after the symbol window asks. */
+  querySymbolNavigation(request: SymbolNavigationQuery): Promise<SymbolNavigationResult>;
+  /** Bounded source for a result outside the captured review; the fingerprint
+   * prevents a moving checkout from being presented as the searched result. */
+  getSymbolSource(request: SymbolSourceRequest): Promise<SymbolSourceView>;
+  /** Bounded, repository-relative file discovery for the navigation window. */
+  getRepositoryFiles(request: RepositoryFilesRequest): Promise<RepositoryFilesResult>;
+  /** Opens a repository-relative file and establishes the fingerprint used by
+   * subsequent lazy source windows. */
+  openRepositorySource(request: RepositorySourceOpenRequest): Promise<SymbolSourceView>;
   /** Workspace scope disambiguates browser fixtures; native file IDs remain globally unique. */
   saveAnnotation(workspaceId: string, annotation: Annotation): Promise<Annotation>;
   getAnnotationDraft(workspaceId: string): Promise<AnnotationDraft | undefined>;

@@ -3,6 +3,11 @@ import type { SyntaxTokenSpan } from './types';
 export interface SafeSyntaxSegment {
   text: string;
   class?: SyntaxTokenSpan['class'];
+  /** UTF-16 offsets within the rendered source row. These remain DOM-safe
+   * presentation coordinates; native symbol queries receive one-based source
+   * line and column separately. */
+  start: number;
+  end: number;
 }
 
 /**
@@ -16,7 +21,7 @@ export function safeSyntaxSegments(
   sourceStartByte: number | undefined,
   spans: SyntaxTokenSpan[] | undefined
 ): SafeSyntaxSegment[] {
-  if (!text || sourceStartByte === undefined || !spans?.length) return [{ text }];
+  if (!text || sourceStartByte === undefined || !spans?.length) return [{ text, start: 0, end: text.length }];
   const bytesAtIndex: number[] = [0];
   let total = 0;
   for (let index = 0; index < text.length;) {
@@ -54,10 +59,10 @@ export function safeSyntaxSegments(
   let cursor = 0;
   for (const span of relevant) {
     if (span.start < cursor) continue;
-    if (span.start > cursor) output.push({ text: text.slice(cursor, span.start) });
-    output.push({ text: text.slice(span.start, span.end), class: span.class });
+    if (span.start > cursor) output.push({ text: text.slice(cursor, span.start), start: cursor, end: span.start });
+    output.push({ text: text.slice(span.start, span.end), class: span.class, start: span.start, end: span.end });
     cursor = span.end;
   }
-  if (cursor < text.length) output.push({ text: text.slice(cursor) });
-  return output.length ? output : [{ text }];
+  if (cursor < text.length) output.push({ text: text.slice(cursor), start: cursor, end: text.length });
+  return output.length ? output : [{ text, start: 0, end: text.length }];
 }

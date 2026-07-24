@@ -1,0 +1,290 @@
+{
+  "schemaVersion": 1,
+  "profile": "release",
+  "fixtureLines": 25000,
+  "iterations": 20,
+  "operations": [
+    {
+      "name": "individual_disclosure",
+      "samples": 20,
+      "viewportRowsRequested": 220,
+      "wallMicros": {
+        "min": 25169,
+        "median": 25843,
+        "p95": 59019,
+        "max": 273555
+      },
+      "nativeMicros": {
+        "min": 24868,
+        "median": 25534,
+        "p95": 58724,
+        "max": 273218
+      },
+      "serializationMicros": {
+        "min": 287,
+        "median": 300,
+        "p95": 331,
+        "max": 336
+      },
+      "responseBytes": {
+        "min": 335205,
+        "median": 335206,
+        "p95": 335936,
+        "max": 335936
+      },
+      "responseRows": {
+        "min": 220,
+        "median": 220,
+        "p95": 220,
+        "max": 220
+      },
+      "syntaxTokens": {
+        "min": 2501,
+        "median": 2501,
+        "p95": 2515,
+        "max": 2515
+      },
+      "omittedBlocks": {
+        "min": 399,
+        "median": 399,
+        "p95": 399,
+        "max": 399
+      }
+    },
+    {
+      "name": "expand_collapse_all",
+      "samples": 20,
+      "viewportRowsRequested": 220,
+      "wallMicros": {
+        "min": 25046,
+        "median": 25490,
+        "p95": 51786,
+        "max": 65749
+      },
+      "nativeMicros": {
+        "min": 24713,
+        "median": 25202,
+        "p95": 51490,
+        "max": 65456
+      },
+      "serializationMicros": {
+        "min": 287,
+        "median": 296,
+        "p95": 333,
+        "max": 345
+      },
+      "responseBytes": {
+        "min": 335232,
+        "median": 335232,
+        "p95": 335742,
+        "max": 335742
+      },
+      "responseRows": {
+        "min": 220,
+        "median": 220,
+        "p95": 220,
+        "max": 220
+      },
+      "syntaxTokens": {
+        "min": 2498,
+        "median": 2498,
+        "p95": 2515,
+        "max": 2515
+      },
+      "omittedBlocks": {
+        "min": 399,
+        "median": 399,
+        "p95": 399,
+        "max": 399
+      }
+    },
+    {
+      "name": "highlight_cold",
+      "samples": 1,
+      "viewportRowsRequested": 220,
+      "wallMicros": {
+        "min": 434477,
+        "median": 434477,
+        "p95": 434477,
+        "max": 434477
+      },
+      "nativeMicros": {
+        "min": 434227,
+        "median": 434227,
+        "p95": 434227,
+        "max": 434227
+      },
+      "serializationMicros": {
+        "min": 249,
+        "median": 249,
+        "p95": 249,
+        "max": 249
+      },
+      "responseBytes": {
+        "min": 295179,
+        "median": 295179,
+        "p95": 295179,
+        "max": 295179
+      },
+      "responseRows": {
+        "min": 220,
+        "median": 220,
+        "p95": 220,
+        "max": 220
+      },
+      "syntaxTokens": {
+        "min": 2403,
+        "median": 2403,
+        "p95": 2403,
+        "max": 2403
+      },
+      "omittedBlocks": {
+        "min": 0,
+        "median": 0,
+        "p95": 0,
+        "max": 0
+      }
+    },
+    {
+      "name": "highlight_cached_viewport",
+      "samples": 20,
+      "viewportRowsRequested": 220,
+      "wallMicros": {
+        "min": 2970,
+        "median": 3107,
+        "p95": 3289,
+        "max": 3339
+      },
+      "nativeMicros": {
+        "min": 2717,
+        "median": 2854,
+        "p95": 3030,
+        "max": 3078
+      },
+      "serializationMicros": {
+        "min": 250,
+        "median": 256,
+        "p95": 276,
+        "max": 282
+      },
+      "responseBytes": {
+        "min": 295179,
+        "median": 295179,
+        "p95": 295179,
+        "max": 295179
+      },
+      "responseRows": {
+        "min": 220,
+        "median": 220,
+        "p95": 220,
+        "max": 220
+      },
+      "syntaxTokens": {
+        "min": 2403,
+        "median": 2403,
+        "p95": 2403,
+        "max": 2403
+      },
+      "omittedBlocks": {
+        "min": 0,
+        "median": 0,
+        "p95": 0,
+        "max": 0
+      }
+    },
+    {
+      "name": "refresh",
+      "samples": 5,
+      "viewportRowsRequested": null,
+      "wallMicros": {
+        "min": 264131,
+        "median": 267547,
+        "p95": 275939,
+        "max": 280447
+      },
+      "nativeMicros": {
+        "min": 264123,
+        "median": 267539,
+        "p95": 275931,
+        "max": 280439
+      },
+      "serializationMicros": {
+        "min": 7,
+        "median": 8,
+        "p95": 8,
+        "max": 10
+      },
+      "responseBytes": {
+        "min": 1310,
+        "median": 1310,
+        "p95": 1310,
+        "max": 1310
+      },
+      "responseRows": {
+        "min": 0,
+        "median": 0,
+        "p95": 0,
+        "max": 0
+      },
+      "syntaxTokens": {
+        "min": 0,
+        "median": 0,
+        "p95": 0,
+        "max": 0
+      },
+      "omittedBlocks": {
+        "min": 0,
+        "median": 0,
+        "p95": 0,
+        "max": 0
+      }
+    },
+    {
+      "name": "symbol_navigation",
+      "samples": 20,
+      "viewportRowsRequested": null,
+      "wallMicros": {
+        "min": 140134,
+        "median": 143128,
+        "p95": 146229,
+        "max": 151939
+      },
+      "nativeMicros": {
+        "min": 140093,
+        "median": 143089,
+        "p95": 146192,
+        "max": 151901
+      },
+      "serializationMicros": {
+        "min": 35,
+        "median": 38,
+        "p95": 43,
+        "max": 45
+      },
+      "responseBytes": {
+        "min": 43554,
+        "median": 43554,
+        "p95": 43554,
+        "max": 43554
+      },
+      "responseRows": {
+        "min": 0,
+        "median": 0,
+        "p95": 0,
+        "max": 0
+      },
+      "syntaxTokens": {
+        "min": 0,
+        "median": 0,
+        "p95": 0,
+        "max": 0
+      },
+      "omittedBlocks": {
+        "min": 0,
+        "median": 0,
+        "p95": 0,
+        "max": 0
+      }
+    }
+  ]
+}

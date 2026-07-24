@@ -37,10 +37,10 @@ use localreview_persistence::{
 };
 use localreview_protocol::{
     validate_ssh_target, AgentErrorCode, AgentNotification, AgentOperation, AgentProgressPhase,
-    AgentResult, DoctorReport, LocalCommand, LocalResponse, RemoteCapturedFile,
-    RemoteComparisonCapture, RemoteComparisonOptions, RemoteFileStatus, RemoteHead,
-    RemoteRepository, RemoteSourceRevision, RemoteSourceWindow, WorkspaceSourceTag,
-    WorkspaceSummary, MAX_REMOTE_SOURCE_WINDOW_LINES, PROTOCOL_VERSION,
+    AgentResult, DoctorReport, LocalCommand, LocalResponse, ProgrammaticAnnotation,
+    ProgrammaticOperation, RemoteCapturedFile, RemoteComparisonCapture, RemoteComparisonOptions,
+    RemoteFileStatus, RemoteHead, RemoteRepository, RemoteSourceRevision, RemoteSourceWindow,
+    WorkspaceSourceTag, WorkspaceSummary, MAX_REMOTE_SOURCE_WINDOW_LINES, PROTOCOL_VERSION,
 };
 use localreview_service::{
     prompt_title_for_scope, CapturedBlameRequest, CapturedCommitContextRequest,
@@ -60,6 +60,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{Emitter, Manager};
 use uuid::Uuid;
+
+use crate::symbols::{
+    list_repository_files as list_symbol_repository_files,
+    open_source_window as open_symbol_source_window,
+    read_source_window as read_symbol_source_window, search_repository as search_symbols,
+    validate_symbol, CoreSourceWindow, CoreSymbolLocation, SymbolSearchError, MAX_REPOSITORY_FILES,
+    MAX_SYMBOL_RESULTS,
+};
 
 const SETTINGS_KEY: &str = "ui.settings.v1";
 const APPLICATION_BASE_KEY: &str = "review.application_base.v1";
@@ -566,6 +574,146 @@ pub struct OutlineSymbolView {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SymbolNavigationOpenInput {
+    pub workspace_id: String,
+    pub repository_id: String,
+    pub file_id: String,
+    pub comparison_id: Option<String>,
+    pub side: String,
+    pub line: u32,
+    pub column: u32,
+    pub symbol: String,
+    pub initial_query: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SymbolNavigationSeedView {
+    pub workspace_id: String,
+    pub repository_id: String,
+    pub file_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comparison_id: Option<String>,
+    pub side: String,
+    pub line: u32,
+    pub column: u32,
+    pub symbol: String,
+    pub initial_query: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SymbolNavigationQuery {
+    pub workspace_id: String,
+    pub repository_id: String,
+    pub comparison_id: Option<String>,
+    pub symbol: String,
+    pub kind: String,
+    pub limit: Option<u16>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SymbolNavigationLocationView {
+    pub repository_id: String,
+    pub path: String,
+    pub line: u32,
+    pub column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+    pub preview: String,
+    pub kind: String,
+    pub role: String,
+    pub source_fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comparison_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub side: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SymbolNavigationResult {
+    pub symbol: String,
+    pub definitions: Vec<SymbolNavigationLocationView>,
+    pub references: Vec<SymbolNavigationLocationView>,
+    pub truncated: bool,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SymbolSourceInput {
+    pub workspace_id: String,
+    pub repository_id: String,
+    pub path: String,
+    pub expected_fingerprint: String,
+    pub start_line: u32,
+    pub line_count: u32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SymbolSourceView {
+    pub repository_id: String,
+    pub path: String,
+    pub source_fingerprint: String,
+    pub start_line: u32,
+    pub total_lines: u32,
+    pub lines: Vec<String>,
+    pub line_start_bytes: Vec<u32>,
+    pub tokens: Vec<SyntaxTokenView>,
+    pub highlight_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub highlight_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepositorySourceOpenInput {
+    pub workspace_id: String,
+    pub repository_id: String,
+    pub path: String,
+    pub start_line: u32,
+    pub line_count: u32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepositoryFilesInput {
+    pub workspace_id: String,
+    pub repository_id: String,
+    pub comparison_id: Option<String>,
+    pub query: Option<String>,
+    pub limit: Option<u16>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryFileView {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comparison_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub side: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryFilesResult {
+    pub files: Vec<RepositoryFileView>,
+    pub truncated: bool,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CopyReviewItemRequest {
     pub kind: String,
     pub file_id: String,
@@ -873,7 +1021,34 @@ pub struct RepositorySetupView {
     pub last_fetch_error: Option<String>,
     pub discovery_error: Option<String>,
     pub comparison_error: Option<String>,
+    /// Typed, dismissible diagnostics for errors that have a concrete
+    /// configuration or retry path. Raw errors remain available above for
+    /// diagnostics, but the WebView never has to parse Git/SSH stderr.
+    pub issues: Vec<ActionableIssueView>,
     pub status_checked_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionableIssueView {
+    /// Stable for the repository and issue cause so a UI may dismiss it for
+    /// the current operation without coupling that choice to display text.
+    pub id: String,
+    pub kind: String,
+    pub severity: String,
+    pub title: String,
+    pub message: String,
+    pub dismissible: bool,
+    pub actions: Vec<ActionableIssueActionView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionableIssueActionView {
+    pub kind: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1180,6 +1355,8 @@ pub struct LocalRefreshFailureView {
     pub repository_id: String,
     pub repository_path: String,
     pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue: Option<ActionableIssueView>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1473,7 +1650,7 @@ pub enum DispatchError {
 }
 
 impl DesktopController {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "perf-harness"))]
     pub fn new(store: StateStore) -> Self {
         Self::from_service(ReviewService::new(store))
     }
@@ -1670,7 +1847,341 @@ impl DesktopController {
                     message: "authenticated LocalReview desktop endpoint is ready".into(),
                 },
             }),
+            LocalCommand::Programmatic { command } => {
+                let operation = programmatic_operation_name(&command).to_owned();
+                let data = self.dispatch_programmatic(command)?;
+                Ok(LocalResponse::Programmatic {
+                    request_id,
+                    operation,
+                    data,
+                })
+            }
         }
+    }
+
+    fn dispatch_programmatic(
+        &self,
+        command: ProgrammaticOperation,
+    ) -> Result<serde_json::Value, DispatchError> {
+        match command {
+            ProgrammaticOperation::ShowWorkspace { selector } => {
+                serialize_programmatic(&self.focus_workspace(&selector)?)
+            }
+            ProgrammaticOperation::ListArchivedWorkspaces => {
+                serialize_programmatic(&self.list_archived_workspaces()?)
+            }
+            ProgrammaticOperation::ReopenArchivedWorkspace { workspace_id } => {
+                serialize_programmatic(
+                    &self.reopen_archived_workspace(required_workspace_id(&workspace_id)?)?,
+                )
+            }
+            ProgrammaticOperation::LoadReview { workspace_id } => {
+                serialize_programmatic(&self.load_review(required_workspace_id(&workspace_id)?)?)
+            }
+            ProgrammaticOperation::ReviewFiles { workspace_id } => serialize_programmatic(
+                &self
+                    .load_review(required_workspace_id(&workspace_id)?)?
+                    .files,
+            ),
+            ProgrammaticOperation::ListAnnotations { workspace_id } => serialize_programmatic(
+                &self
+                    .load_review(required_workspace_id(&workspace_id)?)?
+                    .annotations,
+            ),
+            ProgrammaticOperation::ReviewRows { file_id, mode } => {
+                let file_id = parse_review_file_id(&file_id)
+                    .ok_or_else(|| DispatchError::Invalid("file id is invalid".into()))?;
+                serialize_programmatic(&self.rows(file_id, &mode)?)
+            }
+            ProgrammaticOperation::ReviewHunks { file_id } => {
+                let file_id = parse_review_file_id(&file_id)
+                    .ok_or_else(|| DispatchError::Invalid("file id is invalid".into()))?;
+                let hunks = self
+                    .rows(file_id, "unified")?
+                    .into_iter()
+                    .filter(|row| row.kind == "header")
+                    .collect::<Vec<_>>();
+                serialize_programmatic(&hunks)
+            }
+            ProgrammaticOperation::RepositorySetup { workspace_id } => serialize_programmatic(
+                &self.repository_setup(required_workspace_id(&workspace_id)?)?,
+            ),
+            ProgrammaticOperation::ConfigureBaselines {
+                workspace_id,
+                default_base,
+                repository_bases,
+            } => {
+                let repository_bases = repository_bases
+                    .into_iter()
+                    .map(|item| RepositoryBaseInput {
+                        repository_id: item.repository_id,
+                        repository_path: None,
+                        relative_path: item.relative_path,
+                        base: item.base,
+                    })
+                    .collect();
+                serialize_programmatic(&self.configure_baselines(
+                    required_workspace_id(&workspace_id)?,
+                    ConfigureBaselinesInput {
+                        default_base,
+                        repository_bases,
+                    },
+                )?)
+            }
+            ProgrammaticOperation::SetRepositoryInclusion {
+                workspace_id,
+                repository_ids,
+                enabled,
+            } => serialize_programmatic(&self.set_repository_inclusion(
+                required_workspace_id(&workspace_id)?,
+                SetRepositoryInclusionInput {
+                    repository_ids,
+                    enabled,
+                },
+            )?),
+            ProgrammaticOperation::StartReview {
+                workspace_id,
+                fetch,
+            } => serialize_programmatic(&self.start_new_review(
+                required_workspace_id(&workspace_id)?,
+                StartOrRefreshInput {
+                    fetch_before_capture: fetch,
+                    ..StartOrRefreshInput::default()
+                },
+            )?),
+            ProgrammaticOperation::RefreshReview {
+                workspace_id,
+                fetch,
+            } => serialize_programmatic(&self.refresh_review(
+                required_workspace_id(&workspace_id)?,
+                StartOrRefreshInput {
+                    fetch_before_capture: fetch,
+                    ..StartOrRefreshInput::default()
+                },
+            )?),
+            ProgrammaticOperation::AddAnnotation {
+                workspace_id,
+                annotation,
+            } => {
+                let workspace_id = required_workspace_id(&workspace_id)?;
+                let review = self.load_review(workspace_id)?;
+                let file = review
+                    .files
+                    .iter()
+                    .find(|file| file.id == annotation.file_id)
+                    .ok_or_else(|| {
+                        DispatchError::Invalid(
+                            "annotation file is not part of this workspace's active review".into(),
+                        )
+                    })?;
+                let saved =
+                    self.save_programmatic_annotation(annotation, file.repository_id.clone())?;
+                serialize_programmatic(&saved)
+            }
+            ProgrammaticOperation::DeleteAnnotation {
+                workspace_id,
+                annotation_id,
+            } => {
+                let annotation_id = parse_annotation_id(&annotation_id)
+                    .ok_or_else(|| DispatchError::Invalid("annotation id is invalid".into()))?;
+                self.delete_annotation(required_workspace_id(&workspace_id)?, annotation_id)?;
+                Ok(serde_json::json!({ "deleted": true }))
+            }
+            ProgrammaticOperation::SetAnnotationState {
+                workspace_id,
+                annotation_id,
+                state,
+            } => serialize_programmatic(
+                &self.set_annotation_state(
+                    required_workspace_id(&workspace_id)?,
+                    parse_annotation_id(&annotation_id)
+                        .ok_or_else(|| DispatchError::Invalid("annotation id is invalid".into()))?,
+                    &state,
+                )?,
+            ),
+            ProgrammaticOperation::MarkFileViewed {
+                workspace_id,
+                file_id,
+                viewed,
+            } => {
+                let workspace_id = required_workspace_id(&workspace_id)?;
+                let review = self.load_review(workspace_id)?;
+                if !review.files.iter().any(|file| file.id == file_id) {
+                    return Err(DispatchError::Invalid(
+                        "file is not part of this workspace's active review".into(),
+                    ));
+                }
+                let file_id = parse_review_file_id(&file_id)
+                    .ok_or_else(|| DispatchError::Invalid("file id is invalid".into()))?;
+                self.set_viewed(workspace_id, file_id, viewed)?;
+                Ok(serde_json::json!({ "viewed": viewed }))
+            }
+            ProgrammaticOperation::QuerySymbols {
+                workspace_id,
+                repository_id,
+                symbol,
+                kind,
+                limit,
+            } => serialize_programmatic(&self.query_symbol_navigation(SymbolNavigationQuery {
+                workspace_id,
+                repository_id,
+                comparison_id: None,
+                symbol,
+                kind,
+                limit,
+            })?),
+            ProgrammaticOperation::GeneratePrompt {
+                workspace_id,
+                scope,
+                annotation_ids,
+                path_style,
+                include_diff_hunks,
+                include_git_state,
+                history_id,
+            } => serialize_programmatic(&self.generate_prompt(
+                required_workspace_id(&workspace_id)?,
+                PromptInput {
+                    scope,
+                    annotation_ids,
+                    portable: None,
+                    path_style,
+                    include_diff_hunks: Some(include_diff_hunks),
+                    include_git_state: Some(include_git_state),
+                    history_id,
+                },
+            )?),
+            ProgrammaticOperation::ReviewHistory { workspace_id } => {
+                serialize_programmatic(&self.history(required_workspace_id(&workspace_id)?)?)
+            }
+            ProgrammaticOperation::ArchiveWorkspace {
+                workspace_id,
+                confirmation,
+            } => {
+                if confirmation != "archive" {
+                    return Err(DispatchError::Invalid(
+                        "archive requires the exact confirmation `archive`".into(),
+                    ));
+                }
+                self.archive_workspace(required_workspace_id(&workspace_id)?)?;
+                Ok(serde_json::json!({ "archived": true, "workspaceId": workspace_id }))
+            }
+            ProgrammaticOperation::DeleteWorkspace {
+                workspace_id,
+                confirmation,
+            } => {
+                let workspace_id_value = required_workspace_id(&workspace_id)?;
+                let workspace = self.focus_workspace(&workspace_id)?;
+                if confirmation != workspace.name {
+                    return Err(DispatchError::Invalid(
+                        "delete confirmation must exactly match the workspace name".into(),
+                    ));
+                }
+                self.delete_workspace(workspace_id_value)?;
+                Ok(serde_json::json!({ "deleted": true, "workspaceId": workspace_id }))
+            }
+            ProgrammaticOperation::GithubInspect { workspace_id } => {
+                let workspace_id = required_workspace_id(&workspace_id)?;
+                Ok(serde_json::json!({
+                    "pullRequest": self.github_pull_request(workspace_id)?,
+                    "threads": self.github_threads(workspace_id)?,
+                    "conversation": self.github_conversation(workspace_id)?,
+                }))
+            }
+            ProgrammaticOperation::GithubPreviewReview {
+                workspace_id,
+                annotation_ids,
+                summary,
+                conclusion,
+            } => {
+                let conclusion = match conclusion.as_str() {
+                    "comment" => ReviewConclusion::Comment,
+                    "approve" => ReviewConclusion::Approve,
+                    "request_changes" => ReviewConclusion::RequestChanges,
+                    _ => {
+                        return Err(DispatchError::Invalid(
+                            "unsupported GitHub review conclusion".into(),
+                        ))
+                    }
+                };
+                serialize_programmatic(&self.preview_finish_review(
+                    required_workspace_id(&workspace_id)?,
+                    FinishReviewInput {
+                        annotation_ids,
+                        summary,
+                        conclusion,
+                    },
+                )?)
+            }
+            ProgrammaticOperation::GithubSubmitReview {
+                workspace_id,
+                preview_token,
+                confirm,
+            } => {
+                if !confirm {
+                    return Err(DispatchError::Invalid(
+                        "GitHub submission requires explicit confirmation".into(),
+                    ));
+                }
+                serialize_programmatic(&self.finish_review(
+                    required_workspace_id(&workspace_id)?,
+                    FinishReviewSubmissionInput { preview_token },
+                )?)
+            }
+            ProgrammaticOperation::SshStatus {
+                workspace_id,
+                reconnect,
+            } => {
+                let workspace_id_value = required_workspace_id(&workspace_id)?;
+                let workspace = if reconnect {
+                    self.reconnect_ssh_workspace(workspace_id_value)?
+                } else {
+                    self.focus_workspace(&workspace_id)?
+                };
+                if !workspace.source.iter().any(|source| source == "ssh") {
+                    return Err(DispatchError::Invalid(
+                        "workspace is not an SSH review".into(),
+                    ));
+                }
+                serialize_programmatic(&workspace)
+            }
+            ProgrammaticOperation::EffectiveSettings { workspace_id } => {
+                let workspace_id = required_workspace_id(&workspace_id)?;
+                Ok(serde_json::json!({
+                    "precedence": [
+                        "saved_workspace_choice",
+                        "workspace_file",
+                        "global_file",
+                        "release_default"
+                    ],
+                    "workspace": self.focus_workspace(&workspace_id.to_string())?,
+                    "repositories": self.repository_setup(workspace_id)?,
+                    "ui": self.get_settings()?,
+                }))
+            }
+        }
+    }
+
+    fn save_programmatic_annotation(
+        &self,
+        annotation: ProgrammaticAnnotation,
+        repository_id: String,
+    ) -> Result<AnnotationView, DispatchError> {
+        self.save_annotation(AnnotationView {
+            id: annotation.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+            file_id: annotation.file_id,
+            repository_id,
+            kind: annotation.kind,
+            state: "open".into(),
+            side: annotation.side,
+            start_line: annotation.start_line,
+            end_line: annotation.end_line,
+            body: annotation.body,
+            selected_source: String::new(),
+            labels: annotation.labels,
+            local_only: annotation.local_only,
+            created_at: Utc::now().to_rfc3339(),
+            published_id: None,
+        })
     }
 
     pub fn open_local_workspace(
@@ -2675,6 +3186,7 @@ impl DesktopController {
         let (old_tokens, new_tokens, highlight_status, highlight_reason) = self.highlight_window(
             document,
             &rows,
+            mode,
             &settings,
             language_attribute.as_deref(),
             Some(&job),
@@ -3050,6 +3562,403 @@ impl DesktopController {
             side: side_name.clone(),
         })
         .collect())
+    }
+
+    pub fn validate_symbol_navigation_open(
+        &self,
+        input: SymbolNavigationOpenInput,
+    ) -> Result<SymbolNavigationSeedView, DispatchError> {
+        validate_symbol(&input.symbol).map_err(symbol_dispatch_error)?;
+        if !matches!(input.initial_query.as_str(), "definitions" | "references") {
+            return Err(DispatchError::Invalid(
+                "initial symbol query must be definitions or references".into(),
+            ));
+        }
+        if input.line == 0 || input.column == 0 {
+            return Err(DispatchError::Invalid(
+                "symbol line and column must be positive".into(),
+            ));
+        }
+        let workspace_id = parse_workspace_id(&input.workspace_id)
+            .ok_or_else(|| DispatchError::Invalid("workspaceId is invalid".into()))?;
+        let repository_id = RepositoryId(
+            Uuid::parse_str(&input.repository_id)
+                .map_err(|_| DispatchError::Invalid("repositoryId is invalid".into()))?,
+        );
+        let file_id = parse_review_file_id(&input.file_id)
+            .ok_or_else(|| DispatchError::Invalid("fileId is invalid".into()))?;
+        let comparison_id = input
+            .comparison_id
+            .as_deref()
+            .map(|value| {
+                parse_comparison_id(value)
+                    .ok_or_else(|| DispatchError::Invalid("comparisonId is invalid".into()))
+            })
+            .transpose()?;
+        let requested_side = parse_side(&input.side)?;
+        let document = self
+            .persisted_review_document(file_id, comparison_id)?
+            .document;
+        let session = self
+            .session_for_comparison(document.comparison_id)?
+            .ok_or_else(|| DispatchError::NotFound(document.comparison_id.to_string()))?;
+        if session.workspace_id != workspace_id {
+            return Err(DispatchError::Invalid(
+                "captured file does not belong to the requested workspace".into(),
+            ));
+        }
+        let comparisons = self.current_comparisons(session.id)?;
+        if document_repository_id(&document, &comparisons)? != repository_id {
+            return Err(DispatchError::Invalid(
+                "captured file does not belong to the requested repository".into(),
+            ));
+        }
+        self.symbol_repository(workspace_id, repository_id)?;
+        let side = if document.file.status == ReviewFileStatus::Deleted {
+            DiffSide::Old
+        } else {
+            requested_side
+        };
+        let source = match side {
+            DiffSide::Old => &document.old.content,
+            DiffSide::New => &document.new.content,
+        };
+        let source_line = source
+            .lines()
+            .nth(input.line.saturating_sub(1) as usize)
+            .ok_or_else(|| DispatchError::Invalid("symbol line is outside the source".into()))?;
+        if !line_contains_symbol(source_line, &input.symbol) {
+            return Err(DispatchError::Invalid(
+                "symbol token was not found on the captured source line".into(),
+            ));
+        }
+        let max_column = u32::try_from(source_line.encode_utf16().count())
+            .unwrap_or(u32::MAX)
+            .saturating_add(1);
+        if input.column > max_column {
+            return Err(DispatchError::Invalid(
+                "symbol column is outside the captured source line".into(),
+            ));
+        }
+        Ok(SymbolNavigationSeedView {
+            workspace_id: workspace_id.to_string(),
+            repository_id: repository_id.to_string(),
+            file_id: file_id.to_string(),
+            comparison_id: Some(document.comparison_id.to_string()),
+            side: side_name(side).into(),
+            line: input.line,
+            column: input.column,
+            symbol: input.symbol,
+            initial_query: input.initial_query,
+        })
+    }
+
+    pub fn query_symbol_navigation(
+        &self,
+        input: SymbolNavigationQuery,
+    ) -> Result<SymbolNavigationResult, DispatchError> {
+        validate_symbol(&input.symbol).map_err(symbol_dispatch_error)?;
+        if !matches!(input.kind.as_str(), "definitions" | "references" | "all") {
+            return Err(DispatchError::Invalid(
+                "symbol query kind must be definitions, references, or all".into(),
+            ));
+        }
+        let limit = usize::from(input.limit.unwrap_or(100));
+        if !(1..=MAX_SYMBOL_RESULTS).contains(&limit) {
+            return Err(DispatchError::Invalid(format!(
+                "symbol query limit must be between 1 and {MAX_SYMBOL_RESULTS}"
+            )));
+        }
+        let workspace_id = parse_workspace_id(&input.workspace_id)
+            .ok_or_else(|| DispatchError::Invalid("workspaceId is invalid".into()))?;
+        let repository_id = RepositoryId(
+            Uuid::parse_str(&input.repository_id)
+                .map_err(|_| DispatchError::Invalid("repositoryId is invalid".into()))?,
+        );
+        let comparison_id = input
+            .comparison_id
+            .as_deref()
+            .map(|value| {
+                parse_comparison_id(value)
+                    .ok_or_else(|| DispatchError::Invalid("comparisonId is invalid".into()))
+            })
+            .transpose()?;
+        let repository = self.symbol_repository(workspace_id, repository_id)?;
+        let searched = search_symbols(Path::new(repository.worktree_path.as_str()), &input.symbol)
+            .map_err(symbol_dispatch_error)?;
+        let review_paths =
+            self.symbol_review_path_index(workspace_id, repository_id, comparison_id)?;
+        let definition_total = searched.definitions.len();
+        let reference_total = searched.references.len();
+        let (definition_limit, reference_limit) = match input.kind.as_str() {
+            "definitions" => (limit, 0),
+            "references" => (0, limit),
+            _ => {
+                let definitions = definition_total.min(limit);
+                (definitions, limit.saturating_sub(definitions))
+            }
+        };
+        let definitions = searched
+            .definitions
+            .into_iter()
+            .take(definition_limit)
+            .map(|location| {
+                symbol_location_view(repository_id, location, "definition", &review_paths)
+            })
+            .collect::<Vec<_>>();
+        let references = searched
+            .references
+            .into_iter()
+            .take(reference_limit)
+            .map(|location| {
+                symbol_location_view(repository_id, location, "reference", &review_paths)
+            })
+            .collect::<Vec<_>>();
+        let selected = definitions.len().saturating_add(references.len());
+        let available = match input.kind.as_str() {
+            "definitions" => definition_total,
+            "references" => reference_total,
+            _ => definition_total.saturating_add(reference_total),
+        };
+        Ok(SymbolNavigationResult {
+            symbol: input.symbol,
+            definitions,
+            references,
+            truncated: searched.truncated || available > selected,
+            diagnostics: searched.diagnostics,
+        })
+    }
+
+    pub fn symbol_source(
+        &self,
+        input: SymbolSourceInput,
+    ) -> Result<SymbolSourceView, DispatchError> {
+        let workspace_id = parse_workspace_id(&input.workspace_id)
+            .ok_or_else(|| DispatchError::Invalid("workspaceId is invalid".into()))?;
+        let repository_id = RepositoryId(
+            Uuid::parse_str(&input.repository_id)
+                .map_err(|_| DispatchError::Invalid("repositoryId is invalid".into()))?,
+        );
+        let repository = self.symbol_repository(workspace_id, repository_id)?;
+        let source = read_symbol_source_window(
+            Path::new(repository.worktree_path.as_str()),
+            &input.path,
+            &input.expected_fingerprint,
+            input.start_line,
+            input.line_count,
+        )
+        .map_err(symbol_dispatch_error)?;
+        self.symbol_source_view(repository_id, source)
+    }
+
+    pub fn open_repository_source(
+        &self,
+        input: RepositorySourceOpenInput,
+    ) -> Result<SymbolSourceView, DispatchError> {
+        let workspace_id = parse_workspace_id(&input.workspace_id)
+            .ok_or_else(|| DispatchError::Invalid("workspaceId is invalid".into()))?;
+        let repository_id = RepositoryId(
+            Uuid::parse_str(&input.repository_id)
+                .map_err(|_| DispatchError::Invalid("repositoryId is invalid".into()))?,
+        );
+        let repository = self.symbol_repository(workspace_id, repository_id)?;
+        let source = open_symbol_source_window(
+            Path::new(repository.worktree_path.as_str()),
+            &input.path,
+            input.start_line,
+            input.line_count,
+        )
+        .map_err(symbol_dispatch_error)?;
+        self.symbol_source_view(repository_id, source)
+    }
+
+    pub fn repository_files(
+        &self,
+        input: RepositoryFilesInput,
+    ) -> Result<RepositoryFilesResult, DispatchError> {
+        let workspace_id = parse_workspace_id(&input.workspace_id)
+            .ok_or_else(|| DispatchError::Invalid("workspaceId is invalid".into()))?;
+        let repository_id = RepositoryId(
+            Uuid::parse_str(&input.repository_id)
+                .map_err(|_| DispatchError::Invalid("repositoryId is invalid".into()))?,
+        );
+        let comparison_id = input
+            .comparison_id
+            .as_deref()
+            .map(|value| {
+                parse_comparison_id(value)
+                    .ok_or_else(|| DispatchError::Invalid("comparisonId is invalid".into()))
+            })
+            .transpose()?;
+        let limit = usize::from(input.limit.unwrap_or(2_000));
+        if !(1..=MAX_REPOSITORY_FILES).contains(&limit) {
+            return Err(DispatchError::Invalid(format!(
+                "repository file limit must be between 1 and {MAX_REPOSITORY_FILES}"
+            )));
+        }
+        if input.query.as_ref().is_some_and(|query| query.len() > 512) {
+            return Err(DispatchError::Invalid(
+                "repository file query must be at most 512 bytes".into(),
+            ));
+        }
+        let repository = self.symbol_repository(workspace_id, repository_id)?;
+        let listed = list_symbol_repository_files(
+            Path::new(repository.worktree_path.as_str()),
+            input.query.as_deref(),
+            limit,
+        )
+        .map_err(symbol_dispatch_error)?;
+        let review_paths =
+            self.symbol_review_path_index(workspace_id, repository_id, comparison_id)?;
+        Ok(RepositoryFilesResult {
+            files: listed
+                .files
+                .into_iter()
+                .map(|path| {
+                    let review = review_paths.get(&path);
+                    RepositoryFileView {
+                        path,
+                        file_id: review.map(|(file_id, _, _)| file_id.clone()),
+                        comparison_id: review.map(|(_, comparison_id, _)| comparison_id.clone()),
+                        side: review.map(|(_, _, side)| side.clone()),
+                    }
+                })
+                .collect(),
+            truncated: listed.truncated,
+            diagnostics: listed.diagnostics,
+        })
+    }
+
+    fn symbol_source_view(
+        &self,
+        repository_id: RepositoryId,
+        source: CoreSourceWindow,
+    ) -> Result<SymbolSourceView, DispatchError> {
+        let settings = self.get_settings()?;
+        let request = HighlightRequest {
+            path: Path::new(&source.path),
+            source: &source.source,
+            side: DiffSide::New,
+            language_attribute: None,
+            theme: if settings.theme == "light" {
+                HighlightTheme::Light
+            } else {
+                HighlightTheme::Dark
+            },
+            force: false,
+        };
+        let highlighted =
+            self.highlight
+                .highlight_byte_range(&request, None, Some(source.byte_range));
+        let tokens = highlighted
+            .tokens
+            .into_iter()
+            .filter(|token| token.side == DiffSide::New)
+            .map(|token| SyntaxTokenView {
+                start_byte: token.start_byte,
+                end_byte: token.end_byte,
+                class: syntax_class_name(token.class).into(),
+            })
+            .collect();
+        let (highlight_status, highlight_reason) = match highlighted.status {
+            HighlightStatus::Highlighted => ("highlighted".into(), None),
+            HighlightStatus::PlainText(reason) => {
+                ("plain_text".into(), Some(format!("{reason:?}")))
+            }
+        };
+        Ok(SymbolSourceView {
+            repository_id: repository_id.to_string(),
+            path: source.path,
+            source_fingerprint: source.fingerprint,
+            start_line: source.start_line,
+            total_lines: source.total_lines,
+            lines: source.lines.into_iter().map(|(_, line)| line).collect(),
+            line_start_bytes: source.line_start_bytes,
+            tokens,
+            highlight_status,
+            highlight_reason,
+            language: highlighted
+                .language
+                .map(|language| language.display_name().into()),
+        })
+    }
+
+    fn symbol_repository(
+        &self,
+        workspace_id: WorkspaceId,
+        repository_id: RepositoryId,
+    ) -> Result<Repository, DispatchError> {
+        let workspace = self
+            .state()
+            .workspace(workspace_id)?
+            .ok_or_else(|| DispatchError::NotFound(workspace_id.to_string()))?;
+        if matches!(
+            workspace.source,
+            WorkspaceSource::RemoteDirectory { .. } | WorkspaceSource::RemotePullRequest { .. }
+        ) {
+            return Err(DispatchError::Invalid(
+                "codebase symbol navigation is not available for SSH workspaces yet".into(),
+            ));
+        }
+        let repository = self
+            .state()
+            .repositories_for_id(repository_id)?
+            .ok_or_else(|| DispatchError::NotFound(repository_id.to_string()))?;
+        if repository.workspace_id != workspace_id {
+            return Err(DispatchError::Invalid(
+                "repository does not belong to the requested workspace".into(),
+            ));
+        }
+        Ok(repository)
+    }
+
+    fn symbol_review_path_index(
+        &self,
+        workspace_id: WorkspaceId,
+        repository_id: RepositoryId,
+        comparison_id: Option<ComparisonId>,
+    ) -> Result<BTreeMap<String, (String, String, String)>, DispatchError> {
+        let session = if let Some(comparison_id) = comparison_id {
+            self.session_for_comparison(comparison_id)?
+                .filter(|session| session.workspace_id == workspace_id)
+        } else {
+            self.service.active_review_session(workspace_id)?
+        };
+        let Some(session) = session else {
+            return Ok(BTreeMap::new());
+        };
+        let comparisons = self.current_comparisons(session.id)?;
+        if let Some(comparison_id) = comparison_id {
+            let comparison = comparisons
+                .values()
+                .find(|comparison| comparison.id == comparison_id)
+                .ok_or_else(|| DispatchError::NotFound(comparison_id.to_string()))?;
+            if comparison.repository_id != repository_id {
+                return Err(DispatchError::Invalid(
+                    "comparison does not belong to the requested repository".into(),
+                ));
+            }
+        }
+        Ok(self
+            .service
+            .review_documents(session.id)?
+            .into_iter()
+            .filter_map(|document| {
+                let comparison = comparisons
+                    .values()
+                    .find(|comparison| comparison.id == document.document.comparison_id)?;
+                (comparison.repository_id == repository_id).then(|| {
+                    (
+                        document.document.file.path.as_str().to_owned(),
+                        (
+                            document.document.file.id.to_string(),
+                            document.document.comparison_id.to_string(),
+                            "new".into(),
+                        ),
+                    )
+                })
+            })
+            .collect())
     }
 
     pub fn workspace_ui_state(
@@ -4228,7 +5137,15 @@ impl DesktopController {
                     Ok(identity) => {
                         repository.current_branch = identity.head;
                     }
-                    Err(error) => live.comparison_error = Some(error.to_string()),
+                    Err(error) => {
+                        live.comparison_issue_kind = Some(
+                            localreview_service::RepositoryReviewFailureKind::from_git_error(
+                                &error,
+                                &baseline.reference,
+                            ),
+                        );
+                        live.comparison_error = Some(error.to_string());
+                    }
                 }
                 match git.status() {
                     Ok(status) => {
@@ -4239,6 +5156,12 @@ impl DesktopController {
                     }
                     Err(error) => {
                         live.status_summary = "Status unavailable".into();
+                        live.comparison_issue_kind.get_or_insert_with(|| {
+                            localreview_service::RepositoryReviewFailureKind::from_git_error(
+                                &error,
+                                &baseline.reference,
+                            )
+                        });
                         live.comparison_error
                             .get_or_insert_with(|| error.to_string());
                     }
@@ -4261,10 +5184,24 @@ impl DesktopController {
                                 live.ahead = Some(divergence.ahead);
                                 live.behind = Some(divergence.behind);
                             }
-                            Err(error) => live.comparison_error = Some(error.to_string()),
+                            Err(error) => {
+                                live.comparison_issue_kind = Some(
+                                    localreview_service::RepositoryReviewFailureKind::from_git_error(
+                                        &error,
+                                        &baseline.reference,
+                                    ),
+                                );
+                                live.comparison_error = Some(error.to_string());
+                            }
                         }
                     }
                     Err(error) => {
+                        live.comparison_issue_kind = Some(
+                            localreview_service::RepositoryReviewFailureKind::from_git_error(
+                                &error,
+                                &baseline.reference,
+                            ),
+                        );
                         let error = error.to_string();
                         repository.comparison_error = Some(error.clone());
                         live.comparison_error = Some(error);
@@ -6589,6 +7526,7 @@ impl DesktopController {
         &self,
         document: &ReviewDiffDocument,
         rows: &[DiffRowView],
+        mode: &str,
         settings: &ReviewSettings,
         language_attribute: Option<&str>,
         job: Option<&PresentationJobLease>,
@@ -6599,41 +7537,58 @@ impl DesktopController {
         } else {
             HighlightTheme::Dark
         };
-        let old = self.highlight.highlight(
-            &HighlightRequest {
-                path: Path::new(document.file.path.as_str()),
-                source: &document.old.content,
-                side: DiffSide::Old,
-                language_attribute,
-                theme: theme.clone(),
-                force: false,
-            },
-            job.map(|job| &job.highlight),
-        );
+        let old_ranges = row_byte_ranges(rows, DiffSide::Old, mode);
+        let new_ranges = row_byte_ranges(rows, DiffSide::New, mode);
+        let old_request = HighlightRequest {
+            path: Path::new(document.file.path.as_str()),
+            source: &document.old.content,
+            side: DiffSide::Old,
+            language_attribute,
+            theme: theme.clone(),
+            force: false,
+        };
+        let old = (!old_ranges.is_empty())
+            .then_some(old_ranges.as_slice())
+            .map_or_else(
+                || self.highlight.plain_presentation(&old_request),
+                |byte_ranges| {
+                    self.highlight.highlight_byte_ranges(
+                        &old_request,
+                        job.map(|job| &job.highlight),
+                        byte_ranges,
+                    )
+                },
+            );
         if job.is_some_and(PresentationJobLease::is_cancelled) {
             return Err(DispatchError::Cancelled);
         }
-        let new = self.highlight.highlight(
-            &HighlightRequest {
-                path: Path::new(document.file.path.as_str()),
-                source: &document.new.content,
-                side: DiffSide::New,
-                language_attribute,
-                theme,
-                force: false,
-            },
-            job.map(|job| &job.highlight),
-        );
+        let new_request = HighlightRequest {
+            path: Path::new(document.file.path.as_str()),
+            source: &document.new.content,
+            side: DiffSide::New,
+            language_attribute,
+            theme,
+            force: false,
+        };
+        let new = (!new_ranges.is_empty())
+            .then_some(new_ranges.as_slice())
+            .map_or_else(
+                || self.highlight.plain_presentation(&new_request),
+                |byte_ranges| {
+                    self.highlight.highlight_byte_ranges(
+                        &new_request,
+                        job.map(|job| &job.highlight),
+                        byte_ranges,
+                    )
+                },
+            );
         if job.is_some_and(PresentationJobLease::is_cancelled) {
             return Err(DispatchError::Cancelled);
         }
-        let old_range = row_byte_range(rows, DiffSide::Old);
-        let new_range = row_byte_range(rows, DiffSide::New);
         let old_tokens = old
             .tokens
             .into_iter()
             .filter(|token| token.side == DiffSide::Old)
-            .filter(|token| token_overlaps(token.start_byte, token.end_byte, old_range))
             .map(|token| SyntaxTokenView {
                 start_byte: token.start_byte,
                 end_byte: token.end_byte,
@@ -6644,7 +7599,6 @@ impl DesktopController {
             .tokens
             .into_iter()
             .filter(|token| token.side == DiffSide::New)
-            .filter(|token| token_overlaps(token.start_byte, token.end_byte, new_range))
             .map(|token| SyntaxTokenView {
                 start_byte: token.start_byte,
                 end_byte: token.end_byte,
@@ -6696,6 +7650,7 @@ impl DesktopController {
         let (old_tokens, new_tokens, highlight_status, highlight_reason) = self.highlight_window(
             document,
             &rows,
+            "full",
             settings,
             language_attribute.as_deref(),
             job,
@@ -7882,65 +8837,59 @@ fn full_file_hunk_locations(
     side: DiffSide,
     rows: &[FullFileProjectedRow],
 ) -> Vec<HunkLocationView> {
-    document
+    let mut locations = document
         .hunks
         .iter()
-        .map(|hunk| {
-            let first_old_change = hunk
-                .unified_rows
-                .iter()
-                .filter(|row| row.kind != DiffLineKind::Context)
-                .find_map(|row| row.old.as_ref().map(|cell| cell.line_number));
-            let first_new_change = hunk
-                .unified_rows
-                .iter()
-                .filter(|row| row.kind != DiffLineKind::Context)
-                .find_map(|row| row.new.as_ref().map(|cell| cell.line_number));
-            let displayed_change = hunk
-                .unified_rows
-                .iter()
-                .filter(|row| row.kind != DiffLineKind::Context)
-                .find_map(|row| match side {
-                    DiffSide::Old => row
-                        .old
-                        .as_ref()
-                        .map(|cell| (DiffSide::Old, cell.line_number))
-                        .or_else(|| {
-                            row.new
-                                .as_ref()
-                                .map(|cell| (DiffSide::New, cell.line_number))
-                        }),
-                    DiffSide::New => row
-                        .old
-                        .as_ref()
-                        .map(|cell| (DiffSide::Old, cell.line_number))
-                        .or_else(|| {
-                            row.new
-                                .as_ref()
-                                .map(|cell| (DiffSide::New, cell.line_number))
-                        }),
-                });
-            let row_index = displayed_change
-                .map(|(change_side, line)| nearest_full_file_row(rows, change_side, line))
-                .unwrap_or_else(|| {
-                    let fallback_line = match side {
-                        DiffSide::Old => hunk.header.old_start.max(1),
-                        DiffSide::New => hunk.header.new_start.max(1),
-                    };
-                    nearest_full_file_row(rows, side, fallback_line)
-                });
-            HunkLocationView {
-                id: hunk.id.0.clone(),
-                row_index: u32::try_from(row_index).unwrap_or(u32::MAX),
-                old_line: first_old_change
-                    .or_else(|| (hunk.header.old_count > 0).then_some(hunk.header.old_start)),
-                new_line: first_new_change
-                    .or_else(|| (hunk.header.new_count > 0).then_some(hunk.header.new_start)),
-                header: format_hunk_header(hunk),
-                collapsed_context_lines: None,
-            }
+        .flat_map(|hunk| {
+            // Full File visually separates change clusters even when Git joins
+            // them under one @@ hunk because only a few context lines lie
+            // between them. Navigation must follow those visible units: one
+            // deletion/addition pair (or one-sided gate) at a time.
+            hunk.unified_rows
+                .split(|row| row.kind == DiffLineKind::Context)
+                .filter(|block| !block.is_empty())
+                .enumerate()
+                .map(|(block_index, block)| {
+                    let first_old_change = block
+                        .iter()
+                        .find_map(|row| row.old.as_ref().map(|cell| cell.line_number));
+                    let first_new_change = block
+                        .iter()
+                        .find_map(|row| row.new.as_ref().map(|cell| cell.line_number));
+                    let row_index = [
+                        first_old_change
+                            .map(|line| nearest_full_file_row(rows, DiffSide::Old, line)),
+                        first_new_change
+                            .map(|line| nearest_full_file_row(rows, DiffSide::New, line)),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                    .unwrap_or_else(|| {
+                        let fallback_line = match side {
+                            DiffSide::Old => hunk.header.old_start.max(1),
+                            DiffSide::New => hunk.header.new_start.max(1),
+                        };
+                        nearest_full_file_row(rows, side, fallback_line)
+                    });
+                    HunkLocationView {
+                        id: format!("{}:review-block:{block_index}", hunk.id.0),
+                        row_index: u32::try_from(row_index).unwrap_or(u32::MAX),
+                        old_line: first_old_change,
+                        new_line: first_new_change,
+                        header: format!(
+                            "{} · change {}",
+                            format_hunk_header(hunk),
+                            block_index + 1
+                        ),
+                        collapsed_context_lines: None,
+                    }
+                })
+                .collect::<Vec<_>>()
         })
-        .collect()
+        .collect::<Vec<_>>();
+    locations.sort_by_key(|location| location.row_index);
+    locations
 }
 
 fn annotation_overlaps(
@@ -7962,10 +8911,27 @@ fn annotation_overlaps(
     })
 }
 
-fn row_byte_range(rows: &[DiffRowView], side: DiffSide) -> Option<(u32, u32)> {
-    let mut start = u32::MAX;
-    let mut end = 0_u32;
+fn row_byte_ranges(rows: &[DiffRowView], side: DiffSide, mode: &str) -> Vec<(u32, u32)> {
+    let mut ranges = Vec::<(u32, u32)>::new();
     for row in rows {
+        let display_side = if mode == "split" {
+            None
+        } else if mode == "full" {
+            Some(if row.old_line.is_some() && row.new_line.is_none() {
+                DiffSide::Old
+            } else {
+                DiffSide::New
+            })
+        } else {
+            Some(if row.kind == "deletion" {
+                DiffSide::Old
+            } else {
+                DiffSide::New
+            })
+        };
+        if display_side.is_some_and(|display_side| display_side != side) {
+            continue;
+        }
         let (offset, text) = match side {
             DiffSide::Old => (
                 row.old_source_start_byte,
@@ -7977,15 +8943,17 @@ fn row_byte_range(rows: &[DiffRowView], side: DiffSide) -> Option<(u32, u32)> {
             ),
         };
         if let (Some(offset), Some(text)) = (offset, text) {
-            start = start.min(offset);
-            end = end.max(offset.saturating_add(u32::try_from(text.len()).unwrap_or(u32::MAX)));
+            let end = offset.saturating_add(u32::try_from(text.len()).unwrap_or(u32::MAX));
+            if let Some((_, previous_end)) = ranges.last_mut() {
+                if offset <= previous_end.saturating_add(1) {
+                    *previous_end = (*previous_end).max(end);
+                    continue;
+                }
+            }
+            ranges.push((offset, end));
         }
     }
-    (start != u32::MAX).then_some((start, end))
-}
-
-fn token_overlaps(start: u32, end: u32, range: Option<(u32, u32)>) -> bool {
-    range.is_some_and(|(range_start, range_end)| end > range_start && start < range_end)
+    ranges
 }
 
 fn syntax_class_name(class: localreview_highlight::SyntaxClass) -> &'static str {
@@ -8024,6 +8992,50 @@ fn outline_kind_name(kind: localreview_highlight::OutlineKind) -> &'static str {
         localreview_highlight::OutlineKind::Heading => "heading",
         localreview_highlight::OutlineKind::Property => "property",
         localreview_highlight::OutlineKind::Unknown => "unknown",
+    }
+}
+
+fn symbol_dispatch_error(error: SymbolSearchError) -> DispatchError {
+    DispatchError::Invalid(error.to_string())
+}
+
+fn line_contains_symbol(line: &str, symbol: &str) -> bool {
+    line.match_indices(symbol).any(|(start, matched)| {
+        let end = start.saturating_add(matched.len());
+        let before = line
+            .get(..start)
+            .and_then(|value| value.chars().next_back());
+        let after = line.get(end..).and_then(|value| value.chars().next());
+        !before.is_some_and(symbol_identifier_continue)
+            && !after.is_some_and(symbol_identifier_continue)
+    })
+}
+
+fn symbol_identifier_continue(character: char) -> bool {
+    character == '_' || character == '$' || character.is_alphanumeric()
+}
+
+fn symbol_location_view(
+    repository_id: RepositoryId,
+    location: CoreSymbolLocation,
+    role: &str,
+    review_paths: &BTreeMap<String, (String, String, String)>,
+) -> SymbolNavigationLocationView {
+    let review_location = review_paths.get(&location.path);
+    SymbolNavigationLocationView {
+        repository_id: repository_id.to_string(),
+        path: location.path,
+        line: location.line,
+        column: location.column,
+        end_line: location.end_line,
+        end_column: location.end_column,
+        preview: location.preview,
+        kind: location.kind,
+        role: role.to_owned(),
+        source_fingerprint: location.source_fingerprint,
+        file_id: review_location.map(|(file_id, _, _)| file_id.clone()),
+        comparison_id: review_location.map(|(_, comparison_id, _)| comparison_id.clone()),
+        side: review_location.map(|(_, _, side)| side.clone()),
     }
 }
 
@@ -8342,6 +9354,47 @@ fn protocol_summary(workspace: &WorkspaceView) -> WorkspaceSummary {
             .collect(),
         available: workspace.connection == "connected",
         location: Some(workspace.location.clone()),
+    }
+}
+
+fn serialize_programmatic<T: Serialize>(value: &T) -> Result<serde_json::Value, DispatchError> {
+    serde_json::to_value(value).map_err(|_| DispatchError::Internal)
+}
+
+fn required_workspace_id(value: &str) -> Result<WorkspaceId, DispatchError> {
+    parse_workspace_id(value)
+        .ok_or_else(|| DispatchError::Invalid("workspace id is invalid".into()))
+}
+
+fn programmatic_operation_name(command: &ProgrammaticOperation) -> &'static str {
+    match command {
+        ProgrammaticOperation::ShowWorkspace { .. } => "show_workspace",
+        ProgrammaticOperation::ListArchivedWorkspaces => "list_archived_workspaces",
+        ProgrammaticOperation::ReopenArchivedWorkspace { .. } => "reopen_archived_workspace",
+        ProgrammaticOperation::LoadReview { .. } => "load_review",
+        ProgrammaticOperation::ReviewFiles { .. } => "review_files",
+        ProgrammaticOperation::ListAnnotations { .. } => "list_annotations",
+        ProgrammaticOperation::ReviewRows { .. } => "review_rows",
+        ProgrammaticOperation::ReviewHunks { .. } => "review_hunks",
+        ProgrammaticOperation::RepositorySetup { .. } => "repository_setup",
+        ProgrammaticOperation::ConfigureBaselines { .. } => "configure_baselines",
+        ProgrammaticOperation::SetRepositoryInclusion { .. } => "set_repository_inclusion",
+        ProgrammaticOperation::StartReview { .. } => "start_review",
+        ProgrammaticOperation::RefreshReview { .. } => "refresh_review",
+        ProgrammaticOperation::AddAnnotation { .. } => "add_annotation",
+        ProgrammaticOperation::DeleteAnnotation { .. } => "delete_annotation",
+        ProgrammaticOperation::SetAnnotationState { .. } => "set_annotation_state",
+        ProgrammaticOperation::MarkFileViewed { .. } => "mark_file_viewed",
+        ProgrammaticOperation::QuerySymbols { .. } => "query_symbols",
+        ProgrammaticOperation::GeneratePrompt { .. } => "generate_prompt",
+        ProgrammaticOperation::ReviewHistory { .. } => "review_history",
+        ProgrammaticOperation::ArchiveWorkspace { .. } => "archive_workspace",
+        ProgrammaticOperation::DeleteWorkspace { .. } => "delete_workspace",
+        ProgrammaticOperation::GithubInspect { .. } => "github_inspect",
+        ProgrammaticOperation::GithubPreviewReview { .. } => "github_preview_review",
+        ProgrammaticOperation::GithubSubmitReview { .. } => "github_submit_review",
+        ProgrammaticOperation::SshStatus { .. } => "ssh_status",
+        ProgrammaticOperation::EffectiveSettings { .. } => "effective_settings",
     }
 }
 
@@ -8675,6 +9728,7 @@ struct RepositorySetupLive {
     ahead: Option<u32>,
     behind: Option<u32>,
     comparison_error: Option<String>,
+    comparison_issue_kind: Option<localreview_service::RepositoryReviewFailureKind>,
     status_checked_at: Option<chrono::DateTime<Utc>>,
 }
 
@@ -8702,7 +9756,9 @@ fn repository_setup_view(
         pinned.and_then(|comparison| comparison.head_sha.as_ref().map(ToString::to_string));
     let comparison_error = live
         .comparison_error
+        .clone()
         .or_else(|| repository.comparison_error.clone());
+    let issues = repository_setup_issues(repository, baseline, &live, comparison_error.as_deref());
     RepositorySetupView {
         id: repository.id.to_string(),
         path: repository.relative_path.as_str().into(),
@@ -8731,7 +9787,216 @@ fn repository_setup_view(
         last_fetch_error: repository.last_fetch_error.clone(),
         discovery_error: repository.discovery_error.clone(),
         comparison_error,
+        issues,
         status_checked_at: live.status_checked_at.map(|value| value.to_rfc3339()),
+    }
+}
+
+fn repository_setup_issues(
+    repository: &Repository,
+    baseline: &localreview_domain::ResolvedBaseline,
+    live: &RepositorySetupLive,
+    comparison_error: Option<&str>,
+) -> Vec<ActionableIssueView> {
+    let mut issues = Vec::new();
+    if let Some(kind) = live.comparison_issue_kind.as_ref() {
+        if let Some(issue) =
+            repository_capture_issue(repository.id, kind, live.suggested_base.as_deref())
+        {
+            issues.push(issue);
+        }
+    } else if let Some(error) = comparison_error {
+        // Old durable rows predate typed capture failures. Keep the one
+        // high-confidence legacy signature so an app upgrade can guide the
+        // user immediately; ambiguous diagnostics remain raw errors.
+        if error.contains("rev-parse --verify")
+            && (error.contains("Needed a single revision")
+                || error.contains("unknown revision")
+                || error.contains("bad revision"))
+        {
+            issues.push(missing_base_issue(
+                repository.id,
+                &baseline.reference,
+                live.suggested_base.as_deref(),
+            ));
+        }
+    }
+    if repository.last_fetch_error.is_some() {
+        issues.push(ActionableIssueView {
+            id: format!("repository:{}:remote_fetch_failed", repository.id),
+            kind: "remote_fetch_failed".into(),
+            severity: "warning".into(),
+            title: "Remote fetch failed".into(),
+            message:
+                "The repository kept its existing local refs. Check the remote, credentials, or network, then fetch it again."
+                    .into(),
+            dismissible: true,
+            actions: vec![
+                issue_action("fetch_repository", "Fetch repository", None),
+                issue_action("open_review_setup", "Open Review setup", None),
+            ],
+        });
+    }
+    if repository.discovery_error.is_some() {
+        issues.push(ActionableIssueView {
+            id: format!("repository:{}:discovery_failed", repository.id),
+            kind: "repository_discovery_failed".into(),
+            severity: "error".into(),
+            title: "Repository is unavailable".into(),
+            message:
+                "LocalReview could not inspect this repository. Reconnect its workspace or exclude it before retrying."
+                    .into(),
+            dismissible: true,
+            actions: vec![
+                issue_action("retry_setup", "Retry setup", None),
+                issue_action("disable_repository", "Exclude repository", None),
+            ],
+        });
+    }
+    issues
+}
+
+fn repository_capture_issue(
+    repository_id: RepositoryId,
+    kind: &localreview_service::RepositoryReviewFailureKind,
+    suggested_base: Option<&str>,
+) -> Option<ActionableIssueView> {
+    use localreview_service::RepositoryReviewFailureKind;
+
+    Some(match kind {
+        RepositoryReviewFailureKind::MissingBaseReference { reference } => {
+            return Some(missing_base_issue(
+                repository_id,
+                reference,
+                suggested_base,
+            ));
+        }
+        RepositoryReviewFailureKind::MissingHead => ActionableIssueView {
+            id: format!("repository:{repository_id}:missing_head"),
+            kind: "missing_head".into(),
+            severity: "error".into(),
+            title: "Repository has no commit yet".into(),
+            message:
+                "A review needs a committed HEAD. Create the repository's first commit or exclude it from this review."
+                    .into(),
+            dismissible: true,
+            actions: vec![
+                issue_action("open_review_setup", "Open Review setup", None),
+                issue_action("disable_repository", "Exclude repository", None),
+            ],
+        },
+        RepositoryReviewFailureKind::GitUnavailable => ActionableIssueView {
+            id: format!("repository:{repository_id}:git_unavailable"),
+            kind: "git_unavailable".into(),
+            severity: "error".into(),
+            title: "Git is unavailable".into(),
+            message:
+                "LocalReview could not launch Git. Install Git or configure a usable Git executable, then retry."
+                    .into(),
+            dismissible: true,
+            actions: vec![issue_action("retry_refresh", "Retry refresh", None)],
+        },
+        RepositoryReviewFailureKind::RepositoryUnavailable => ActionableIssueView {
+            id: format!("repository:{repository_id}:repository_unavailable"),
+            kind: "repository_unavailable".into(),
+            severity: "error".into(),
+            title: "Repository path is no longer usable".into(),
+            message:
+                "The saved folder is missing or is no longer a Git worktree. Restore it or exclude it from Review setup."
+                    .into(),
+            dismissible: true,
+            actions: vec![
+                issue_action("open_review_setup", "Open Review setup", None),
+                issue_action("disable_repository", "Exclude repository", None),
+            ],
+        },
+        RepositoryReviewFailureKind::RepositoryPermissionDenied => ActionableIssueView {
+            id: format!("repository:{repository_id}:permission_denied"),
+            kind: "repository_permission_denied".into(),
+            severity: "error".into(),
+            title: "Repository access was denied".into(),
+            message:
+                "LocalReview cannot read part of this repository. Restore folder permissions or exclude it before retrying."
+                    .into(),
+            dismissible: true,
+            actions: vec![issue_action("open_review_setup", "Open Review setup", None)],
+        },
+        RepositoryReviewFailureKind::CaptureLimitExceeded => ActionableIssueView {
+            id: format!("repository:{repository_id}:capture_limit"),
+            kind: "capture_limit_exceeded".into(),
+            severity: "error".into(),
+            title: "Repository exceeds a review capture limit".into(),
+            message:
+                "A file or Git response is larger than LocalReview can safely capture. Remove the oversized untracked input or exclude this repository."
+                    .into(),
+            dismissible: true,
+            actions: vec![
+                issue_action("open_review_setup", "Open Review setup", None),
+                issue_action("disable_repository", "Exclude repository", None),
+            ],
+        },
+        RepositoryReviewFailureKind::ConcurrentModification => ActionableIssueView {
+            id: format!("repository:{repository_id}:concurrent_modification"),
+            kind: "concurrent_modification".into(),
+            severity: "warning".into(),
+            title: "Repository changed during capture".into(),
+            message: "Wait for the current Git operation or file update to finish, then retry."
+                .into(),
+            dismissible: true,
+            actions: vec![issue_action("retry_refresh", "Retry refresh", None)],
+        },
+        RepositoryReviewFailureKind::InvalidComparison => ActionableIssueView {
+            id: format!("repository:{repository_id}:invalid_comparison"),
+            kind: "invalid_comparison".into(),
+            severity: "error".into(),
+            title: "Comparison settings are invalid".into(),
+            message: "Review this repository's base and comparison options before retrying.".into(),
+            dismissible: true,
+            actions: vec![issue_action("open_review_setup", "Open Review setup", None)],
+        },
+        RepositoryReviewFailureKind::Other => return None,
+    })
+}
+
+fn missing_base_issue(
+    repository_id: RepositoryId,
+    reference: &BaseReference,
+    suggested_base: Option<&str>,
+) -> ActionableIssueView {
+    let mut actions = Vec::new();
+    if let Some(suggested) = suggested_base.filter(|value| *value != reference.as_str()) {
+        actions.push(issue_action(
+            "apply_suggested_base",
+            &format!("Use {suggested}"),
+            Some(suggested),
+        ));
+    }
+    if reference.as_str().starts_with("origin/") {
+        actions.push(issue_action("fetch_repository", "Fetch repository", None));
+    }
+    actions.push(issue_action("open_review_setup", "Open Review setup", None));
+    ActionableIssueView {
+        id: format!(
+            "repository:{repository_id}:missing_base:{}",
+            reference.as_str()
+        ),
+        kind: "missing_base_reference".into(),
+        severity: "error".into(),
+        title: "Base reference was not found".into(),
+        message: format!(
+            "Git cannot resolve `{}` in this repository. Choose a valid base, or fetch it if the remote ref has not been downloaded.",
+            reference.as_str()
+        ),
+        dismissible: true,
+        actions,
+    }
+}
+
+fn issue_action(kind: &str, label: &str, value: Option<&str>) -> ActionableIssueActionView {
+    ActionableIssueActionView {
+        kind: kind.into(),
+        label: label.into(),
+        value: value.map(Into::into),
     }
 }
 
@@ -8800,6 +10065,7 @@ fn local_refresh_outcome(
                 repository_id: failure.repository_id.to_string(),
                 repository_path: failure.relative_path.to_string(),
                 error: failure.error.clone(),
+                issue: repository_capture_issue(failure.repository_id, &failure.kind, None),
             })
             .collect(),
     }
@@ -9885,6 +11151,41 @@ mod tests {
         assert!(refreshed.workspace.refresh_available_revision > 0);
     }
 
+    #[test]
+    fn missing_base_failures_expose_stable_guided_actions_without_parsing_in_webview() {
+        let repository_id = RepositoryId::new();
+        let reference = BaseReference::new("origin/main").unwrap();
+        let issue = repository_capture_issue(
+            repository_id,
+            &localreview_service::RepositoryReviewFailureKind::MissingBaseReference {
+                reference: reference.clone(),
+            },
+            Some("origin/trunk"),
+        )
+        .unwrap();
+
+        assert_eq!(issue.kind, "missing_base_reference");
+        assert!(issue.dismissible);
+        assert!(issue.message.contains("origin/main"));
+        assert_eq!(
+            issue
+                .actions
+                .iter()
+                .map(|action| action.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "apply_suggested_base",
+                "fetch_repository",
+                "open_review_setup"
+            ]
+        );
+        assert_eq!(
+            issue.actions[0].value.as_deref(),
+            Some("origin/trunk"),
+            "the backend provides the exact validated suggestion instead of asking the UI to infer it"
+        );
+    }
+
     fn review_fixture(old_source: &str, new_source: &str) -> ReviewFixture {
         let state_directory = TempDir::new().unwrap();
         let workspace_directory = TempDir::new().unwrap();
@@ -9996,6 +11297,379 @@ mod tests {
     }
 
     #[test]
+    fn programmatic_cli_contract_drives_review_state_without_a_second_store() {
+        let fixture = review_fixture(
+            "fn old_one() {}\nfn old_two() {}\n",
+            "fn changed_one() {}\nfn caller() { changed_one(); }\n",
+        );
+        let workspace_id = fixture.workspace_id.to_string();
+        let file_id = fixture.file_id.to_string();
+
+        let loaded = fixture
+            .controller
+            .dispatch(
+                LocalCommand::Programmatic {
+                    command: ProgrammaticOperation::LoadReview {
+                        workspace_id: workspace_id.clone(),
+                    },
+                },
+                "load".into(),
+            )
+            .unwrap();
+        assert!(matches!(
+            loaded,
+            LocalResponse::Programmatic { ref operation, ref data, .. }
+                if operation == "load_review"
+                    && data["files"][0]["id"] == file_id
+        ));
+
+        let rows = fixture
+            .controller
+            .dispatch(
+                LocalCommand::Programmatic {
+                    command: ProgrammaticOperation::ReviewRows {
+                        file_id: file_id.clone(),
+                        mode: "unified".into(),
+                    },
+                },
+                "rows".into(),
+            )
+            .unwrap();
+        assert!(matches!(
+            rows,
+            LocalResponse::Programmatic { ref data, .. }
+                if data.as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "header"))
+        ));
+
+        let mut created_ids = Vec::new();
+        for (kind, body) in [
+            ("comment", "Please keep both changed lines coherent."),
+            ("question", "Why do these two lines change together?"),
+        ] {
+            let response = fixture
+                .controller
+                .dispatch(
+                    LocalCommand::Programmatic {
+                        command: ProgrammaticOperation::AddAnnotation {
+                            workspace_id: workspace_id.clone(),
+                            annotation: ProgrammaticAnnotation {
+                                id: None,
+                                file_id: file_id.clone(),
+                                kind: kind.into(),
+                                side: "new".into(),
+                                start_line: 1,
+                                end_line: 2,
+                                body: body.into(),
+                                labels: Vec::new(),
+                                local_only: true,
+                            },
+                        },
+                    },
+                    format!("add-{kind}"),
+                )
+                .unwrap();
+            let LocalResponse::Programmatic { data, .. } = response else {
+                panic!("expected programmatic annotation response");
+            };
+            created_ids.push(data["id"].as_str().unwrap().to_owned());
+        }
+
+        let feedback = fixture
+            .controller
+            .dispatch(
+                LocalCommand::Programmatic {
+                    command: ProgrammaticOperation::GeneratePrompt {
+                        workspace_id: workspace_id.clone(),
+                        scope: "feedback".into(),
+                        annotation_ids: Vec::new(),
+                        path_style: Some("portable".into()),
+                        include_diff_hunks: false,
+                        include_git_state: false,
+                        history_id: None,
+                    },
+                },
+                "prompt".into(),
+            )
+            .unwrap();
+        assert!(matches!(
+            feedback,
+            LocalResponse::Programmatic { ref data, .. }
+                if data["content"].as_str().is_some_and(|content|
+                    content.contains("Please keep both changed lines coherent.")
+                    && !content.contains("Why do these two lines change together?"))
+        ));
+
+        let history = fixture
+            .controller
+            .dispatch(
+                LocalCommand::Programmatic {
+                    command: ProgrammaticOperation::ReviewHistory {
+                        workspace_id: workspace_id.clone(),
+                    },
+                },
+                "history".into(),
+            )
+            .unwrap();
+        assert!(matches!(
+            history,
+            LocalResponse::Programmatic { ref data, .. }
+                if data.as_array().is_some_and(|items| items.iter().any(|item| item["type"] == "export"))
+        ));
+
+        let symbols = fixture
+            .controller
+            .dispatch(
+                LocalCommand::Programmatic {
+                    command: ProgrammaticOperation::QuerySymbols {
+                        workspace_id: workspace_id.clone(),
+                        repository_id: fixture.repository_id.to_string(),
+                        symbol: "changed_one".into(),
+                        kind: "all".into(),
+                        limit: Some(20),
+                    },
+                },
+                "symbols".into(),
+            )
+            .unwrap();
+        assert!(matches!(
+            symbols,
+            LocalResponse::Programmatic { ref data, .. }
+                if data["definitions"].as_array().is_some_and(|items| !items.is_empty())
+                    && data["references"].as_array().is_some_and(|items| !items.is_empty())
+        ));
+
+        fixture
+            .controller
+            .dispatch(
+                LocalCommand::Programmatic {
+                    command: ProgrammaticOperation::MarkFileViewed {
+                        workspace_id: workspace_id.clone(),
+                        file_id: file_id.clone(),
+                        viewed: true,
+                    },
+                },
+                "viewed".into(),
+            )
+            .unwrap();
+        fixture
+            .controller
+            .dispatch(
+                LocalCommand::Programmatic {
+                    command: ProgrammaticOperation::SetAnnotationState {
+                        workspace_id: workspace_id.clone(),
+                        annotation_id: created_ids[1].clone(),
+                        state: "resolved".into(),
+                    },
+                },
+                "resolve".into(),
+            )
+            .unwrap();
+        fixture
+            .controller
+            .dispatch(
+                LocalCommand::Programmatic {
+                    command: ProgrammaticOperation::DeleteAnnotation {
+                        workspace_id: workspace_id.clone(),
+                        annotation_id: created_ids[0].clone(),
+                    },
+                },
+                "delete-annotation".into(),
+            )
+            .unwrap();
+
+        let refused = fixture.controller.dispatch(
+            LocalCommand::Programmatic {
+                command: ProgrammaticOperation::ArchiveWorkspace {
+                    workspace_id: workspace_id.clone(),
+                    confirmation: "yes".into(),
+                },
+            },
+            "unsafe-archive".into(),
+        );
+        assert!(matches!(refused, Err(DispatchError::Invalid(_))));
+
+        fixture
+            .controller
+            .dispatch(
+                LocalCommand::Programmatic {
+                    command: ProgrammaticOperation::ArchiveWorkspace {
+                        workspace_id,
+                        confirmation: "archive".into(),
+                    },
+                },
+                "archive".into(),
+            )
+            .unwrap();
+        assert_eq!(
+            fixture.controller.list_archived_workspaces().unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn symbol_navigation_is_repository_owned_lazy_and_fingerprint_checked() {
+        let source = "pub fn shared_name() {}\nfn caller() { shared_name(); }\n";
+        let fixture = review_fixture("pub fn old_name() {}\n", source);
+        let seed = fixture
+            .controller
+            .validate_symbol_navigation_open(SymbolNavigationOpenInput {
+                workspace_id: fixture.workspace_id.to_string(),
+                repository_id: fixture.repository_id.to_string(),
+                file_id: fixture.file_id.to_string(),
+                comparison_id: None,
+                side: "new".into(),
+                line: 1,
+                column: 8,
+                symbol: "shared_name".into(),
+                initial_query: "definitions".into(),
+            })
+            .unwrap();
+        assert_eq!(seed.workspace_id, fixture.workspace_id.to_string());
+        assert_eq!(seed.repository_id, fixture.repository_id.to_string());
+        assert_eq!(seed.side, "new");
+        assert!(seed.comparison_id.is_some());
+
+        let result = fixture
+            .controller
+            .query_symbol_navigation(SymbolNavigationQuery {
+                workspace_id: fixture.workspace_id.to_string(),
+                repository_id: fixture.repository_id.to_string(),
+                comparison_id: seed.comparison_id.clone(),
+                symbol: "shared_name".into(),
+                kind: "all".into(),
+                limit: Some(20),
+            })
+            .unwrap();
+        let definition = result
+            .definitions
+            .iter()
+            .find(|location| location.path == "review.rs")
+            .expect("reviewed definition");
+        assert_eq!(definition.role, "definition");
+        assert_eq!(definition.file_id.as_deref(), Some(seed.file_id.as_str()));
+        assert_eq!(
+            definition.comparison_id.as_deref(),
+            seed.comparison_id.as_deref()
+        );
+        assert_eq!(definition.side.as_deref(), Some("new"));
+        assert!(result
+            .references
+            .iter()
+            .any(|location| location.path == "review.rs" && location.line == 2));
+
+        let source_view = fixture
+            .controller
+            .symbol_source(SymbolSourceInput {
+                workspace_id: fixture.workspace_id.to_string(),
+                repository_id: fixture.repository_id.to_string(),
+                path: definition.path.clone(),
+                expected_fingerprint: definition.source_fingerprint.clone(),
+                start_line: 1,
+                line_count: 10,
+            })
+            .unwrap();
+        assert_eq!(source_view.repository_id, fixture.repository_id.to_string());
+        assert_eq!(source_view.path, "review.rs");
+        assert_eq!(source_view.start_line, 1);
+        assert_eq!(source_view.total_lines, 2);
+        assert_eq!(source_view.line_start_bytes.len(), 2);
+        assert_eq!(source_view.highlight_status, "highlighted");
+        assert_eq!(source_view.language.as_deref(), Some("Rust"));
+        assert_eq!(
+            source_view.lines,
+            source.lines().map(str::to_owned).collect::<Vec<_>>()
+        );
+        let files = fixture
+            .controller
+            .repository_files(RepositoryFilesInput {
+                workspace_id: fixture.workspace_id.to_string(),
+                repository_id: fixture.repository_id.to_string(),
+                comparison_id: seed.comparison_id.clone(),
+                query: Some("review".into()),
+                limit: Some(20),
+            })
+            .unwrap();
+        assert_eq!(files.files.len(), 1);
+        assert_eq!(files.files[0].path, "review.rs");
+        assert_eq!(
+            files.files[0].file_id.as_deref(),
+            Some(seed.file_id.as_str())
+        );
+        let opened = fixture
+            .controller
+            .open_repository_source(RepositorySourceOpenInput {
+                workspace_id: fixture.workspace_id.to_string(),
+                repository_id: fixture.repository_id.to_string(),
+                path: "review.rs".into(),
+                start_line: 2,
+                line_count: 1,
+            })
+            .unwrap();
+        assert_eq!(opened.lines, vec!["fn caller() { shared_name(); }"]);
+        assert_eq!(opened.source_fingerprint, definition.source_fingerprint);
+
+        std::fs::write(
+            fixture._workspace_directory.path().join("review.rs"),
+            "pub fn changed_after_search() {}\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            fixture.controller.symbol_source(SymbolSourceInput {
+                workspace_id: fixture.workspace_id.to_string(),
+                repository_id: fixture.repository_id.to_string(),
+                path: definition.path.clone(),
+                expected_fingerprint: definition.source_fingerprint.clone(),
+                start_line: 1,
+                line_count: 10,
+            }),
+            Err(DispatchError::Invalid(message)) if message.contains("changed")
+        ));
+    }
+
+    #[test]
+    fn symbol_navigation_rejects_cross_workspace_and_cross_repository_targets() {
+        let fixture = review_fixture("fn before() {}\n", "fn reviewed_symbol() {}\n");
+        let wrong_workspace = WorkspaceId::new();
+        let wrong_repository = RepositoryId::new();
+        let input =
+            |workspace_id: WorkspaceId, repository_id: RepositoryId| SymbolNavigationOpenInput {
+                workspace_id: workspace_id.to_string(),
+                repository_id: repository_id.to_string(),
+                file_id: fixture.file_id.to_string(),
+                comparison_id: None,
+                side: "new".into(),
+                line: 1,
+                column: 4,
+                symbol: "reviewed_symbol".into(),
+                initial_query: "definitions".into(),
+            };
+
+        assert!(matches!(
+            fixture
+                .controller
+                .validate_symbol_navigation_open(input(wrong_workspace, fixture.repository_id)),
+            Err(DispatchError::Invalid(message)) if message.contains("workspace")
+        ));
+        assert!(matches!(
+            fixture
+                .controller
+                .validate_symbol_navigation_open(input(fixture.workspace_id, wrong_repository)),
+            Err(DispatchError::Invalid(message)) if message.contains("repository")
+        ));
+        assert!(matches!(
+            fixture.controller.symbol_source(SymbolSourceInput {
+                workspace_id: fixture.workspace_id.to_string(),
+                repository_id: fixture.repository_id.to_string(),
+                path: "../outside.rs".into(),
+                expected_fingerprint: "00".into(),
+                start_line: 1,
+                line_count: 10,
+            }),
+            Err(DispatchError::Invalid(message)) if message.contains("repository-relative")
+        ));
+    }
+
+    #[test]
     fn local_open_with_missing_base_enters_durable_setup_then_retries_after_restart() {
         let workspace_directory = TempDir::new().unwrap();
         let repository = workspace_directory.path();
@@ -10042,6 +11716,11 @@ mod tests {
         let setup = controller.repository_setup(workspace_id).unwrap();
         assert_eq!(setup.len(), 1);
         assert!(setup[0].comparison_error.is_some());
+        assert_eq!(setup[0].issues[0].kind, "missing_base_reference");
+        assert!(setup[0].issues[0]
+            .actions
+            .iter()
+            .any(|action| action.kind == "open_review_setup"));
         drop(controller);
 
         let reopened = DesktopController::new(StateStore::open(state_directory.path()).unwrap());
@@ -11961,6 +13640,84 @@ mod tests {
             .unwrap();
         assert_eq!(expanded_location.row_index, 21);
         assert!(!expanded.old_tokens.is_empty());
+    }
+
+    #[test]
+    fn full_file_navigation_exposes_each_visible_change_block_inside_one_git_hunk() {
+        let old = (1..=30)
+            .map(|line| format!("value_{line}=old\n"))
+            .collect::<String>();
+        let new = (1..=30)
+            .map(|line| {
+                if matches!(line, 8 | 12 | 16) {
+                    format!("value_{line}=new\n")
+                } else {
+                    format!("value_{line}=old\n")
+                }
+            })
+            .collect::<String>();
+        let fixture = review_fixture(&old, &new);
+        let resources = TempDir::new().unwrap();
+
+        let unified = fixture
+            .controller
+            .presentation_window(
+                PresentationRequest {
+                    file_id: fixture.file_id.to_string(),
+                    comparison_id: None,
+                    mode: "unified".into(),
+                    start_row: 0,
+                    end_row: u32::MAX,
+                    generation: 1,
+                    full_file_side: None,
+                    split_ratio: None,
+                    ephemeral_expanded_full_file_deletion_blocks: None,
+                    ephemeral_collapsed_full_file_addition_blocks: None,
+                },
+                resources.path(),
+            )
+            .unwrap();
+        assert_eq!(unified.hunks.len(), 1, "Git should merge the nearby edits");
+
+        let full = fixture
+            .controller
+            .presentation_window(
+                PresentationRequest {
+                    file_id: fixture.file_id.to_string(),
+                    comparison_id: None,
+                    mode: "full".into(),
+                    start_row: 0,
+                    end_row: u32::MAX,
+                    generation: 2,
+                    full_file_side: Some("both".into()),
+                    split_ratio: None,
+                    ephemeral_expanded_full_file_deletion_blocks: None,
+                    ephemeral_collapsed_full_file_addition_blocks: None,
+                },
+                resources.path(),
+            )
+            .unwrap();
+
+        assert_eq!(full.hunks.len(), 3);
+        assert_eq!(
+            full.hunks
+                .iter()
+                .map(|block| (block.old_line, block.new_line))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(8), Some(8)),
+                (Some(12), Some(12)),
+                (Some(16), Some(16))
+            ]
+        );
+        assert!(full
+            .hunks
+            .windows(2)
+            .all(|pair| pair[0].row_index < pair[1].row_index));
+        assert!(full
+            .hunks
+            .iter()
+            .all(|block| block.id.contains(":review-block:")));
     }
 
     #[test]

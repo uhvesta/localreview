@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{error::ErrorKind as ClapErrorKind, Parser, Subcommand};
 use localreview_domain::{
     BaseReference, ComparisonId, ComparisonOptions, RepositoryId, StoredPath,
 };
@@ -12,9 +12,10 @@ use localreview_protocol::{
     AgentOperation, AgentProgress, AgentProgressPhase, AgentRequest, AgentResponse, AgentResult,
     AppPaths, AuthProof, DoctorReport, LocalCommand, LocalRequest, LocalResponse,
     ManagedForwardCommand, ManagedForwardRelayCommand, ManagedForwardRelayRequest,
-    ManagedForwardRequest, ManagedForwardResponse, ProtocolError, RemoteCapturedFile,
-    RemoteChangeLayer, RemoteComparisonCapture, RemoteComparisonOptions, RemoteFileStatus,
-    RemoteHead, RemoteLayerSummary, RemoteRepository, RemoteRepositoryRef, RemoteSourceRevision,
+    ManagedForwardRequest, ManagedForwardResponse, ProgrammaticAnnotation, ProgrammaticOperation,
+    ProgrammaticRepositoryBase, ProtocolError, RemoteCapturedFile, RemoteChangeLayer,
+    RemoteComparisonCapture, RemoteComparisonOptions, RemoteFileStatus, RemoteHead,
+    RemoteLayerSummary, RemoteRepository, RemoteRepositoryRef, RemoteSourceRevision,
     RemoteSourceWindow, RepositoryBaseOverride, RuntimeRecord, WorkspaceSummary,
     MAX_REMOTE_CAPTURE_FILES, MAX_REMOTE_SOURCE_WINDOW_BYTES, PROTOCOL_VERSION,
 };
@@ -78,6 +79,117 @@ enum Command {
     Ssh { target: String },
     /// List desktop-registered workspaces.
     List,
+    /// Show one workspace without recapturing it.
+    Show { workspace: String },
+    /// Inspect archived workspaces or reopen one.
+    Archived {
+        #[command(subcommand)]
+        command: ArchivedCommand,
+    },
+    /// Inspect and capture durable review generations.
+    Review {
+        #[command(subcommand)]
+        command: ReviewCommand,
+    },
+    /// Inspect or change repository participation and baselines.
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
+    },
+    /// Add a durable feedback, question, suggestion, file note, or review note.
+    Annotate {
+        workspace_id: String,
+        file_id: String,
+        /// Existing annotation ID to update; omit to create.
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long, value_parser = ["comment", "question", "suggestion", "file_note", "review_note"])]
+        kind: String,
+        #[arg(long, default_value = "new", value_parser = ["old", "new"])]
+        side: String,
+        #[arg(long, default_value_t = 0)]
+        start_line: u32,
+        #[arg(long, default_value_t = 0)]
+        end_line: u32,
+        /// Markdown body, or `-` to read it from standard input.
+        #[arg(
+            long,
+            required_unless_present = "body_file",
+            conflicts_with = "body_file"
+        )]
+        body: Option<String>,
+        /// Read the Markdown body from a UTF-8 file.
+        #[arg(long, conflicts_with = "body")]
+        body_file: Option<PathBuf>,
+        #[arg(long = "label")]
+        labels: Vec<String>,
+        /// Include this line annotation in the next GitHub review.
+        #[arg(long)]
+        publish: bool,
+    },
+    /// List or mutate existing annotations.
+    Annotations {
+        #[command(subcommand)]
+        command: AnnotationCommand,
+    },
+    /// Mark one reviewed file viewed or unviewed.
+    Viewed {
+        workspace_id: String,
+        file_id: String,
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Lazily query repository-owned symbol definitions and references.
+    Symbol {
+        workspace_id: String,
+        repository_id: String,
+        symbol: String,
+        #[arg(long, default_value = "all", value_parser = ["all", "definitions", "references"])]
+        kind: String,
+        #[arg(long)]
+        limit: Option<u16>,
+    },
+    /// Generate and durably record a prompt export.
+    Prompt {
+        workspace_id: String,
+        #[arg(long, value_parser = ["feedback", "questions", "full", "focused_question", "selected"])]
+        scope: String,
+        #[arg(long = "annotation")]
+        annotation_ids: Vec<String>,
+        #[arg(long, value_parser = ["portable", "qualified", "absolute"])]
+        path_style: Option<String>,
+        #[arg(long)]
+        include_diff_hunks: bool,
+        #[arg(long)]
+        include_git_state: bool,
+        #[arg(long)]
+        history_id: Option<String>,
+    },
+    /// Archive a workspace while retaining recoverable review history.
+    Archive {
+        workspace_id: String,
+        /// Required exact acknowledgement.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Permanently purge LocalReview state for a workspace.
+    Delete {
+        workspace_id: String,
+        /// Required exact workspace display name.
+        #[arg(long)]
+        confirm_name: String,
+    },
+    /// Inspect, preview, or explicitly submit a GitHub PR review.
+    Github {
+        #[command(subcommand)]
+        command: GithubCommand,
+    },
+    /// Probe or reconnect one durable SSH workspace.
+    SshStatus {
+        workspace_id: String,
+        #[arg(long)]
+        reconnect: bool,
+    },
     /// Report whether the desktop endpoint and its local authentication material are usable.
     Doctor,
     /// Inspect LocalReview's read-only global defaults location.
@@ -115,10 +227,139 @@ enum RecoveryCommand {
 enum ConfigCommand {
     /// Print the OS-specific global config.toml path.
     Path,
+    /// Show the effective durable settings and repository baselines.
+    Effective { workspace_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum ArchivedCommand {
+    List,
+    Reopen { workspace_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum ReviewCommand {
+    Show {
+        workspace_id: String,
+    },
+    /// List the active review's immutable file records.
+    Files {
+        workspace_id: String,
+    },
+    /// List canonical hunk headers for one reviewed file.
+    Hunks {
+        file_id: String,
+    },
+    Rows {
+        file_id: String,
+        #[arg(long, default_value = "unified", value_parser = ["unified", "split", "full", "difftastic"])]
+        mode: String,
+    },
+    Start {
+        workspace_id: String,
+        #[arg(long)]
+        fetch: bool,
+    },
+    Refresh {
+        workspace_id: String,
+        #[arg(long)]
+        fetch: bool,
+    },
+    History {
+        workspace_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RepoCommand {
+    List {
+        workspace_id: String,
+    },
+    Configure {
+        workspace_id: String,
+        #[arg(long)]
+        default_base: Option<String>,
+        /// `repository-id-or-relative-path=ref`; use an empty ref to reset.
+        #[arg(long = "base")]
+        bases: Vec<String>,
+    },
+    Include {
+        workspace_id: String,
+        repository_ids: Vec<String>,
+    },
+    Exclude {
+        workspace_id: String,
+        repository_ids: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum GithubCommand {
+    Inspect {
+        workspace_id: String,
+    },
+    Preview {
+        workspace_id: String,
+        #[arg(long = "annotation")]
+        annotation_ids: Vec<String>,
+        #[arg(long, default_value = "")]
+        summary: String,
+        #[arg(long, default_value = "comment", value_parser = ["comment", "approve", "request_changes"])]
+        conclusion: String,
+    },
+    Submit {
+        workspace_id: String,
+        preview_token: String,
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AnnotationCommand {
+    List {
+        workspace_id: String,
+    },
+    Delete {
+        workspace_id: String,
+        annotation_id: String,
+    },
+    State {
+        workspace_id: String,
+        annotation_id: String,
+        #[arg(value_parser = ["open", "resolved"])]
+        state: String,
+    },
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ClapErrorKind::DisplayHelp | ClapErrorKind::DisplayVersion
+            ) =>
+        {
+            let _ = error.print();
+            return ExitCode::SUCCESS;
+        }
+        Err(error) => {
+            if env::args_os().any(|argument| argument == "--json") {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": false,
+                        "code": "usage",
+                        "message": error.to_string(),
+                    })
+                );
+            } else {
+                let _ = error.print();
+            }
+            return ExitCode::from(2);
+        }
+    };
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -189,6 +430,266 @@ fn run(cli: Cli) -> Result<(), CliError> {
             )
         }
         Command::List => emit_response(forward(LocalCommand::ListWorkspaces, true)?, cli.json),
+        Command::Show { workspace } => emit_programmatic(
+            ProgrammaticOperation::ShowWorkspace {
+                selector: workspace,
+            },
+            cli.json,
+        ),
+        Command::Archived { command } => match command {
+            ArchivedCommand::List => {
+                emit_programmatic(ProgrammaticOperation::ListArchivedWorkspaces, cli.json)
+            }
+            ArchivedCommand::Reopen { workspace_id } => emit_programmatic(
+                ProgrammaticOperation::ReopenArchivedWorkspace { workspace_id },
+                cli.json,
+            ),
+        },
+        Command::Review { command } => {
+            let operation = match command {
+                ReviewCommand::Show { workspace_id } => {
+                    ProgrammaticOperation::LoadReview { workspace_id }
+                }
+                ReviewCommand::Files { workspace_id } => {
+                    ProgrammaticOperation::ReviewFiles { workspace_id }
+                }
+                ReviewCommand::Hunks { file_id } => ProgrammaticOperation::ReviewHunks { file_id },
+                ReviewCommand::Rows { file_id, mode } => {
+                    ProgrammaticOperation::ReviewRows { file_id, mode }
+                }
+                ReviewCommand::Start {
+                    workspace_id,
+                    fetch,
+                } => ProgrammaticOperation::StartReview {
+                    workspace_id,
+                    fetch,
+                },
+                ReviewCommand::Refresh {
+                    workspace_id,
+                    fetch,
+                } => ProgrammaticOperation::RefreshReview {
+                    workspace_id,
+                    fetch,
+                },
+                ReviewCommand::History { workspace_id } => {
+                    ProgrammaticOperation::ReviewHistory { workspace_id }
+                }
+            };
+            emit_programmatic(operation, cli.json)
+        }
+        Command::Repo { command } => {
+            let operation = match command {
+                RepoCommand::List { workspace_id } => {
+                    ProgrammaticOperation::RepositorySetup { workspace_id }
+                }
+                RepoCommand::Configure {
+                    workspace_id,
+                    default_base,
+                    bases,
+                } => ProgrammaticOperation::ConfigureBaselines {
+                    workspace_id,
+                    default_base,
+                    repository_bases: bases
+                        .iter()
+                        .map(|value| parse_programmatic_base(value))
+                        .collect::<Result<Vec<_>, _>>()?,
+                },
+                RepoCommand::Include {
+                    workspace_id,
+                    repository_ids,
+                } => ProgrammaticOperation::SetRepositoryInclusion {
+                    workspace_id,
+                    repository_ids,
+                    enabled: true,
+                },
+                RepoCommand::Exclude {
+                    workspace_id,
+                    repository_ids,
+                } => ProgrammaticOperation::SetRepositoryInclusion {
+                    workspace_id,
+                    repository_ids,
+                    enabled: false,
+                },
+            };
+            emit_programmatic(operation, cli.json)
+        }
+        Command::Annotate {
+            workspace_id,
+            file_id,
+            id,
+            kind,
+            side,
+            start_line,
+            end_line,
+            body,
+            body_file,
+            labels,
+            publish,
+        } => {
+            let body = read_annotation_body(body, body_file)?;
+            emit_programmatic(
+                ProgrammaticOperation::AddAnnotation {
+                    workspace_id,
+                    annotation: ProgrammaticAnnotation {
+                        id,
+                        file_id,
+                        kind,
+                        side,
+                        start_line,
+                        end_line,
+                        body,
+                        labels,
+                        local_only: !publish,
+                    },
+                },
+                cli.json,
+            )
+        }
+        Command::Annotations { command } => {
+            let operation = match command {
+                AnnotationCommand::List { workspace_id } => {
+                    ProgrammaticOperation::ListAnnotations { workspace_id }
+                }
+                AnnotationCommand::Delete {
+                    workspace_id,
+                    annotation_id,
+                } => ProgrammaticOperation::DeleteAnnotation {
+                    workspace_id,
+                    annotation_id,
+                },
+                AnnotationCommand::State {
+                    workspace_id,
+                    annotation_id,
+                    state,
+                } => ProgrammaticOperation::SetAnnotationState {
+                    workspace_id,
+                    annotation_id,
+                    state,
+                },
+            };
+            emit_programmatic(operation, cli.json)
+        }
+        Command::Viewed {
+            workspace_id,
+            file_id,
+            clear,
+        } => emit_programmatic(
+            ProgrammaticOperation::MarkFileViewed {
+                workspace_id,
+                file_id,
+                viewed: !clear,
+            },
+            cli.json,
+        ),
+        Command::Symbol {
+            workspace_id,
+            repository_id,
+            symbol,
+            kind,
+            limit,
+        } => emit_programmatic(
+            ProgrammaticOperation::QuerySymbols {
+                workspace_id,
+                repository_id,
+                symbol,
+                kind,
+                limit,
+            },
+            cli.json,
+        ),
+        Command::Prompt {
+            workspace_id,
+            scope,
+            annotation_ids,
+            path_style,
+            include_diff_hunks,
+            include_git_state,
+            history_id,
+        } => emit_programmatic(
+            ProgrammaticOperation::GeneratePrompt {
+                workspace_id,
+                scope: if scope == "full" { "all".into() } else { scope },
+                annotation_ids,
+                path_style,
+                include_diff_hunks,
+                include_git_state,
+                history_id,
+            },
+            cli.json,
+        ),
+        Command::Archive {
+            workspace_id,
+            confirm,
+        } => {
+            if !confirm {
+                return Err(CliError::Usage(
+                    "archive requires --confirm; history remains recoverable".into(),
+                ));
+            }
+            emit_programmatic(
+                ProgrammaticOperation::ArchiveWorkspace {
+                    workspace_id,
+                    confirmation: "archive".into(),
+                },
+                cli.json,
+            )
+        }
+        Command::Delete {
+            workspace_id,
+            confirm_name,
+        } => emit_programmatic(
+            ProgrammaticOperation::DeleteWorkspace {
+                workspace_id,
+                confirmation: confirm_name,
+            },
+            cli.json,
+        ),
+        Command::Github { command } => {
+            let operation = match command {
+                GithubCommand::Inspect { workspace_id } => {
+                    ProgrammaticOperation::GithubInspect { workspace_id }
+                }
+                GithubCommand::Preview {
+                    workspace_id,
+                    annotation_ids,
+                    summary,
+                    conclusion,
+                } => ProgrammaticOperation::GithubPreviewReview {
+                    workspace_id,
+                    annotation_ids,
+                    summary,
+                    conclusion,
+                },
+                GithubCommand::Submit {
+                    workspace_id,
+                    preview_token,
+                    confirm,
+                } => {
+                    if !confirm {
+                        return Err(CliError::Usage(
+                            "GitHub submission requires --confirm after inspecting the preview"
+                                .into(),
+                        ));
+                    }
+                    ProgrammaticOperation::GithubSubmitReview {
+                        workspace_id,
+                        preview_token,
+                        confirm,
+                    }
+                }
+            };
+            emit_programmatic(operation, cli.json)
+        }
+        Command::SshStatus {
+            workspace_id,
+            reconnect,
+        } => emit_programmatic(
+            ProgrammaticOperation::SshStatus {
+                workspace_id,
+                reconnect,
+            },
+            cli.json,
+        ),
         Command::Doctor => emit_response(run_doctor()?, cli.json),
         Command::Config {
             command: ConfigCommand::Path,
@@ -208,6 +709,12 @@ fn run(cli: Cli) -> Result<(), CliError> {
             }
             Ok(())
         }
+        Command::Config {
+            command: ConfigCommand::Effective { workspace_id },
+        } => emit_programmatic(
+            ProgrammaticOperation::EffectiveSettings { workspace_id },
+            cli.json,
+        ),
         Command::Recover { command } => run_recovery(command, cli.json),
     }
 }
@@ -327,6 +834,76 @@ fn parse_repository_base(value: &str) -> Result<RepositoryBaseOverride, CliError
     }
     .validate()?;
     Ok(override_)
+}
+
+fn parse_programmatic_base(value: &str) -> Result<ProgrammaticRepositoryBase, CliError> {
+    let (selector, base) = value.split_once('=').ok_or_else(|| {
+        CliError::Usage("--base must use repository-id-or-relative-path=base-ref".into())
+    })?;
+    if selector.is_empty() {
+        return Err(CliError::Usage(
+            "repository base selector cannot be empty".into(),
+        ));
+    }
+    let base = (!base.is_empty()).then(|| base.to_owned());
+    if let Some(base) = &base {
+        localreview_protocol::validate_ref(base, "repository base")?;
+    }
+    let is_id = validate_identifier(selector, "repository id").is_ok()
+        && selector.len() == 36
+        && selector
+            .chars()
+            .filter(|character| *character == '-')
+            .count()
+            == 4;
+    if is_id {
+        Ok(ProgrammaticRepositoryBase {
+            repository_id: Some(selector.into()),
+            relative_path: None,
+            base,
+        })
+    } else {
+        localreview_protocol::validate_relative_path(selector)?;
+        Ok(ProgrammaticRepositoryBase {
+            repository_id: None,
+            relative_path: Some(selector.into()),
+            base,
+        })
+    }
+}
+
+fn read_annotation_body(inline: Option<String>, file: Option<PathBuf>) -> Result<String, CliError> {
+    const MAX_BODY_BYTES: u64 = 1024 * 1024;
+    let body = match (inline, file) {
+        (Some(value), None) if value == "-" => {
+            let mut body = String::new();
+            io::stdin()
+                .take(MAX_BODY_BYTES + 1)
+                .read_to_string(&mut body)?;
+            body
+        }
+        (Some(value), None) => value,
+        (None, Some(path)) => {
+            let metadata = fs::metadata(&path)?;
+            if metadata.len() > MAX_BODY_BYTES {
+                return Err(CliError::Usage(
+                    "annotation body file exceeds the 1 MiB limit".into(),
+                ));
+            }
+            fs::read_to_string(path)?
+        }
+        _ => {
+            return Err(CliError::Usage(
+                "provide exactly one of --body or --body-file".into(),
+            ))
+        }
+    };
+    if body.is_empty() || body.len() as u64 > MAX_BODY_BYTES || body.contains('\0') {
+        return Err(CliError::Usage(
+            "annotation body must contain 1 byte to 1 MiB of UTF-8 without NUL".into(),
+        ));
+    }
+    Ok(body)
 }
 
 fn resolve_workspace_path(path: &Path) -> Result<String, CliError> {
@@ -2986,11 +3563,34 @@ fn emit_response(response: LocalResponse, json: bool) -> Result<(), CliError> {
         }
         LocalResponse::Workspaces { workspaces, .. } => print_workspaces(&workspaces),
         LocalResponse::Doctor { report, .. } => print_doctor(&report),
+        LocalResponse::Programmatic {
+            operation, data, ..
+        } => {
+            if operation == "generate_prompt" {
+                if let Some(content) = data.get("content").and_then(serde_json::Value::as_str) {
+                    println!("{content}");
+                } else {
+                    return Err(CliError::Internal(
+                        "desktop prompt response omitted content".into(),
+                    ));
+                }
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&data)
+                        .map_err(|error| CliError::Internal(error.to_string()))?
+                );
+            }
+        }
         LocalResponse::Error { code, message, .. } => {
             return Err(CliError::Remote { code, message });
         }
     }
     Ok(())
+}
+
+fn emit_programmatic(command: ProgrammaticOperation, json: bool) -> Result<(), CliError> {
+    emit_response(forward(LocalCommand::Programmatic { command }, true)?, json)
 }
 
 fn print_workspaces(workspaces: &[WorkspaceSummary]) {
@@ -3168,6 +3768,93 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn cli_exposes_noninteractive_review_automation_surface() {
+        assert!(matches!(
+            Cli::try_parse_from(["localreview", "--json", "review", "show", "workspace-id"])
+                .unwrap()
+                .command,
+            Command::Review {
+                command: ReviewCommand::Show { .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "localreview",
+                "annotate",
+                "workspace-id",
+                "file-id",
+                "--kind",
+                "question",
+                "--start-line",
+                "7",
+                "--end-line",
+                "9",
+                "--body",
+                "Why?"
+            ])
+            .unwrap()
+            .command,
+            Command::Annotate {
+                start_line: 7,
+                end_line: 9,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from([
+            "localreview",
+            "github",
+            "submit",
+            "workspace-id",
+            "preview-token"
+        ])
+        .is_ok());
+        assert!(matches!(
+            Cli::try_parse_from([
+                "localreview",
+                "repo",
+                "configure",
+                "workspace-id",
+                "--default-base",
+                "origin/main",
+                "--base",
+                "services/api=origin/hotfix"
+            ])
+            .unwrap()
+            .command,
+            Command::Repo {
+                command: RepoCommand::Configure { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn programmatic_base_parser_supports_ids_paths_and_explicit_reset() {
+        let id = "12345678-1234-1234-1234-123456789abc";
+        let by_id = parse_programmatic_base(&format!("{id}=origin/main")).unwrap();
+        assert_eq!(by_id.repository_id.as_deref(), Some(id));
+        assert_eq!(by_id.relative_path, None);
+        assert_eq!(by_id.base.as_deref(), Some("origin/main"));
+
+        let reset = parse_programmatic_base("services/api=").unwrap();
+        assert_eq!(reset.repository_id, None);
+        assert_eq!(reset.relative_path.as_deref(), Some("services/api"));
+        assert_eq!(reset.base, None);
+        assert!(parse_programmatic_base("../escape=origin/main").is_err());
+    }
+
+    #[test]
+    fn annotation_body_file_is_utf8_and_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("body.md");
+        fs::write(&path, "multi-line\nfeedback\n").unwrap();
+        assert_eq!(
+            read_annotation_body(None, Some(path)).unwrap(),
+            "multi-line\nfeedback\n"
+        );
+        assert!(read_annotation_body(Some(String::new()), None).is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn authenticated_unix_forwarding_preserves_open_contract_on_macos_and_linux() {
@@ -3231,6 +3918,59 @@ mod tests {
                 workspace: WorkspaceSummary { ref id, .. },
                 ..
             } if id == "workspace-1"
+        ));
+        worker.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_programmatic_forwarding_preserves_machine_readable_data() {
+        use std::os::unix::net::UnixListener;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("desktop.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let secret = localreview_protocol::InstallationSecret::from_bytes([7; 32]);
+        let server_secret = secret.clone();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: LocalRequest = read_frame(&mut stream).unwrap();
+            server_secret.verify(&request).unwrap();
+            assert!(matches!(
+                request.command,
+                LocalCommand::Programmatic {
+                    command: ProgrammaticOperation::LoadReview { ref workspace_id }
+                } if workspace_id == "12345678-1234-1234-1234-123456789abc"
+            ));
+            write_frame(
+                &mut stream,
+                &LocalResponse::Programmatic {
+                    request_id: request.request_id,
+                    operation: "load_review".into(),
+                    data: serde_json::json!({
+                        "workspace": { "id": "12345678-1234-1234-1234-123456789abc" },
+                        "files": []
+                    }),
+                },
+            )
+            .unwrap();
+        });
+        let response = send_request(
+            &Endpoint {
+                record: RuntimeRecord::current(socket_path),
+                secret,
+            },
+            LocalCommand::Programmatic {
+                command: ProgrammaticOperation::LoadReview {
+                    workspace_id: "12345678-1234-1234-1234-123456789abc".into(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            response,
+            LocalResponse::Programmatic { ref data, .. }
+                if data["files"].as_array().is_some_and(Vec::is_empty)
         ));
         worker.join().unwrap();
     }

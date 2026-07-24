@@ -12,9 +12,12 @@ use crate::controller::{
     ImportedGitHubReviewThreadView, OpenGitHubPullRequestInput, OpenSshWorkspaceInput,
     OpenWorkspaceInput, OutlineSymbolView, PresentationLocation, PresentationRequest,
     PresentationWindow, PromptExportSaveFormat, PromptInput, PromptPreview, RepositoryBaseInput,
-    RepositorySelectionInput, RepositorySetupView, ReviewData, ReviewFileClassificationView,
-    ReviewHistoryItem, ReviewSettings, SavedPromptExport, SetRepositoryInclusionInput,
-    StartOrRefreshInput, WorkspaceUiStatePatch, WorkspaceUiStateView, WorkspaceView,
+    RepositoryFilesInput, RepositoryFilesResult, RepositorySelectionInput, RepositorySetupView,
+    RepositorySourceOpenInput, ReviewData, ReviewFileClassificationView, ReviewHistoryItem,
+    ReviewSettings, SavedPromptExport, SetRepositoryInclusionInput, StartOrRefreshInput,
+    SymbolNavigationOpenInput, SymbolNavigationQuery, SymbolNavigationResult,
+    SymbolNavigationSeedView, SymbolSourceInput, SymbolSourceView, WorkspaceUiStatePatch,
+    WorkspaceUiStateView, WorkspaceView,
 };
 use crate::AppState;
 use localreview_persistence::PersistenceDiagnostics;
@@ -51,6 +54,11 @@ pub const REVIEW_API_COMMANDS: &[&str] = &[
     "get_captured_source_range",
     "expand_hunk_context",
     "get_outline",
+    "open_symbol_navigation",
+    "query_symbol_navigation",
+    "get_symbol_source",
+    "get_repository_files",
+    "open_repository_source",
     "save_annotation",
     "get_annotation_draft",
     "save_annotation_draft",
@@ -181,6 +189,12 @@ impl From<DispatchError> for ApiError {
 #[serde(rename_all = "camelCase")]
 pub struct PickedFolder {
     pub path: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenSymbolNavigationResult {
+    pub window_label: String,
 }
 
 #[tauri::command]
@@ -473,13 +487,14 @@ pub async fn get_presentation_window(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<PresentationWindow, ApiError> {
+    let started = std::time::Instant::now();
     let resource_dir = app.path().resource_dir().map_err(|error| ApiError {
         code: "resource_unavailable",
         message: format!("could not resolve packaged presentation resources: {error}"),
         recovery_preview_token: None,
     })?;
     let controller = std::sync::Arc::clone(&state.controller);
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         controller.presentation_window(request, &resource_dir)
     })
     .await
@@ -488,7 +503,14 @@ pub async fn get_presentation_window(
         message: format!("presentation worker stopped unexpectedly: {error}"),
         recovery_preview_token: None,
     })?
-    .map_err(ApiError::from)
+    .map_err(ApiError::from);
+    crate::perf_trace::record(
+        "get_presentation_window",
+        started,
+        if result.is_ok() { "ok" } else { "error" },
+        result.as_ref().ok().map(|window| window.rows.len()),
+    );
+    result
 }
 
 /// Resolves a source line against the complete native presentation. Command
@@ -588,6 +610,134 @@ pub async fn get_outline(
         .map_err(|error| ApiError {
             code: "presentation_worker_failed",
             message: format!("outline worker stopped unexpectedly: {error}"),
+            recovery_preview_token: None,
+        })?
+        .map_err(ApiError::from)
+}
+
+#[tauri::command]
+pub async fn open_symbol_navigation(
+    input: SymbolNavigationOpenInput,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<OpenSymbolNavigationResult, ApiError> {
+    let controller = std::sync::Arc::clone(&state.controller);
+    let seed: SymbolNavigationSeedView = tauri::async_runtime::spawn_blocking(move || {
+        controller.validate_symbol_navigation_open(input)
+    })
+    .await
+    .map_err(|error| ApiError {
+        code: "symbol_navigation_worker_failed",
+        message: format!("symbol navigation validation stopped unexpectedly: {error}"),
+        recovery_preview_token: None,
+    })?
+    .map_err(ApiError::from)?;
+
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query
+        .append_pair("view", "symbol")
+        .append_pair("workspaceId", &seed.workspace_id)
+        .append_pair("repositoryId", &seed.repository_id)
+        .append_pair("fileId", &seed.file_id);
+    if let Some(comparison_id) = seed.comparison_id.as_deref() {
+        query.append_pair("comparisonId", comparison_id);
+    }
+    query
+        .append_pair("side", &seed.side)
+        .append_pair("line", &seed.line.to_string())
+        .append_pair("column", &seed.column.to_string())
+        .append_pair("symbol", &seed.symbol)
+        .append_pair("initialQuery", &seed.initial_query);
+    let window_label = format!("symbol-navigation-{}", uuid::Uuid::new_v4().simple());
+    let app_url = format!("index.html?{}", query.finish());
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        window_label.clone(),
+        tauri::WebviewUrl::App(app_url.into()),
+    )
+    .title(format!("{} — Code Navigation", seed.symbol))
+    .inner_size(1_100.0, 800.0)
+    .min_inner_size(720.0, 480.0)
+    .build()
+    .map_err(|error| ApiError {
+        code: "symbol_navigation_window_failed",
+        message: format!("could not open the code navigation window: {error}"),
+        recovery_preview_token: None,
+    })?;
+    Ok(OpenSymbolNavigationResult { window_label })
+}
+
+#[tauri::command]
+pub async fn query_symbol_navigation(
+    input: SymbolNavigationQuery,
+    state: State<'_, AppState>,
+) -> Result<SymbolNavigationResult, ApiError> {
+    let started = std::time::Instant::now();
+    let controller = std::sync::Arc::clone(&state.controller);
+    let result =
+        tauri::async_runtime::spawn_blocking(move || controller.query_symbol_navigation(input))
+            .await
+            .map_err(|error| ApiError {
+                code: "symbol_navigation_worker_failed",
+                message: format!("symbol search worker stopped unexpectedly: {error}"),
+                recovery_preview_token: None,
+            })?
+            .map_err(ApiError::from);
+    crate::perf_trace::record(
+        "query_symbol_navigation",
+        started,
+        if result.is_ok() { "ok" } else { "error" },
+        result
+            .as_ref()
+            .ok()
+            .map(|matches| matches.definitions.len() + matches.references.len()),
+    );
+    result
+}
+
+#[tauri::command]
+pub async fn get_symbol_source(
+    input: SymbolSourceInput,
+    state: State<'_, AppState>,
+) -> Result<SymbolSourceView, ApiError> {
+    let controller = std::sync::Arc::clone(&state.controller);
+    tauri::async_runtime::spawn_blocking(move || controller.symbol_source(input))
+        .await
+        .map_err(|error| ApiError {
+            code: "symbol_source_worker_failed",
+            message: format!("symbol source worker stopped unexpectedly: {error}"),
+            recovery_preview_token: None,
+        })?
+        .map_err(ApiError::from)
+}
+
+#[tauri::command]
+pub async fn get_repository_files(
+    input: RepositoryFilesInput,
+    state: State<'_, AppState>,
+) -> Result<RepositoryFilesResult, ApiError> {
+    let controller = std::sync::Arc::clone(&state.controller);
+    tauri::async_runtime::spawn_blocking(move || controller.repository_files(input))
+        .await
+        .map_err(|error| ApiError {
+            code: "repository_files_worker_failed",
+            message: format!("repository file worker stopped unexpectedly: {error}"),
+            recovery_preview_token: None,
+        })?
+        .map_err(ApiError::from)
+}
+
+#[tauri::command]
+pub async fn open_repository_source(
+    input: RepositorySourceOpenInput,
+    state: State<'_, AppState>,
+) -> Result<SymbolSourceView, ApiError> {
+    let controller = std::sync::Arc::clone(&state.controller);
+    tauri::async_runtime::spawn_blocking(move || controller.open_repository_source(input))
+        .await
+        .map_err(|error| ApiError {
+            code: "repository_source_worker_failed",
+            message: format!("repository source worker stopped unexpectedly: {error}"),
             recovery_preview_token: None,
         })?
         .map_err(ApiError::from)
@@ -865,17 +1015,27 @@ pub async fn refresh_review(
     request: Option<StartOrRefreshInput>,
     state: State<'_, AppState>,
 ) -> Result<ReviewData, ApiError> {
+    let started = std::time::Instant::now();
     let workspace_id = parse_workspace(&workspace_id)?;
     let request = request.unwrap_or_default();
     let controller = std::sync::Arc::clone(&state.controller);
-    tauri::async_runtime::spawn_blocking(move || controller.refresh_review(workspace_id, request))
-        .await
-        .map_err(|error| ApiError {
-            code: "refresh_worker_failed",
-            message: format!("refresh worker stopped unexpectedly: {error}"),
-            recovery_preview_token: None,
-        })?
-        .map_err(ApiError::from)
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        controller.refresh_review(workspace_id, request)
+    })
+    .await
+    .map_err(|error| ApiError {
+        code: "refresh_worker_failed",
+        message: format!("refresh worker stopped unexpectedly: {error}"),
+        recovery_preview_token: None,
+    })?
+    .map_err(ApiError::from);
+    crate::perf_trace::record(
+        "refresh_review",
+        started,
+        if result.is_ok() { "ok" } else { "error" },
+        result.as_ref().ok().map(|review| review.files.len()),
+    );
+    result
 }
 
 #[tauri::command]
@@ -1335,6 +1495,11 @@ mod tests {
                 "get_captured_source_range",
                 "expand_hunk_context",
                 "get_outline",
+                "open_symbol_navigation",
+                "query_symbol_navigation",
+                "get_symbol_source",
+                "get_repository_files",
+                "open_repository_source",
                 "save_annotation",
                 "get_annotation_draft",
                 "save_annotation_draft",

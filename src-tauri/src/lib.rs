@@ -5,8 +5,12 @@
 mod activation;
 mod api;
 mod controller;
+#[cfg(feature = "perf-harness")]
+mod perf_harness;
+mod perf_trace;
 #[cfg(unix)]
 mod rpc;
+mod symbols;
 
 use api::{
     abandon_finish_review, apply_repository_base, archive_annotations, archive_workspace,
@@ -16,14 +20,16 @@ use api::{
     get_captured_source_range, get_changed_since_previous_review, get_commit_context,
     get_github_conversation, get_github_pull_request, get_github_threads, get_github_update_status,
     get_outline, get_persistence_diagnostics, get_presentation_rows, get_presentation_window,
-    get_repository_setup, get_review_file_classifications, get_review_history, get_ui_settings,
-    get_workspace_ui_state, list_archived_workspaces, list_workspaces, load_archived_review,
-    load_review, open_github_pr, open_in_external_editor, open_ssh_workspace, open_workspace,
-    pick_local_folder, preview_finish_review, reconnect_ssh_workspace, refresh_review,
-    reopen_archived_workspace, reset_repository_base_overrides, resolve_presentation_location,
-    restore_annotations, restore_history_item, save_annotation, save_annotation_draft,
-    save_prompt_export, save_ui_settings, save_workspace_ui_state, set_annotation_state,
-    set_repository_inclusion, set_viewed, start_new_review, update_workspace_metadata,
+    get_repository_files, get_repository_setup, get_review_file_classifications,
+    get_review_history, get_symbol_source, get_ui_settings, get_workspace_ui_state,
+    list_archived_workspaces, list_workspaces, load_archived_review, load_review, open_github_pr,
+    open_in_external_editor, open_repository_source, open_ssh_workspace, open_symbol_navigation,
+    open_workspace, pick_local_folder, preview_finish_review, query_symbol_navigation,
+    reconnect_ssh_workspace, refresh_review, reopen_archived_workspace,
+    reset_repository_base_overrides, resolve_presentation_location, restore_annotations,
+    restore_history_item, save_annotation, save_annotation_draft, save_prompt_export,
+    save_ui_settings, save_workspace_ui_state, set_annotation_state, set_repository_inclusion,
+    set_viewed, start_new_review, update_workspace_metadata,
 };
 use controller::DesktopController;
 use localreview_persistence::{StartupState, StateStore, DEFAULT_BACKUP_INTERVAL};
@@ -35,6 +41,11 @@ pub(crate) const DESKTOP_OPERATION_EVENT: &str = "localreview://desktop-operatio
 
 pub(crate) struct AppState {
     pub controller: Arc<DesktopController>,
+}
+
+#[cfg(feature = "perf-harness")]
+pub fn run_performance_harness(output: &std::path::Path) -> Result<(), String> {
+    perf_harness::run(output)
 }
 
 pub fn run() {
@@ -91,8 +102,13 @@ pub fn run() {
     let _ = controller.repair_managed_worktree_orphans();
     // Single-instance must be the first plugin so operating-system activation
     // and deep-link argv are delivered to the already-running review window.
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(
+    // The isolated release-bundle performance harness uses a distinct data
+    // directory and opts out so it never interrupts the user's real app.
+    let builder = tauri::Builder::default();
+    let builder = if std::env::var_os("LOCALREVIEW_ALLOW_MULTIPLE_INSTANCES").is_some() {
+        builder
+    } else {
+        builder.plugin(tauri_plugin_single_instance::init(
             |app, arguments, _cwd| {
                 for argument in arguments
                     .iter()
@@ -107,6 +123,8 @@ pub fn run() {
                 }
             },
         ))
+    };
+    builder
         .plugin(tauri_plugin_deep_link::init())
         .manage(AppState {
             controller: Arc::new(controller),
@@ -137,6 +155,11 @@ pub fn run() {
             get_captured_source_range,
             expand_hunk_context,
             get_outline,
+            open_symbol_navigation,
+            query_symbol_navigation,
+            get_symbol_source,
+            get_repository_files,
+            open_repository_source,
             save_annotation,
             get_annotation_draft,
             save_annotation_draft,

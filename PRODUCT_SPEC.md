@@ -40,7 +40,10 @@ The following decisions are requirements, not unresolved design suggestions:
 - Initial GitHub authentication may reuse the GitHub CLI (`gh`) login.
 - App-managed PR worktrees are review-only. Editing and source modification are outside product scope.
 - SSH support may install or invoke a small LocalReview companion binary on the remote host.
-- The CLI primarily opens, forwards, and focuses workspaces in the desktop application. It is not a headless diff renderer.
+- The CLI is a noninteractive automation client of the desktop application's
+  authenticated native controller. It can open/focus workspaces and operate
+  durable review state without implementing a second headless renderer or
+  opening the state database directly.
 
 ## 3. Goals
 
@@ -366,6 +369,60 @@ The user can:
 - Continue with successful repositories when another repository fails.
 
 Fetch-on-review is a global setting with a workspace override. It defaults to off. Refresh reads existing local refs unless fetch-on-review is enabled. A separate Refresh and Fetch action always makes network activity explicit.
+
+### 9.1 Actionable setup issues
+
+Configuration and environment failures must cross the native/UI boundary as
+typed actionable issues when LocalReview can identify the cause confidently.
+Each issue has a stable ID and kind, severity, concise explanation,
+dismissibility, and zero or more native-defined actions. The UI must not parse
+Git, GitHub CLI, SSH, or operating-system error text to decide which control to
+offer. Raw diagnostics remain available behind technical details.
+
+Issues are non-destructive and dismissible for the current operation. Dismissing
+one never changes repository inclusion, a baseline, credentials, or a config
+file. An issue is shown again after a later operation fails for the same cause.
+An action that changes review configuration still requires the user's explicit
+click.
+
+The initial typed repository issue set includes:
+
+- Missing base reference: apply Git's authoritative `origin/HEAD` suggestion
+  when one exists, fetch the repository, or open Review setup.
+- Unborn HEAD: open Review setup or exclude the repository.
+- Missing Git executable: explain installation/configuration and retry.
+- Missing/non-repository path or permission denial: open setup and, where safe,
+  offer exclusion.
+- Capture size limit: explain the bounded input and offer setup/exclusion.
+- Repository changed during capture: retry without treating it as a
+  configuration failure.
+- Invalid comparison inputs: open Review setup.
+- Failed fetch or discovery: retry the scoped operation or exclude the
+  repository while keeping successful siblings usable.
+
+### 9.2 Configuration-error audit and repair policy
+
+| Area | Detectable cause | Policy |
+| --- | --- | --- |
+| Workspace/global TOML | Unreadable file, invalid TOML, unsafe exclude, invalid base | Guided error with the exact config path and field; never rewrite a read-only shared config |
+| Workspace discovery | Root missing/unreadable, nested path no longer a worktree | Guided workspace/folder correction or repository exclusion |
+| Local Git | Deterministically resolved Git missing, permission denied | Guided install/path/permission correction; PATH remains a fallback |
+| Comparison | Base ref missing, unborn HEAD, invalid comparison option | Typed Review setup action; an authoritative `origin/HEAD` may be suggested but is never applied automatically |
+| Fetch | Missing `origin`, authentication/network failure, remote ref still absent | Scoped Fetch/retry action; no implicit network request |
+| Capture | Oversized untracked file/output, concurrent mutation | Explain/exclude for hard limits; retry for concurrent mutation |
+| GitHub | Invalid PR URL, missing CLI/auth, insufficient access, moved head/base | Guided sign-in/retry/refresh; invalid user input remains inline; ambiguous publication must use reconciliation and can never be auto-retried |
+| SSH | Invalid host/root, host authentication, companion missing/incompatible, protocol mismatch, forward failure, disconnect | Guided reconnect or explicit signed companion install/update; never weaken host verification |
+| Managed PR worktree | Dirty worktree, missing registry/worktree, mismatched origin | Guided cleanup/recreate/delete choice; never discard dirty content automatically |
+| Persistence | App-data path missing/unwritable, schema/data corruption, disk full | Startup/blocking error with durable-path guidance; never fall back to temporary storage or auto-delete history |
+| Presentation | Missing/invalid Difftastic sidecar or unsupported file | Automatically fall back to canonical diff and expose a non-blocking diagnostic |
+| Desktop integration | Clipboard/editor unavailable, invalid activation/forwarding endpoint | Retry or settings guidance; malformed/untrusted requests remain errors |
+
+Only recoveries that preserve intent and data may be automatic: deterministic
+executable resolution, cache invalidation/recomputation, reconnecting an
+unchanged transport, and Difftastic-to-canonical fallback. Selecting a
+different baseline, fetching, editing config, installing a remote companion,
+discarding a worktree, changing credentials, or retrying an ambiguous GitHub
+submission always requires an explicit user action.
 
 ## 10. Review capture and refresh
 
@@ -768,7 +825,12 @@ Questions may be included as normal GitHub review comments. Any annotation can b
 
 ### 21.1 Scope
 
-The CLI opens or focuses content in the desktop application. It does not need to render diffs or manage review annotations headlessly.
+The CLI exposes the useful review workflow noninteractively while the running
+desktop process remains the sole authority for persistence, Git captures,
+annotation validation, prompt generation, SSH sessions, and GitHub
+publication. It may return native review/file/row data as JSON, but it does not
+implement an independent diff renderer or read/write the state database
+directly.
 
 Required commands:
 
@@ -780,7 +842,21 @@ localreview workspace <name-or-id>
 localreview pr <github-pr-url>
 localreview ssh <host>:<absolute-path>
 localreview list
+localreview show <workspace-name-or-id>
+localreview archived list|reopen ...
+localreview review show|rows|start|refresh|history ...
+localreview repo list|configure|include|exclude ...
+localreview annotate ...
+localreview annotations list|delete|state ...
+localreview viewed ...
+localreview symbol ...
+localreview prompt ...
+localreview archive ... --confirm
+localreview delete ... --confirm-name <exact-name>
+localreview github inspect|preview|submit ...
+localreview ssh-status ...
 localreview doctor
+localreview config path|effective ...
 localreview agent --stdio
 ```
 
@@ -789,6 +865,20 @@ Behavior:
 - Relative paths resolve against the CLI process working directory before forwarding.
 - Opening a registered path focuses its existing workspace rather than duplicating it.
 - `workspace` focuses a known workspace by exact ID or unambiguous name.
+- Every durable review operation is forwarded through the authenticated
+  desktop controller and supports `--json`; scripts never need database
+  access, renderer state, or shell-command injection.
+- Feedback, questions, suggestions, file notes, and review notes accept
+  inclusive multi-line ranges and bounded bodies supplied inline, from UTF-8
+  files, or from standard input. Existing annotation IDs may be updated;
+  state and deletion operations retain native ownership validation.
+- Prompt scopes keep feedback, questions, and full exports distinct and expose
+  the exact durable prompt bytes in the JSON response.
+- Archive requires an explicit acknowledgement. Permanent deletion requires
+  the exact workspace display name. GitHub submission requires a native
+  preview token plus a separate `--confirm`.
+- Read-only automation calls do not activate or steal focus from the desktop
+  window. Open/focus operations retain normal desktop activation.
 - `list` prints registered names, IDs, source tags, and availability for discoverability.
 - Commands return useful exit codes and support `--json` acknowledgement output for shell integration.
 - If the macOS application is not running, a local macOS CLI command launches it and waits for readiness.
@@ -1145,7 +1235,11 @@ The complete target product is acceptable when:
 13. Pasting a GitHub PR URL creates or reuses Git objects, creates an isolated worktree, and pins the review SHAs.
 14. Deleting a PR review safely removes its worktree while retaining a useful shared mirror.
 15. Finish Review previews and submits all selected annotations as one native GitHub review.
-16. The macOS/Linux CLI can open or focus known workspaces, open PRs, and request SSH workspaces in the macOS app.
+16. The macOS/Linux CLI can noninteractively exercise the durable review
+    workflow through authenticated desktop IPC—including workspace lifecycle,
+    baselines, capture/refresh, multi-line annotations, prompt/history export,
+    viewed state, symbol queries, GitHub preview/submission, and SSH
+    status—using stable JSON and exit codes.
 17. A remote Linux companion can review an SSH workspace with local-like behavior and no full-workspace synchronization.
 18. Large-file, large-patch, accessibility, persistence, recovery, and security test gates pass.
 

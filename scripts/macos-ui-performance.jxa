@@ -1,0 +1,137 @@
+#!/usr/bin/osascript -l JavaScript
+ObjC.import("Foundation");
+
+function micros() {
+  return Math.round(Number($.NSProcessInfo.processInfo.systemUptime) * 1000000);
+}
+
+function process() {
+  const systemEvents = Application("System Events");
+  const arguments = ObjC.deepUnwrap($.NSProcessInfo.processInfo.arguments);
+  const requestedPid = Number(arguments[arguments.length - 1]);
+  let matches = Number.isFinite(requestedPid)
+    ? systemEvents.processes.whose({ unixId: requestedPid })()
+    : [];
+  if (!matches.length) matches = systemEvents.processes.whose({ name: "LocalReviewPerf" })();
+  if (!matches.length) matches = systemEvents.processes.whose({ name: "LocalReview" })();
+  if (!matches.length) throw new Error("LocalReview is not running");
+  return matches[0];
+}
+
+function value(element, property, fallback) {
+  try {
+    const result = element[property]();
+    return result === undefined || result === null ? fallback : result;
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function buttons() {
+  return process().entireContents().filter((element) => value(element, "role", "") === "AXButton");
+}
+
+function buttonMatching(predicate) {
+  const found = buttons().find((element) => {
+    const name = String(value(element, "name", ""));
+    const description = String(value(element, "description", ""));
+    return predicate(name, description, element);
+  });
+  if (!found) throw new Error("matching button was not found");
+  return found;
+}
+
+function press(element) {
+  element.actions.byName("AXPress").perform();
+}
+
+function waitFor(predicate, timeoutMicros, label) {
+  const started = micros();
+  while (micros() - started < timeoutMicros) {
+    const result = predicate();
+    if (result) return result;
+    delay(0.005);
+  }
+  throw new Error(`timed out waiting for ${label}`);
+}
+
+function enabledButton(name) {
+  try {
+    const button = buttonMatching((candidate) => candidate === name);
+    return value(button, "enabled", false) ? button : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function measureOptimistic(sourceName, targetName) {
+  const source = waitFor(() => enabledButton(sourceName), 10000000, sourceName);
+  const started = micros();
+  press(source);
+  waitFor(() => enabledButton(targetName), 5000000, targetName);
+  return {
+    kind: "frontend_optimistic",
+    operation: sourceName.toLowerCase().replaceAll(" ", "_"),
+    durationMicros: micros() - started,
+  };
+}
+
+function measureIndividual(action) {
+  const source = waitFor(
+    () => {
+      try {
+        return buttonMatching((name, description) => {
+          const label = `${name} ${description}`;
+          return label.includes(`${action} `) && label.includes("added line");
+        });
+      } catch (_) {
+        return null;
+      }
+    },
+    10000000,
+    `${action} individual addition`
+  );
+  const started = micros();
+  press(source);
+  const targetAction = action === "Hide" ? "Show" : "Hide";
+  waitFor(
+    () => {
+      try {
+        return buttonMatching((name, description) => {
+          const label = `${name} ${description}`;
+          return label.includes(`${targetAction} `) && label.includes("added line");
+        });
+      } catch (_) {
+        return null;
+      }
+    },
+    5000000,
+    `${targetAction} individual addition`
+  );
+  return {
+    kind: "frontend_optimistic",
+    operation: `${action.toLowerCase()}_individual_addition`,
+    durationMicros: micros() - started,
+  };
+}
+
+function run() {
+  const fullFile = waitFor(
+    () => {
+      try {
+        return buttonMatching((name) => name === "Full File");
+      } catch (_) {
+        return null;
+      }
+    },
+    15000000,
+    "Full File button"
+  );
+  press(fullFile);
+  const records = [];
+  records.push(measureOptimistic("Hide all additions", "Show all additions"));
+  records.push(measureOptimistic("Show all additions", "Hide all additions"));
+  records.push(measureIndividual("Hide"));
+  records.push(measureIndividual("Show"));
+  return records.map((record) => JSON.stringify(record)).join("\n");
+}

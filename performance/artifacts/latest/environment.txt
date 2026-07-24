@@ -1,0 +1,7 @@
+commit=444cbeed9699510b843c8636448fb685005942b4
+dirty_files=38
+arch=arm64
+os=26.5.1
+iterations=20
+profile_iterations=40
+viewport_rows=220

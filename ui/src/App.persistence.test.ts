@@ -96,6 +96,7 @@ function installApi(workspaces: Workspace[], initialSettings: ReviewSettings = s
     locationRequests: [] as Array<{ fileId: string; mode: string; side: 'old' | 'new'; line: number }>,
     setupReads: [] as string[],
     inclusionWrites: [] as Array<{ workspaceId: string; repositoryIds: string[]; enabled: boolean }>,
+    baseApplications: [] as Array<{ workspaceId: string; repositoryIds: string[]; base: string }>,
     baselineWrites: [] as Array<{ workspaceId: string; defaultBase?: string; repositoryBases?: unknown[] }>,
     startRequests: [] as Array<{ workspaceId: string; request?: Record<string, unknown> }>,
     refreshRequests: [] as Array<{ workspaceId: string; request?: Record<string, unknown> }>,
@@ -178,6 +179,10 @@ function installApi(workspaces: Workspace[], initialSettings: ReviewSettings = s
     },
     setRepositoryInclusion: async (workspaceId: string, repositoryIds: string[], enabled: boolean) => {
       calls.inclusionWrites.push({ workspaceId, repositoryIds: [...repositoryIds], enabled });
+      return harness.state.implementation.getRepositorySetup(workspaceId);
+    },
+    applyRepositoryBase: async (workspaceId: string, repositoryIds: string[], base: string) => {
+      calls.baseApplications.push({ workspaceId, repositoryIds: [...repositoryIds], base });
       return harness.state.implementation.getRepositorySetup(workspaceId);
     },
     configureBaselines: async (workspaceId: string, defaultBase?: string, repositoryBases?: unknown[]) => {
@@ -371,6 +376,69 @@ describe('App review-session persistence boundaries', () => {
     await new Promise((resolve) => window.setTimeout(resolve, 160));
     await settle();
     expect(calls.uiStates.at(-1)?.state).toMatchObject({ rightTab: 'files' });
+  });
+
+  it('repeatedly closes and reopens the right panel in Full File while settings persistence is queued', async () => {
+    const local = workspace('workspace-localreview', 'LocalReview');
+    const calls = installApi([local], { ...settings, rightCollapsed: false });
+    const firstSettingsWrite = deferred<void>();
+    let settingsWriteCount = 0;
+    let persistedSettings = { ...settings, rightCollapsed: false };
+    harness.state.implementation.saveSettings = async (partial: Partial<ReviewSettings>) => {
+      calls.settingsWrites.push(structuredClone(partial));
+      settingsWriteCount += 1;
+      if (settingsWriteCount === 1) await firstSettingsWrite.promise;
+      persistedSettings = { ...persistedSettings, ...partial };
+      return structuredClone(persistedSettings);
+    };
+    components.push(mount(App, { target: target() }));
+    await settle(6);
+
+    const fullFile = [...document.querySelectorAll<HTMLButtonElement>('.mode-picker button')]
+      .find((button) => button.textContent === 'Full File')!;
+    fullFile.click();
+    await settle(5);
+    expect(fullFile.getAttribute('aria-selected')).toBe('true');
+    const panel = document.querySelector<HTMLElement>('.review-panel')!;
+    const restore = document.querySelector<HTMLButtonElement>('[aria-label="Open files and review panel"]')!;
+    expect(panel.hidden).toBe(false);
+    expect(restore.hidden).toBe(true);
+
+    document.querySelector<HTMLButtonElement>('[aria-label="Close review panel"]')!.click();
+    expect(panel.hidden).toBe(true);
+    expect(restore.hidden).toBe(false);
+
+    // Reopen while the close write is still unresolved. The large file-tree
+    // panel and its restore target keep stable DOM identities, so WebKit
+    // cannot leave a visible button backed by the prior hit-test subtree.
+    restore.click();
+
+    expect(panel.hidden).toBe(false);
+    expect(restore.hidden).toBe(true);
+    expect(document.querySelector<HTMLElement>('.app-shell')?.getAttribute('style')).toContain('minmax(0,1fr)');
+    await settle(1);
+    expect(document.activeElement?.id).toBe('right-panel-tab-files');
+
+    // A second close also takes effect immediately while both prior native
+    // writes are queued.
+    document.querySelector<HTMLButtonElement>('[aria-label="Close review panel"]')!.click();
+    expect(panel.hidden).toBe(true);
+    expect(restore.hidden).toBe(false);
+
+    firstSettingsWrite.resolve();
+    await settle(8);
+    expect(panel.hidden).toBe(true);
+    expect(calls.settingsWrites.slice(-3)).toEqual([
+      { rightCollapsed: true },
+      { rightCollapsed: false },
+      { rightCollapsed: true }
+    ]);
+
+    restore.click();
+    expect(panel.hidden).toBe(false);
+    expect(restore.hidden).toBe(true);
+    await settle(6);
+    expect(calls.settingsWrites).toContainEqual({ rightCollapsed: false });
   });
 
   it('surfaces an asynchronous workspace hydration failure instead of remaining stuck opening', async () => {
@@ -568,7 +636,7 @@ describe('App review-session persistence boundaries', () => {
     expect(document.querySelector('#baseline-title')?.textContent).toBe('Start review');
     expect(document.querySelector<HTMLDetailsElement>('.advanced-setup')?.open).toBe(false);
     expect(document.querySelector<HTMLInputElement>('[aria-label="Comparison branch for ."]')?.value).toBe('origin/main');
-    expect(document.querySelector('.setup-notice')?.textContent).toContain('selected origin/main for you');
+    expect(document.querySelector('.setup-notice')?.textContent).toContain('staged origin/main as the detected repair');
     expect([...document.querySelectorAll<HTMLButtonElement>('button')].some((button) => button.textContent === 'Start review')).toBe(true);
     expect(document.querySelector('.file-picker')?.textContent).toContain('Initial review setup');
     expect(document.body.textContent).not.toContain('Loading diff');
@@ -642,6 +710,34 @@ describe('App review-session persistence boundaries', () => {
     expect(calls.inclusionWrites).toEqual([]);
   });
 
+  it('stages a detected default-branch repair when an active review opens setup', async () => {
+    const active = workspace('workspace-localreview', 'LocalReview');
+    const calls = installApi([active]);
+    const readSetup = harness.state.implementation.getRepositorySetup;
+    harness.state.implementation.getRepositorySetup = async (workspaceId: string) => {
+      const rows = await readSetup(workspaceId);
+      return rows.map((repository: Record<string, unknown>) => ({
+        ...repository,
+        effectiveBase: 'origin/main',
+        suggestedBase: 'origin/dev',
+        resolvedBaseSha: undefined,
+        comparisonError: 'origin/main does not resolve to a commit'
+      }));
+    };
+    components.push(mount(App, { target: target() }));
+    await settle(6);
+
+    const actions = document.querySelector<HTMLDetailsElement>('.actions-menu')!;
+    actions.open = true;
+    [...actions.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+      .find((button) => button.textContent === 'Review setup')?.click();
+    await settle(6);
+
+    expect(document.querySelector<HTMLInputElement>('[aria-label="Comparison branch for ."]')?.value).toBe('origin/dev');
+    expect(document.querySelector('.setup-notice')?.textContent).toContain('staged origin/dev as the detected repair');
+    expect(calls.baselineWrites).toEqual([]);
+  });
+
   it('persists layout choices for a valid zero-file review without an empty active file id', async () => {
     const empty = workspace('workspace-empty', 'Empty review');
     const calls = installApi([empty]);
@@ -712,7 +808,11 @@ describe('App review-session persistence boundaries', () => {
     const local = workspace('workspace-localreview', 'LocalReview');
     const calls = installApi([local]);
     const getPresentationWindow = harness.state.implementation.getPresentationWindow;
+    let heldDisclosure: ReturnType<typeof deferred<void>> | undefined;
     harness.state.implementation.getPresentationWindow = async (request: ViewportRequest) => {
+      if (heldDisclosure && request.ephemeralCollapsedFullFileAdditionBlocks?.includes('added-1')) {
+        await heldDisclosure.promise;
+      }
       const result = await getPresentationWindow(request);
       if (request.mode !== 'full') return result;
       const deletionExpanded = (request.ephemeralExpandedFullFileDeletionBlocks ?? []).includes('removed-1');
@@ -755,12 +855,35 @@ describe('App review-session persistence boundaries', () => {
     expect(deletionControls?.textContent).toContain('Hide all deletions');
 
     const savesBeforeDisclosure = calls.uiStates.length;
+    const requestsBeforeDisclosure = calls.presentationRequests.length;
+    heldDisclosure = deferred<void>();
+    [...additionControls!.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent === 'Hide all additions')?.click();
+    await settle(2);
+    // The chevron acknowledges the click before native projection work or
+    // the debounced durable save completes.
+    expect(document.querySelector<HTMLButtonElement>('.addition-gate-toggle')?.ariaExpanded).toBe('false');
+    expect(calls.uiStates).toHaveLength(savesBeforeDisclosure);
+    // A newer click while the projection request is still in flight remains
+    // immediately interactive and becomes the sole trailing native request.
+    [...additionControls!.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent === 'Show all additions')?.click();
+    await settle(2);
+    expect(document.querySelector<HTMLButtonElement>('.addition-gate-toggle')?.ariaExpanded).toBe('true');
+    heldDisclosure.resolve();
+    heldDisclosure = undefined;
+    await settle(8);
+    const coalescedRequests = calls.presentationRequests.slice(requestsBeforeDisclosure);
+    expect(coalescedRequests).toHaveLength(2);
+    expect(coalescedRequests[0]?.ephemeralCollapsedFullFileAdditionBlocks).toEqual(['added-1']);
+    expect(coalescedRequests[1]?.ephemeralCollapsedFullFileAdditionBlocks).toEqual([]);
+    expect(document.querySelector<HTMLButtonElement>('.addition-gate-toggle')?.ariaExpanded).toBe('true');
+    expect(calls.uiStates).toHaveLength(savesBeforeDisclosure);
+
     [...additionControls!.querySelectorAll<HTMLButtonElement>('button')]
       .find((button) => button.textContent === 'Hide all additions')?.click();
     await settle(4);
     expect(calls.presentationRequests.at(-1)?.ephemeralCollapsedFullFileAdditionBlocks).toEqual(['added-1']);
-    expect(document.querySelector<HTMLButtonElement>('.addition-gate-toggle')?.ariaExpanded).toBe('false');
-    expect(calls.uiStates).toHaveLength(savesBeforeDisclosure);
 
     [...deletionControls!.querySelectorAll<HTMLButtonElement>('button')]
       .find((button) => button.textContent === 'Show all deletions')?.click();
@@ -866,34 +989,34 @@ describe('App review-session persistence boundaries', () => {
 
     await clickNavigation('Next');
     expectLastWindowToContain(100);
-    expect(viewport.scrollTop).toBe(1_800);
+    expect(viewport.scrollTop).toBe(2_000);
     expect(document.querySelector<HTMLButtonElement>('.mode-picker [role="tab"][aria-selected="true"]')?.textContent).toBe('Full File');
 
     await clickNavigation('Next');
     expectLastWindowToContain(700);
-    expect(viewport.scrollTop).toBe(13_800);
+    expect(viewport.scrollTop).toBe(14_000);
 
     await clickNavigation('Next');
     expectLastWindowToContain(100);
-    expect(viewport.scrollTop).toBe(1_800);
+    expect(viewport.scrollTop).toBe(2_000);
 
     await clickNavigation('Previous');
     expectLastWindowToContain(700);
-    expect(viewport.scrollTop).toBe(13_800);
+    expect(viewport.scrollTop).toBe(14_000);
 
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', altKey: true, bubbles: true }));
     await settle(5);
     expectLastWindowToContain(100);
-    expect(viewport.scrollTop).toBe(1_800);
+    expect(viewport.scrollTop).toBe(2_000);
     expect(document.querySelector<HTMLButtonElement>('.mode-picker [role="tab"][aria-selected="true"]')?.textContent).toBe('Full File');
 
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', altKey: true, bubbles: true }));
     await settle(5);
     expectLastWindowToContain(700);
-    expect(viewport.scrollTop).toBe(13_800);
+    expect(viewport.scrollTop).toBe(14_000);
     await new Promise((resolve) => window.setTimeout(resolve, 160));
     await settle(3);
-    expect(calls.uiStates.some((call) => call.state.mode === 'full' && call.state.fullFileSide === 'both' && call.state.nearestSourceLine === 651 && call.state.nearestSourceSide === 'old' && call.state.scrollTop === 13_800)).toBe(true);
+    expect(calls.uiStates.some((call) => call.state.mode === 'full' && call.state.fullFileSide === 'both' && call.state.nearestSourceLine === 651 && call.state.nearestSourceSide === 'old' && call.state.scrollTop === 14_000)).toBe(true);
 
     document.querySelector<HTMLButtonElement>('[aria-label="Full-file source side"] button:last-child')?.click();
     await settle(5);
@@ -902,7 +1025,7 @@ describe('App review-session persistence boundaries', () => {
     expectLastWindowToContain(100);
     await new Promise((resolve) => window.setTimeout(resolve, 160));
     await settle(3);
-    expect(calls.uiStates.some((call) => call.state.mode === 'full' && call.state.fullFileSide === 'old' && call.state.nearestSourceLine === 91 && call.state.nearestSourceSide === 'old' && call.state.scrollTop === 1_800)).toBe(true);
+    expect(calls.uiStates.some((call) => call.state.mode === 'full' && call.state.fullFileSide === 'old' && call.state.nearestSourceLine === 91 && call.state.nearestSourceSide === 'old' && call.state.scrollTop === 2_000)).toBe(true);
 
     document.querySelector<HTMLButtonElement>('[aria-label="Next file"]')?.click();
     await settle(6);
@@ -1481,7 +1604,29 @@ describe('App review-session persistence boundaries', () => {
   it('reports an all-repository native capture failure without claiming the review updated', async () => {
     vi.useFakeTimers();
     const local = { ...workspace('workspace-localreview', 'LocalReview'), refreshAvailable: true, refreshAvailableRevision: 2 };
-    installApi([local]);
+    const calls = installApi([local]);
+    const readSetup = harness.state.implementation.getRepositorySetup;
+    harness.state.implementation.getRepositorySetup = async (workspaceId: string) => {
+      const rows = await readSetup(workspaceId);
+      return rows.map((repository: Record<string, unknown>) => ({
+        ...repository,
+        effectiveBase: 'origin/main',
+        suggestedBase: 'origin/dev',
+        comparisonError: 'origin/main does not resolve to a commit',
+        issues: [{
+          id: 'missing-base:repo-localreview',
+          kind: 'missing_base_reference',
+          severity: 'error',
+          title: 'Comparison branch is unavailable',
+          message: 'origin/main does not resolve; origin/dev is the detected remote default.',
+          dismissible: true,
+          actions: [
+            { kind: 'apply_suggested_base', label: 'Use origin/dev', value: 'origin/dev' },
+            { kind: 'open_review_setup', label: 'Open Review setup' }
+          ]
+        }]
+      }));
+    };
     const failed = review({ ...local, refreshAvailable: true, refreshAvailableRevision: 3 });
     failed.refreshOutcome = {
       status: 'failed',
@@ -1503,6 +1648,29 @@ describe('App review-session persistence boundaries', () => {
     expect(document.querySelector('.statusbar')?.textContent).toContain('no repositories were updated');
     expect(document.querySelector('.statusbar')?.textContent).toContain('main no longer resolves to a commit');
     expect(document.querySelector('.file-picker')?.textContent).toContain('localreview.ts');
+    const repairDialog = document.querySelector('[aria-labelledby="configuration-repair-title"]');
+    expect(repairDialog?.textContent).toContain('Fix review configuration');
+    expect(repairDialog?.textContent).toContain('origin/main');
+    expect(repairDialog?.textContent).toContain('origin/dev');
+
+    [...repairDialog!.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent === 'Not now')?.click();
+    await settle();
+    expect(document.querySelector('[aria-labelledby="configuration-repair-title"]')).toBeNull();
+
+    refreshButton.click();
+    await settle(8);
+    const reopenedRepair = document.querySelector('[aria-labelledby="configuration-repair-title"]')!;
+    [...reopenedRepair.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent === 'Apply fix')?.click();
+    await settle(6);
+    expect(calls.baseApplications).toEqual([{
+      workspaceId: local.id,
+      repositoryIds: ['repo-localreview'],
+      base: 'origin/dev'
+    }]);
+    expect(document.querySelector('[aria-labelledby="configuration-repair-title"]')).toBeNull();
+    expect(document.querySelector('.statusbar')?.textContent).toContain('Press Refresh to capture the corrected comparison');
 
     vi.advanceTimersByTime(5001);
     await settle(3);

@@ -74,7 +74,71 @@ pub struct StartReviewResult {
 pub struct RepositoryReviewFailure {
     pub repository_id: RepositoryId,
     pub relative_path: StoredPath,
+    pub kind: RepositoryReviewFailureKind,
     pub error: String,
+}
+
+/// Stable, presentation-independent reason for one repository capture
+/// failure.  The desktop uses this instead of parsing localized Git stderr
+/// when it can offer a concrete recovery action.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RepositoryReviewFailureKind {
+    MissingBaseReference { reference: BaseReference },
+    MissingHead,
+    GitUnavailable,
+    RepositoryUnavailable,
+    RepositoryPermissionDenied,
+    CaptureLimitExceeded,
+    ConcurrentModification,
+    InvalidComparison,
+    Other,
+}
+
+impl RepositoryReviewFailureKind {
+    fn from_error(error: &ServiceError, requested_base: &BaseReference) -> Self {
+        match error {
+            ServiceError::Git(error) => Self::from_git_error(error, requested_base),
+            _ => Self::Other,
+        }
+    }
+
+    #[must_use]
+    pub fn from_git_error(error: &GitError, requested_base: &BaseReference) -> Self {
+        match error {
+            GitError::CommandFailed { command, .. }
+                if command.contains(&format!("rev-parse --verify {}", requested_base.as_str())) =>
+            {
+                Self::MissingBaseReference {
+                    reference: requested_base.clone(),
+                }
+            }
+            GitError::UnbornHead => Self::MissingHead,
+            GitError::Spawn { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
+                Self::GitUnavailable
+            }
+            GitError::Spawn { source, .. }
+                if source.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                Self::RepositoryPermissionDenied
+            }
+            GitError::NotARepository { .. } => Self::RepositoryUnavailable,
+            GitError::File { source, .. }
+                if source.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                Self::RepositoryPermissionDenied
+            }
+            GitError::UntrackedFileTooLarge { .. } | GitError::OutputTooLarge { .. } => {
+                Self::CaptureLimitExceeded
+            }
+            GitError::ConcurrentModification { .. } => Self::ConcurrentModification,
+            GitError::Parse(_)
+            | GitError::UnsafeRepositoryPath { .. }
+            | GitError::InvalidBlameRange { .. }
+            | GitError::InvalidCommitContextLimit { .. }
+            | GitError::CommitOutsideComparisonRange { .. } => Self::InvalidComparison,
+            _ => Self::Other,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -556,6 +620,7 @@ impl ReviewService {
                     .cloned(),
             }
             .effective();
+            let requested_base = baseline.reference.clone();
             let operation: Result<PreparedCapturedReview, ServiceError> = (|| {
                 let git = GitRepository::open(repository.worktree_path.as_str());
                 let resolved = git.resolve_comparison(
@@ -581,6 +646,7 @@ impl ReviewService {
                 Err(error) => failures.push(RepositoryReviewFailure {
                     repository_id: repository.id,
                     relative_path: repository.relative_path,
+                    kind: RepositoryReviewFailureKind::from_error(&error, &requested_base),
                     error: error.to_string(),
                 }),
             }
@@ -661,6 +727,7 @@ impl ReviewService {
                 temporary_override: temporary_base_overrides.get(&repository.id).cloned(),
             }
             .effective();
+            let requested_base = baseline.reference.clone();
             let operation: Result<PreparedCapturedReview, ServiceError> = (|| {
                 let git = GitRepository::open(repository.worktree_path.as_str());
                 let resolved = git.resolve_comparison(
@@ -698,6 +765,7 @@ impl ReviewService {
                 Err(error) => failures.push(RepositoryReviewFailure {
                     repository_id: repository.id,
                     relative_path: repository.relative_path,
+                    kind: RepositoryReviewFailureKind::from_error(&error, &requested_base),
                     error: error.to_string(),
                 }),
             }
@@ -2051,6 +2119,31 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn repository_capture_failures_keep_machine_readable_git_causes() {
+        let requested_base = BaseReference::new("origin/main").unwrap();
+        let missing = GitError::CommandFailed {
+            command: "git -C /work/repo rev-parse --verify origin/main".into(),
+            stderr: "fatal: Needed a single revision".into(),
+        };
+        assert_eq!(
+            RepositoryReviewFailureKind::from_git_error(&missing, &requested_base),
+            RepositoryReviewFailureKind::MissingBaseReference {
+                reference: requested_base.clone()
+            }
+        );
+
+        let unrelated = GitError::CommandFailed {
+            command: "git -C /work/repo diff --binary".into(),
+            stderr: "fatal: unexpected provider error".into(),
+        };
+        assert_eq!(
+            RepositoryReviewFailureKind::from_git_error(&unrelated, &requested_base),
+            RepositoryReviewFailureKind::Other,
+            "unknown Git diagnostics must not receive a misleading repair action"
+        );
+    }
 
     fn workspace() -> Workspace {
         let now = Utc::now();

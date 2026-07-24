@@ -1,6 +1,6 @@
 import { flushSync, mount, tick, unmount } from 'svelte';
 import { readFileSync } from 'node:fs';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import App from '../App.svelte';
 import VirtualDiff from './VirtualDiff.svelte';
 import VirtualFileList from './VirtualFileList.svelte';
@@ -747,6 +747,34 @@ describe('review components', () => {
     unmount(component);
   });
 
+  it('keeps scroll painting independent from trailing workspace persistence', async () => {
+    const locations: Array<{ scrollTop: number }> = [];
+    const rows: DiffRow[] = Array.from({ length: 300 }, (_, index) => ({
+      id: `scroll-row-${index}`, kind: 'context', newLine: index + 1, newText: `const line${index} = true;`
+    }));
+    const host = target();
+    const component = mount(VirtualDiff, {
+      target: host,
+      props: {
+        rows, windowStart: 0, totalRows: rows.length, mode: 'unified',
+        onLocationChange: (location: { scrollTop: number }) => locations.push(location)
+      }
+    });
+    await settle();
+    const viewport = host.querySelector<HTMLElement>('.diff-viewport')!;
+    for (let index = 1; index <= 30; index += 1) {
+      viewport.scrollTop = index * 20;
+      viewport.dispatchEvent(new Event('scroll'));
+    }
+    await settle();
+    expect(locations).toEqual([]);
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
+    await settle();
+    expect(locations).toHaveLength(1);
+    expect(locations[0].scrollTop).toBe(600);
+    unmount(component);
+  });
+
   it('uses a collapsible repository/folder tree with scaled variable rows', async () => {
     const files = Array.from({ length: 100 }, (_, index) => ({
       id: `tree-${index}`, repositoryId: 'repo', path: `src/features/area-${index % 5}/a-very-long-review-file-name-${index}.ts`, status: 'modified' as const,
@@ -762,6 +790,83 @@ describe('review components', () => {
     await settle();
     expect(repository.getAttribute('aria-expanded')).toBe('false');
     expect(host.querySelectorAll('.file-row')).toHaveLength(0);
+    unmount(component);
+  });
+
+  it('compacts consecutive single-child folders without merging the repository row', async () => {
+    const host = target();
+    const component = mount(VirtualFileList, { target: host, props: {
+      files: [{
+        id: 'ghostty-model',
+        repositoryId: 'mono',
+        path: 'tools/boss/app-macos/Sources/Ghostty/BossPaneModel.swift',
+        status: 'modified',
+        additions: 37,
+        deletions: 16,
+        hunkCount: 4,
+        language: 'Swift',
+        viewed: false,
+        annotationCount: 0
+      }],
+      repositories: [{ id: 'mono', name: 'mono', path: '/tmp/mono', branch: 'feature', base: 'origin/main', mergeBase: 'a', head: 'b' }],
+      grouping: 'repository'
+    } });
+    await settle();
+
+    const groups = [...host.querySelectorAll<HTMLButtonElement>('.file-group-label')];
+    expect(groups).toHaveLength(2);
+    expect(groups[0].getAttribute('aria-label')).toBe('mono, folder');
+    expect(groups[0].getAttribute('aria-level')).toBe('1');
+    expect(groups[0].dataset.chainLength).toBe('1');
+    expect(groups[1].getAttribute('aria-label')).toBe('tools/boss/app-macos/Sources/Ghostty, folder');
+    expect(groups[1].getAttribute('aria-level')).toBe('2');
+    expect(groups[1].dataset.chainLength).toBe('5');
+    expect(groups[1].textContent?.replace(/\s/g, '')).toContain('tools/boss/app-macos/Sources/Ghostty');
+    expect(host.querySelectorAll('.file-row')).toHaveLength(1);
+    expect(host.querySelector('.file-row')?.getAttribute('aria-level')).toBe('3');
+    expect(host.querySelector('.file-path')?.textContent).toBe('BossPaneModel.swift');
+    expect(host.querySelector('.file-path')?.getAttribute('title')).toBe('tools/boss/app-macos/Sources/Ghostty/BossPaneModel.swift');
+    expect(host.querySelector('.file-select')?.getAttribute('aria-label')).toContain('tools/boss/app-macos/Sources/Ghostty/BossPaneModel.swift, mono, modified');
+
+    groups[1].click();
+    await settle();
+    expect(host.querySelector('[aria-label="tools/boss/app-macos/Sources/Ghostty, folder"]')?.getAttribute('aria-expanded')).toBe('false');
+    expect(host.querySelectorAll('.file-row')).toHaveLength(0);
+    unmount(component);
+  });
+
+  it('stops compact folder chains at branches and keeps each branch independently collapsible', async () => {
+    const host = target();
+    const files = ['client/components/Button.ts', 'client/components/Input.ts', 'client/hooks/useTheme.ts'].map((path, index) => ({
+      id: `branch-${index}`,
+      repositoryId: 'web',
+      path,
+      status: 'modified' as const,
+      additions: 1,
+      deletions: 0,
+      hunkCount: 1,
+      language: 'TypeScript',
+      viewed: false,
+      annotationCount: 0
+    }));
+    const component = mount(VirtualFileList, { target: host, props: {
+      files,
+      repositories: [{ id: 'web', name: 'web', path: '/tmp/web', branch: 'feature', base: 'origin/main', mergeBase: 'a', head: 'b' }],
+      grouping: 'repository'
+    } });
+    await settle();
+
+    expect(host.querySelector('[aria-label="client, folder"]')).not.toBeNull();
+    expect(host.querySelector('[aria-label="client/components, folder"]')).toBeNull();
+    const components = host.querySelector<HTMLButtonElement>('[aria-label="components, folder"]')!;
+    const hooks = host.querySelector<HTMLButtonElement>('[aria-label="hooks, folder"]')!;
+    expect(components).not.toBeNull();
+    expect(hooks).not.toBeNull();
+    components.click();
+    await settle();
+    expect(host.querySelector('[aria-label="components, folder"]')?.getAttribute('aria-expanded')).toBe('false');
+    expect(host.textContent).not.toContain('Button.ts');
+    expect(host.textContent).toContain('useTheme.ts');
     unmount(component);
   });
 
@@ -860,12 +965,91 @@ describe('review components', () => {
     viewport.scrollTop = 12_000;
     viewport.dispatchEvent(new Event('scroll'));
     await settle();
+    await new Promise((resolve) => window.requestAnimationFrame(() => resolve(undefined)));
+    await settle();
     expect(document.activeElement).toBe(viewport);
     viewport.scrollTop = 0;
     viewport.dispatchEvent(new Event('scroll'));
     await settle();
+    await new Promise((resolve) => window.requestAnimationFrame(() => resolve(undefined)));
+    await settle();
     expect((document.activeElement as HTMLElement).dataset.line).toBe('1');
     unmount(component);
+  });
+
+  it('keeps exactly the explicitly navigated hunk active while scrolling stays passive', async () => {
+    const rows: DiffRow[] = Array.from({ length: 120 }, (_, index) => ({
+      id: `hunk-focus-${index}`,
+      hunkId: index < 40 ? 'hunk-one' : index < 80 ? 'hunk-two' : 'hunk-three',
+      kind: index === 2 || index === 40 || index === 80 ? 'addition' : index === 3 || index === 41 || index === 81 ? 'deletion' : 'context',
+      oldLine: index === 2 || index === 40 || index === 80 ? undefined : index + 1,
+      newLine: index === 3 || index === 41 || index === 81 ? undefined : index + 1,
+      oldText: `const old${index} = true;`,
+      newText: `const next${index} = true;`
+    }));
+    const hunks = [
+      { id: 'hunk-one', rowIndex: 0, oldLine: 1, newLine: 1, header: '@@ first @@' },
+      { id: 'hunk-two', rowIndex: 40, oldLine: 41, newLine: 41, header: '@@ second @@' },
+      { id: 'hunk-three', rowIndex: 80, oldLine: 81, newLine: 81, header: '@@ third @@' }
+    ];
+    const locations: Array<{ scrollTop: number }> = [];
+    const requests: Array<{ startRow: number; endRow: number }> = [];
+    const host = target();
+    const component = mount(VirtualDiff, {
+      target: host,
+      props: {
+        rows, totalRows: rows.length, hunks, mode: 'full', fullFileSide: 'both',
+        activeHunkId: 'hunk-one',
+        onLocationChange: (location: { scrollTop: number }) => locations.push(location),
+        onViewportRequest: (request: { startRow: number; endRow: number }) => requests.push(request)
+      }
+    });
+    await settle();
+
+    const firstAddition = host.querySelector<HTMLElement>('[data-virtual-row="2"]')!;
+    const firstRemoval = host.querySelector<HTMLElement>('[data-virtual-row="3"]')!;
+    const secondAddition = host.querySelector<HTMLElement>('[data-virtual-row="40"]')!;
+    expect(firstAddition.classList.contains('active-hunk')).toBe(true);
+    expect(firstRemoval.classList.contains('active-hunk')).toBe(true);
+    expect(firstAddition.getAttribute('aria-current')).toBe('location');
+    expect(firstAddition.getAttribute('aria-label')).toContain('Current review hunk 1 of 3');
+    expect(secondAddition.classList.contains('active-hunk')).toBe(false);
+
+    const viewport = host.querySelector<HTMLElement>('.diff-viewport')!;
+    requests.length = 0;
+    const layoutReads = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect');
+    for (let index = 1; index <= 50; index += 1) {
+      viewport.scrollTop = index * 2;
+      viewport.dispatchEvent(new Event('scroll'));
+    }
+    await settle();
+    expect(locations).toEqual([]);
+    expect(layoutReads).not.toHaveBeenCalled();
+    layoutReads.mockRestore();
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
+    await settle();
+    expect(locations).toEqual([{ scrollTop: 100 }]);
+    expect(requests).toEqual([]);
+    expect(host.querySelector('[data-active-hunk="hunk-one"]')).not.toBeNull();
+    expect(host.querySelector('[data-active-hunk="hunk-two"]')).toBeNull();
+    expect(host.querySelector('[role="status"]')?.textContent).toContain('Reviewing hunk 1 of 3');
+    unmount(component);
+
+    const jumpHost = target();
+    const jumped = mount(VirtualDiff, {
+      target: jumpHost,
+      props: {
+        rows, totalRows: rows.length, hunks, mode: 'full', fullFileSide: 'both',
+        jumpToRow: 40, jumpGeneration: 1, activeHunkId: 'hunk-two'
+      }
+    });
+    await settle();
+    expect(jumpHost.querySelector<HTMLElement>('.diff-viewport')?.scrollTop).toBe(800);
+    expect(jumpHost.querySelector('[data-virtual-row="40"]')?.classList.contains('active-hunk')).toBe(true);
+    expect(jumpHost.querySelector('[data-virtual-row="40"]')?.getAttribute('data-active-hunk')).toBe('hunk-two');
+    expect(jumpHost.querySelector('[data-active-hunk="hunk-one"]')).toBeNull();
+    expect(jumpHost.querySelector('[data-active-hunk="hunk-three"]')).toBeNull();
+    unmount(jumped);
   });
 
   it('wraps long diff rows without fixed-height clipping and keeps nowrap as the default', async () => {

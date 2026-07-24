@@ -16,7 +16,7 @@ describe('safeSyntaxSegments', () => {
   it('drops spans that split a UTF-8 code point', () => {
     const source = 'café';
     const segments = safeSyntaxSegments(source, 0, [{ startByte: 3, endByte: 4, class: 'string' }]);
-    expect(segments).toEqual([{ text: source }]);
+    expect(segments).toEqual([{ text: source, start: 0, end: source.length }]);
   });
 
   it('clips multi-line tokens to the visible source row', () => {
@@ -24,7 +24,7 @@ describe('safeSyntaxSegments', () => {
     const segments = safeSyntaxSegments(source, 15, [
       { startByte: 0, endByte: 30, class: 'comment' }
     ]);
-    expect(segments).toEqual([{ text: source, class: 'comment' }]);
+    expect(segments).toEqual([{ text: source, class: 'comment', start: 0, end: source.length }]);
   });
 
   it('finds a visible token without scanning earlier rows and preserves astral UTF-8 boundaries', () => {
@@ -40,8 +40,8 @@ describe('safeSyntaxSegments', () => {
       { startByte, endByte: startByte + 4, class: 'string' }
     ]);
     expect(segments).toEqual([
-      { text: '🚀', class: 'string' },
-      { text: ' launch' }
+      { text: '🚀', class: 'string', start: 0, end: 2 },
+      { text: ' launch', start: 2, end: source.length }
     ]);
   });
 

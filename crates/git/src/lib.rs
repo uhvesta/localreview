@@ -303,7 +303,12 @@ impl<E: GitExecutor> GitRepository<E> {
     }
 
     pub fn inspect(&self) -> Result<RepositoryIdentity, GitError> {
-        self.require_success(self.command(["rev-parse", "--is-inside-work-tree"]))?;
+        let inside_worktree = self.execute(self.command(["rev-parse", "--is-inside-work-tree"]))?;
+        if !inside_worktree.success() || inside_worktree.stdout_trimmed() != "true" {
+            return Err(GitError::NotARepository {
+                path: self.root.clone(),
+            });
+        }
         let worktree = PathBuf::from(
             self.require_success(self.command(["rev-parse", "--show-toplevel"]))?
                 .stdout_trimmed(),
@@ -1886,6 +1891,13 @@ mod tests {
         git(root, &["branch", "feature"]);
         git(root, &["switch", "feature"]);
         temporary
+    }
+
+    #[test]
+    fn inspect_classifies_a_plain_directory_as_an_unusable_repository() {
+        let directory = TempDir::new().unwrap();
+        let error = GitRepository::open(directory.path()).inspect().unwrap_err();
+        assert!(matches!(error, GitError::NotARepository { .. }));
     }
 
     #[test]

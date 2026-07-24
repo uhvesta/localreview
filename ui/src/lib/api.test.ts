@@ -529,6 +529,12 @@ describe('browser fallback API', () => {
     await api.getPresentationWindow({ fileId: 'file-1', mode: 'split', startRow: 20, endRow: 80, generation: 4, splitRatio: .55 });
     await api.resolvePresentationLocation('file-1', 'split', 'new', 42);
     await api.getCapturedSourceRange('file-1', 'new', 40, 42);
+    const symbolInput = { workspaceId: 'workspace-1', repositoryId: 'repo-1', fileId: 'file-1', comparisonId: 'comparison-1', side: 'new' as const, line: 42, column: 7, symbol: 'launch', initialQuery: 'definitions' as const };
+    const symbolQuery = { workspaceId: 'workspace-1', repositoryId: 'repo-1', symbol: 'launch', kind: 'references' as const, limit: 200 };
+    const symbolSource = { workspaceId: 'workspace-1', repositoryId: 'repo-1', path: 'src/main.rs', expectedFingerprint: 'fingerprint-1', startLine: 34, lineCount: 17 };
+    await api.openSymbolNavigation(symbolInput);
+    await api.querySymbolNavigation(symbolQuery);
+    await api.getSymbolSource(symbolSource);
     const draft = { id: 'draft-1', workspaceId: 'workspace-1', fileId: 'file-1', repositoryId: 'repo-1', kind: 'comment' as const, side: 'new' as const, startLine: 42, endLine: 42, body: 'unfinished', updatedAt: '2026-07-22T00:00:00Z' };
     await api.saveAnnotationDraft(draft);
     await api.getAnnotationDraft('workspace-1');
@@ -574,6 +580,9 @@ describe('browser fallback API', () => {
       , ['get_presentation_window', { request: { fileId: 'file-1', mode: 'split', startRow: 20, endRow: 80, generation: 4, splitRatio: .55 } }]
       , ['resolve_presentation_location', { fileId: 'file-1', mode: 'split', side: 'new', line: 42 }]
       , ['get_captured_source_range', { fileId: 'file-1', side: 'new', startLine: 40, endLine: 42 }]
+      , ['open_symbol_navigation', { input: symbolInput }]
+      , ['query_symbol_navigation', { input: symbolQuery }]
+      , ['get_symbol_source', { input: symbolSource }]
       , ['save_annotation_draft', { draft }]
       , ['get_annotation_draft', { workspaceId: 'workspace-1' }]
       , ['clear_annotation_draft', { workspaceId: 'workspace-1' }]

@@ -14,6 +14,7 @@ use std::{
 
 pub const GH_PATH_ENV: &str = "LOCALREVIEW_GH_PATH";
 pub const GIT_PATH_ENV: &str = "LOCALREVIEW_GIT_PATH";
+pub const RG_PATH_ENV: &str = "LOCALREVIEW_RG_PATH";
 
 /// Resolve the Git executable used for repository discovery, capture, and
 /// managed worktrees.
@@ -35,6 +36,18 @@ pub fn gh_executable() -> PathBuf {
         env::var_os(GH_PATH_ENV),
         env::var_os("PATH"),
         gh_well_known_paths(),
+    )
+}
+
+/// Resolve ripgrep for lazy codebase symbol discovery. The caller retains a
+/// Git-backed fallback when ripgrep is not installed.
+#[must_use]
+pub fn rg_executable() -> PathBuf {
+    resolve_executable(
+        "rg",
+        env::var_os(RG_PATH_ENV),
+        env::var_os("PATH"),
+        rg_well_known_paths(),
     )
 }
 
@@ -127,6 +140,30 @@ fn gh_well_known_paths() -> &'static [&'static str] {
         "/usr/local/bin/gh",
         "/opt/local/bin/gh",
     ]
+}
+
+#[cfg(target_os = "macos")]
+fn rg_well_known_paths() -> &'static [&'static str] {
+    &[
+        "/opt/homebrew/bin/rg",
+        "/usr/local/bin/rg",
+        "/opt/local/bin/rg",
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn rg_well_known_paths() -> &'static [&'static str] {
+    &[
+        "/usr/bin/rg",
+        "/usr/local/bin/rg",
+        "/home/linuxbrew/.linuxbrew/bin/rg",
+        "/run/current-system/sw/bin/rg",
+    ]
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rg_well_known_paths() -> &'static [&'static str] {
+    &[]
 }
 
 #[cfg(target_os = "linux")]

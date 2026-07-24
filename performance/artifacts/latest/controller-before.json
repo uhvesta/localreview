@@ -1,0 +1,176 @@
+{
+  "schemaVersion": 1,
+  "profile": "release",
+  "fixtureLines": 25000,
+  "iterations": 20,
+  "operations": [
+    {
+      "name": "individual_disclosure",
+      "samples": 20,
+      "wallMicros": {
+        "min": 25585,
+        "median": 50453,
+        "p95": 61255,
+        "max": 87174
+      },
+      "nativeMicros": {
+        "min": 25295,
+        "median": 31529,
+        "p95": 60927,
+        "max": 67443
+      },
+      "serializationMicros": {
+        "min": 286,
+        "median": 421,
+        "p95": 19731,
+        "max": 20218
+      },
+      "responseBytes": {
+        "min": 335935,
+        "median": 335936,
+        "p95": 17001610,
+        "max": 17001610
+      }
+    },
+    {
+      "name": "expand_collapse_all",
+      "samples": 20,
+      "wallMicros": {
+        "min": 25692,
+        "median": 50238,
+        "p95": 69884,
+        "max": 92103
+      },
+      "nativeMicros": {
+        "min": 25397,
+        "median": 31786,
+        "p95": 50067,
+        "max": 71217
+      },
+      "serializationMicros": {
+        "min": 287,
+        "median": 377,
+        "p95": 20885,
+        "max": 36361
+      },
+      "responseBytes": {
+        "min": 335742,
+        "median": 335742,
+        "p95": 17002442,
+        "max": 17002442
+      }
+    },
+    {
+      "name": "highlight_cold",
+      "samples": 1,
+      "wallMicros": {
+        "min": 464601,
+        "median": 464601,
+        "p95": 464601,
+        "max": 464601
+      },
+      "nativeMicros": {
+        "min": 461703,
+        "median": 461703,
+        "p95": 461703,
+        "max": 461703
+      },
+      "serializationMicros": {
+        "min": 2897,
+        "median": 2897,
+        "p95": 2897,
+        "max": 2897
+      },
+      "responseBytes": {
+        "min": 2402082,
+        "median": 2402082,
+        "p95": 2402082,
+        "max": 2402082
+      }
+    },
+    {
+      "name": "highlight_cached_viewport",
+      "samples": 20,
+      "wallMicros": {
+        "min": 6424,
+        "median": 10357,
+        "p95": 38664,
+        "max": 46953
+      },
+      "nativeMicros": {
+        "min": 3864,
+        "median": 5600,
+        "p95": 16280,
+        "max": 31089
+      },
+      "serializationMicros": {
+        "min": 2492,
+        "median": 2950,
+        "p95": 22417,
+        "max": 41565
+      },
+      "responseBytes": {
+        "min": 2402082,
+        "median": 2402082,
+        "p95": 2402082,
+        "max": 2402082
+      }
+    },
+    {
+      "name": "refresh",
+      "samples": 5,
+      "wallMicros": {
+        "min": 246703,
+        "median": 251975,
+        "p95": 269232,
+        "max": 372656
+      },
+      "nativeMicros": {
+        "min": 246695,
+        "median": 251965,
+        "p95": 269223,
+        "max": 372647
+      },
+      "serializationMicros": {
+        "min": 8,
+        "median": 8,
+        "p95": 8,
+        "max": 10
+      },
+      "responseBytes": {
+        "min": 1310,
+        "median": 1310,
+        "p95": 1310,
+        "max": 1310
+      }
+    },
+    {
+      "name": "symbol_navigation",
+      "samples": 20,
+      "wallMicros": {
+        "min": 137942,
+        "median": 138921,
+        "p95": 140693,
+        "max": 143731
+      },
+      "nativeMicros": {
+        "min": 137903,
+        "median": 138879,
+        "p95": 140656,
+        "max": 143692
+      },
+      "serializationMicros": {
+        "min": 36,
+        "median": 38,
+        "p95": 43,
+        "max": 45
+      },
+      "responseBytes": {
+        "min": 43554,
+        "median": 43554,
+        "p95": 43554,
+        "max": 43554
+      }
+    }
+  ]
+}

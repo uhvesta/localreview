@@ -25,6 +25,7 @@ import type {
   PromptPreview,
   PromptRequest,
   Repository,
+  RepositoryFilesResult,
   RepositorySetup,
   ReviewApi,
   ReviewData,
@@ -32,6 +33,11 @@ import type {
   ReviewFileClassificationRecord,
   ReviewHistoryItem,
   ReviewSettings,
+  SymbolNavigationOpenRequest,
+  SymbolNavigationQuery,
+  SymbolNavigationResult,
+  SymbolSourceRequest,
+  SymbolSourceView,
   ViewportRequest,
   WorkspaceUiState,
   OutlineSymbol,
@@ -842,6 +848,129 @@ export function makeMockApi(): ReviewApi {
     },
     async expandHunk(_fileId, _hunkId, _contextLines) { /* browser fixture already includes context */ },
     async getOutline(fileId, _side) { return demoOutline(fileId); },
+    async openSymbolNavigation(input) {
+      const data = review(input.workspaceId);
+      const file = data.files.find((candidate) =>
+        candidate.id === input.fileId
+        && candidate.repositoryId === input.repositoryId
+        && (!input.comparisonId || candidate.comparisonId === input.comparisonId)
+      );
+      if (!file) throw new Error('The symbol target does not belong to this captured workspace.');
+      return { windowLabel: `symbol-navigation-${uid().slice(0, 12)}` };
+    },
+    async querySymbolNavigation(input): Promise<SymbolNavigationResult> {
+      const data = review(input.workspaceId);
+      const repositoryFiles = data.files.filter((file) => file.repositoryId === input.repositoryId);
+      const escaped = input.symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const matcher = new RegExp(`(^|[^\\p{L}\\p{N}_$])(${escaped})(?=$|[^\\p{L}\\p{N}_$])`, 'u');
+      const locations = repositoryFiles.flatMap((file) =>
+        positionedRows(file.id).rows.flatMap((row) => {
+          if (row.kind === 'header' || !row.newLine) return [];
+          const source = row.newText ?? row.text ?? '';
+          const match = source.match(matcher);
+          if (!match || match.index === undefined) return [];
+          const column = match.index + match[1]!.length + 1;
+          const definition = new RegExp(`\\b(?:class|const|def|enum|fn|function|interface|let|module|struct|type)\\s+${escaped}\\b`).test(source);
+          return [{
+            repositoryId: input.repositoryId,
+            path: file.path,
+            line: row.newLine,
+            column,
+            endLine: row.newLine,
+            endColumn: column + input.symbol.length,
+            preview: source,
+            kind: definition ? 'declaration' : 'usage',
+            role: definition ? 'definition' as const : 'reference' as const,
+            sourceFingerprint: `mock:${file.id}:${file.comparisonId ?? 'current'}`,
+            fileId: file.id,
+            comparisonId: file.comparisonId,
+            side: 'new' as const
+          }];
+        })
+      );
+      const limit = Math.max(1, Math.min(500, input.limit ?? 200));
+      const definitions = input.kind === 'references'
+        ? []
+        : locations.filter((location) => location.role === 'definition').slice(0, limit);
+      const references = input.kind === 'definitions'
+        ? []
+        : locations.filter((location) => location.role === 'reference').slice(0, limit);
+      return {
+        symbol: input.symbol,
+        definitions,
+        references,
+        truncated: definitions.length + references.length < locations.length,
+        diagnostics: []
+      };
+    },
+    async getSymbolSource(input): Promise<SymbolSourceView> {
+      const data = review(input.workspaceId);
+      const file = data.files.find((candidate) =>
+        candidate.repositoryId === input.repositoryId && candidate.path === input.path
+      );
+      if (!file) throw new Error('The symbol source path is outside this repository.');
+      const fingerprint = `mock:${file.id}:${file.comparisonId ?? 'current'}`;
+      if (fingerprint !== input.expectedFingerprint) throw new Error('The symbol source changed; run the search again.');
+      const source = positionedRows(file.id).rows
+        .filter((row) => row.kind !== 'header' && row.newLine)
+        .map((row) => ({ line: row.newLine!, text: row.newText ?? row.text ?? '' }))
+        .sort((left, right) => left.line - right.line);
+      const startLine = Math.max(1, input.startLine);
+      const endLine = startLine + Math.max(1, input.lineCount);
+      return {
+        repositoryId: input.repositoryId,
+        path: input.path,
+        sourceFingerprint: fingerprint,
+        startLine,
+        totalLines: source.at(-1)?.line ?? 0,
+        lines: source.filter((row) => row.line >= startLine && row.line < endLine).map((row) => row.text),
+        lineStartBytes: source
+          .filter((row) => row.line >= startLine && row.line < endLine)
+          .map((row) => source.slice(0, Math.max(0, row.line - 1)).reduce((bytes, item) => bytes + new TextEncoder().encode(`${item.text}\n`).length, 0)),
+        tokens: [],
+        highlightStatus: 'plain_text',
+        highlightReason: 'Browser fixture source'
+      };
+    },
+    async getRepositoryFiles(input): Promise<RepositoryFilesResult> {
+      const needle = input.query?.trim().toLowerCase() ?? '';
+      const files = review(input.workspaceId).files
+        .filter((file) => file.repositoryId === input.repositoryId && (!needle || file.path.toLowerCase().includes(needle)))
+        .slice(0, input.limit ?? 2_000)
+        .map((file) => ({
+          path: file.path,
+          fileId: file.id,
+          comparisonId: file.comparisonId,
+          side: file.status === 'deleted' ? 'old' as const : 'new' as const
+        }));
+      return { files, truncated: false, diagnostics: [] };
+    },
+    async openRepositorySource(input): Promise<SymbolSourceView> {
+      const data = review(input.workspaceId);
+      const file = data.files.find((candidate) =>
+        candidate.repositoryId === input.repositoryId && candidate.path === input.path
+      );
+      if (!file) throw new Error('The repository source path is unavailable.');
+      const source = positionedRows(file.id).rows
+        .filter((row) => row.kind !== 'header' && row.newLine)
+        .map((row) => ({ line: row.newLine!, text: row.newText ?? row.text ?? '' }))
+        .sort((left, right) => left.line - right.line);
+      const startLine = Math.max(1, input.startLine);
+      const endLine = startLine + Math.max(1, input.lineCount);
+      const selected = source.filter((row) => row.line >= startLine && row.line < endLine);
+      return {
+        repositoryId: input.repositoryId,
+        path: input.path,
+        sourceFingerprint: `mock:${file.id}:${file.comparisonId ?? 'current'}`,
+        startLine,
+        totalLines: source.at(-1)?.line ?? 0,
+        lines: selected.map((row) => row.text),
+        lineStartBytes: selected.map((row) => source.slice(0, Math.max(0, row.line - 1)).reduce((bytes, item) => bytes + new TextEncoder().encode(`${item.text}\n`).length, 0)),
+        tokens: [],
+        highlightStatus: 'plain_text',
+        highlightReason: 'Browser fixture source'
+      };
+    },
     async saveAnnotation(workspaceId, annotation) {
       const data = review(workspaceId);
       const file = data.files.find((candidate) => candidate.id === annotation.fileId);
@@ -977,26 +1106,38 @@ export function makeMockApi(): ReviewApi {
       saveState(state);
     },
     async getRepositorySetup(workspaceId): Promise<RepositorySetup[]> {
-      return review(workspaceId).repositories.map((repository, index) => ({
-        id: repository.id,
-        path: repository.path,
-        enabled: setupEnabledByRepository.get(repository.id) ?? true,
-        branch: repository.branch,
-        clean: index !== 1,
-        changedFileCount: index === 1 ? 3 : 0,
-        statusSummary: index === 1 ? 'Dirty: 1 staged, 1 unstaged, 1 untracked' : 'Clean',
-        effectiveBase: repository.base,
-        baseSource: repository.isOverride ? 'override' : 'inherited',
-        baseOverride: repository.isOverride ? repository.base : undefined,
-        resolvedBaseSha: mockBaseResolves(repository.base) ? repository.mergeBase : undefined,
-        mergeBaseSha: mockBaseResolves(repository.base) ? repository.mergeBase : undefined,
-        headSha: repository.head,
-        ahead: index === 1 ? 2 : 0,
-        behind: index === 1 ? 1 : 0,
-        lastFetchAt: '2026-07-22T00:00:00.000Z',
-        statusCheckedAt: now(),
-        comparisonError: mockBaseResolves(repository.base) ? undefined : `Base ${repository.base} does not resolve in this repository.`
-      }));
+      return review(workspaceId).repositories.map((repository, index) => {
+        const baseResolves = mockBaseResolves(repository.base);
+        return {
+          id: repository.id,
+          path: repository.path,
+          enabled: setupEnabledByRepository.get(repository.id) ?? true,
+          branch: repository.branch,
+          clean: index !== 1,
+          changedFileCount: index === 1 ? 3 : 0,
+          statusSummary: index === 1 ? 'Dirty: 1 staged, 1 unstaged, 1 untracked' : 'Clean',
+          effectiveBase: repository.base,
+          baseSource: repository.isOverride ? 'override' : 'inherited',
+          baseOverride: repository.isOverride ? repository.base : undefined,
+          resolvedBaseSha: baseResolves ? repository.mergeBase : undefined,
+          mergeBaseSha: baseResolves ? repository.mergeBase : undefined,
+          headSha: repository.head,
+          ahead: index === 1 ? 2 : 0,
+          behind: index === 1 ? 1 : 0,
+          lastFetchAt: '2026-07-22T00:00:00.000Z',
+          statusCheckedAt: now(),
+          comparisonError: baseResolves ? undefined : `Base ${repository.base} does not resolve in this repository.`,
+          issues: baseResolves ? [] : [{
+            id: `repository:${repository.id}:missing_base:${repository.base}`,
+            kind: 'missing_base_reference',
+            severity: 'error',
+            title: 'Base reference was not found',
+            message: `Git cannot resolve \`${repository.base}\` in this repository. Choose a valid base.`,
+            dismissible: true,
+            actions: [{ kind: 'open_review_setup', label: 'Open Review setup' }]
+          }]
+        };
+      });
     },
     async setRepositoryInclusion(workspaceId, repositoryIds, enabled): Promise<RepositorySetup[]> {
       for (const repositoryId of repositoryIds) setupEnabledByRepository.set(repositoryId, enabled);
@@ -1276,6 +1417,11 @@ export function createNativeReviewApi(invoke: TauriInvoke): ReviewApi {
     getRows: (fileId, mode) => invoke('get_presentation_rows', { fileId, mode }),
     expandHunk: (fileId, hunkId, contextLines, comparisonId) => invoke('expand_hunk_context', { fileId, comparisonId, hunkId, contextLines }),
     getOutline: (fileId, side, comparisonId) => invoke('get_outline', { fileId, comparisonId, side }),
+    openSymbolNavigation: (input) => invoke('open_symbol_navigation', { input }),
+    querySymbolNavigation: (input) => invoke('query_symbol_navigation', { input }),
+    getSymbolSource: (input) => invoke('get_symbol_source', { input }),
+    getRepositoryFiles: (input) => invoke('get_repository_files', { input }),
+    openRepositorySource: (input) => invoke('open_repository_source', { input }),
     saveAnnotation: (_workspaceId, annotation) => invoke('save_annotation', { annotation }),
     getAnnotationDraft: (workspaceId) => invoke('get_annotation_draft', { workspaceId }),
     saveAnnotationDraft: (draft) => invoke('save_annotation_draft', { draft }),

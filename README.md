@@ -122,12 +122,39 @@ localreview focus <name-or-id> # alias for workspace
 localreview pr <github-pr-url>
 localreview ssh <host>:<absolute-path>
 localreview list
+localreview show <workspace-name-or-id>
+localreview archived list
+localreview archived reopen <workspace-id>
+localreview review show|files <workspace-id>
+localreview review hunks <file-id>
+localreview review rows <file-id> --mode <unified|split|full|difftastic>
+localreview review start <workspace-id> [--fetch]
+localreview review refresh <workspace-id> [--fetch]
+localreview review history <workspace-id>
+localreview repo list <workspace-id>
+localreview repo configure <workspace-id> [--default-base <ref>] [--base <repo-or-path>=<ref>]
+localreview repo include|exclude <workspace-id> <repository-id>...
+localreview annotate <workspace-id> <file-id> --kind <kind> (--body <text>|--body-file <path>) [line options]
+localreview annotations list|delete|state ...
+localreview viewed <workspace-id> <file-id> [--clear]
+localreview symbol <workspace-id> <repository-id> <symbol> [--kind <kind>]
+localreview prompt <workspace-id> --scope <feedback|questions|full|selected|focused_question>
+localreview archive <workspace-id> --confirm
+localreview delete <workspace-id> --confirm-name <exact-workspace-name>
+localreview github inspect|preview|submit ...
+localreview ssh-status <workspace-id> [--reconnect]
 localreview doctor
 localreview config path
+localreview config effective <workspace-id>
 localreview recover status
 localreview recover restore <backup-file-name> --confirm
 localreview agent --stdio
 ```
+
+All review-state commands support `--json`, stable exit codes, and the same
+authenticated desktop controller as the GUI. The full programmatic capability
+matrix, safety confirmations, JSON contract, and examples are documented in
+[`docs/CLI_AUTOMATION.md`](docs/CLI_AUTOMATION.md).
 
 `open` canonicalizes the folder and reuses its durable workspace when it is
 already registered; `workspace`/`focus` selects an existing live workspace

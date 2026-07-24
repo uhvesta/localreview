@@ -136,7 +136,6 @@ fn dispatch_request(
     }
     match controller.dispatch(request.command, request_id) {
         Ok(response) => {
-            activate_main_window(app);
             // Every successful open/focus response includes the canonical
             // workspace id, including GitHub and SSH opens. Emit only that
             // durable target: Svelte intentionally never accepts paths, URLs,
@@ -144,6 +143,7 @@ fn dispatch_request(
             // Emit it only after controller dispatch succeeded so the UI never
             // focuses a phantom workspace.
             if let Some(operation) = workspace_operation_for_response(&response) {
+                activate_main_window(app);
                 let _ = app.emit(DESKTOP_OPERATION_EVENT, operation);
             }
             response
