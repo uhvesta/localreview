@@ -2427,7 +2427,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "localreview-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "clap",
  "hex",
@@ -2446,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "localreview-desktop"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "arboard",
  "chrono",
@@ -2481,7 +2481,7 @@ dependencies = [
 
 [[package]]
 name = "localreview-diff"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "blake3",
  "localreview-domain",
@@ -2493,7 +2493,7 @@ dependencies = [
 
 [[package]]
 name = "localreview-difftastic"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -2503,7 +2503,7 @@ dependencies = [
 
 [[package]]
 name = "localreview-domain"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "blake3",
  "chrono",
@@ -2514,7 +2514,7 @@ dependencies = [
 
 [[package]]
 name = "localreview-git"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "blake3",
  "chrono",
@@ -2528,7 +2528,7 @@ dependencies = [
 
 [[package]]
 name = "localreview-github"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "chrono",
  "localreview-domain",
@@ -2543,7 +2543,7 @@ dependencies = [
 
 [[package]]
 name = "localreview-highlight"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "blake3",
  "localreview-domain",
@@ -2584,7 +2584,7 @@ dependencies = [
 
 [[package]]
 name = "localreview-persistence"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "chrono",
  "hex",
@@ -2599,7 +2599,7 @@ dependencies = [
 
 [[package]]
 name = "localreview-protocol"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "hex",
  "hmac",
@@ -2614,7 +2614,7 @@ dependencies = [
 
 [[package]]
 name = "localreview-service"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "chrono",
  "localreview-diff",
@@ -2633,7 +2633,7 @@ dependencies = [
 
 [[package]]
 name = "localreview-ssh"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
@@ -2648,7 +2648,7 @@ dependencies = [
 
 [[package]]
 name = "localreview-tools"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "tempfile",
 ]
